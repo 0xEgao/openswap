@@ -10,14 +10,13 @@ use bitcoind::{
     BitcoinD,
 };
 use electrsd::ElectrsD;
-use log::info;
 
 use openswap::wallet::{
     AddressType, AnyBlockchain, BackendConfig, CoreRPC, CoreRpcConfig, Electrum, ElectrumConfig,
     Wallet, WalletBackup,
 };
 
-use openswap::security::{load_sensitive_struct, KeyMaterial, SerdeJson};
+use openswap::security::{load_sensitive_struct, KeyMaterial, SecurityError, SerdeCbor, SerdeJson};
 
 use super::test_framework::{
     generate_blocks, init_bitcoind, init_electrsd, send_to_address, wait_for_electrs_tip,
@@ -81,55 +80,28 @@ fn send_and_mine(
     Ok(())
 }
 
-#[test]
-fn plainwallet_plainbackup_plainrestore() {
-    info!("Running Test: Creating Wallet file, backing it up, then receive a payment, and restore backup");
-
-    let (
-        original_wallet,
-        rpc_config,
-        wallet_backup_file,
-        mut bitcoind,
-        restored_wallet_file,
-        root_dir,
-    ) = setup("plain_wallet_plainbackup_plain_restore".to_string());
-
-    let mut wallet = Wallet::init(
-        &original_wallet,
-        AnyBlockchain::CoreRPC(CoreRPC::new(&rpc_config).unwrap()),
-        None,
-    )
-    .unwrap();
-
-    let addr = wallet.get_next_external_address(AddressType::P2TR).unwrap();
-    send_and_mine(&mut bitcoind, &addr, 0.05, 1).unwrap();
-
-    let _ = wallet.backup(&wallet_backup_file, None);
-
-    let addr = wallet.get_next_external_address(AddressType::P2TR).unwrap();
-    send_and_mine(&mut bitcoind, &addr, 0.05, 1).unwrap();
-
-    wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
-
-    let (backup, _) =
-        load_sensitive_struct::<WalletBackup, SerdeJson>(&wallet_backup_file, None).unwrap();
-
-    let restored_wallet = Wallet::restore(
-        &backup,
-        &restored_wallet_file,
-        &BackendConfig::CoreRpc(rpc_config.clone()),
-        None,
-    )
-    .unwrap();
-
+/// Asserts the wallet file on disk is genuinely encrypted with the given
+/// passphrase: it must be an encrypted container, reject a wrong password,
+/// and open with the correct one. (The missing-password `PasswordRequired`
+/// path is covered by wallet storage unit tests, which have the concrete
+/// `WalletStore` type available.)
+fn assert_wallet_file_encrypted(path: &Path, password: &str) {
     assert!(
-        wallet == restored_wallet, // only compares .store!
-        "restored wallet does not match the original"
+        Wallet::is_wallet_encrypted(path).unwrap(),
+        "restored wallet file must be encrypted"
     );
 
-    cleanup(&mut bitcoind, &root_dir);
+    let err = load_sensitive_struct::<serde_cbor::Value, SerdeCbor>(
+        path,
+        Some("definitely-wrong-password".to_string()),
+    )
+    .expect_err("encrypted wallet file must reject a wrong password");
+    assert!(matches!(err, SecurityError::Decryption));
 
-    info!("🎉 Wallet Backup and Restore after tx test ran successfully!");
+    let (_, material) =
+        load_sensitive_struct::<serde_cbor::Value, SerdeCbor>(path, Some(password.to_string()))
+            .expect("the restore password must open the restored wallet file");
+    assert!(material.is_some());
 }
 
 #[test]
@@ -143,7 +115,7 @@ fn encwallet_encbackup_encrestore() {
         root_dir,
     ) = setup("encwallet_encbackup_encrestore".to_string());
 
-    let km = KeyMaterial::new_from_password(Some("integration-test".to_string()));
+    let km = KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap();
 
     let mut wallet = Wallet::init(
         &original_wallet,
@@ -180,6 +152,23 @@ fn encwallet_encbackup_encrestore() {
         wallet == restored_wallet, // only compares .store!
         "restored wallet does not match the original"
     );
+
+    // The restore must have written an *encrypted* wallet file, keyed by the
+    // restore passphrase.
+    assert_wallet_file_encrypted(&restored_wallet_file, "integration-test");
+
+    // A nameless restore path resolves to the backup's original filename
+    // instead of colliding with the wallets directory itself.
+    let nameless_dir = root_dir.join("nameless-restore");
+    std::fs::create_dir_all(&nameless_dir).unwrap();
+    Wallet::restore(
+        &backup,
+        &nameless_dir,
+        &BackendConfig::CoreRpc(rpc_config.clone()),
+        km.clone(),
+    )
+    .unwrap();
+    assert_wallet_file_encrypted(&nameless_dir.join("original-wallet"), "integration-test");
 
     cleanup(&mut bitcoind, &root_dir);
 }
@@ -231,55 +220,10 @@ fn setup_electrum(test_name: &str) -> ElectrumSetup {
 }
 
 #[test]
-fn plainwallet_plainbackup_plainrestore_electrum() {
-    info!("Running Test: Electrum-backed Wallet backup-restore");
-
-    let mut s = setup_electrum("plain_wallet_plainbackup_plain_restore_electrum");
-
-    let mut wallet = Wallet::init(
-        &s.original_wallet,
-        AnyBlockchain::Electrum(Electrum::new(&s.electrum_cfg).unwrap()),
-        None,
-    )
-    .unwrap();
-
-    let addr = wallet.get_next_external_address(AddressType::P2TR).unwrap();
-    send_and_mine(&mut s.bitcoind, &addr, 0.05, 1).unwrap();
-    wait_for_electrs_tip(&s.bitcoind, &s.electrsd, &s.electrum_cfg);
-
-    wallet.backup(&s.backup_file, None).unwrap();
-
-    let addr = wallet.get_next_external_address(AddressType::P2TR).unwrap();
-    send_and_mine(&mut s.bitcoind, &addr, 0.05, 1).unwrap();
-    wait_for_electrs_tip(&s.bitcoind, &s.electrsd, &s.electrum_cfg);
-
-    wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
-
-    let (backup, _) =
-        load_sensitive_struct::<WalletBackup, SerdeJson>(&s.backup_file, None).unwrap();
-
-    let restored_wallet = Wallet::restore(
-        &backup,
-        &s.restored_wallet,
-        &BackendConfig::Electrum(s.electrum_cfg.clone()),
-        None,
-    )
-    .unwrap();
-
-    assert_eq!(wallet, restored_wallet);
-
-    // Kill electrs before cleanup wipes root_dir, which holds its datadir.
-    drop(s.electrsd);
-    cleanup(&mut s.bitcoind, &s.root_dir);
-
-    info!("🎉 Electrum wallet backup-restore test ran successfully!");
-}
-
-#[test]
 fn encwallet_encbackup_encrestore_electrum() {
     let mut s = setup_electrum("encwallet_encbackup_encrestore_electrum");
 
-    let km = KeyMaterial::new_from_password(Some("integration-test".to_string()));
+    let km = KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap();
 
     let mut wallet = Wallet::init(
         &s.original_wallet,
@@ -315,6 +259,10 @@ fn encwallet_encbackup_encrestore_electrum() {
     .unwrap();
 
     assert_eq!(wallet, restored_wallet);
+
+    // The restore must have written an *encrypted* wallet file, keyed by the
+    // restore passphrase.
+    assert_wallet_file_encrypted(&s.restored_wallet, "integration-test");
 
     // Kill electrs before cleanup wipes root_dir, which holds its datadir.
     drop(s.electrsd);

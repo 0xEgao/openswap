@@ -563,7 +563,7 @@ impl Taker {
     }
 
     /// Initialize a new taker. The backend is resolved from `config` via [`TakerInitConfig::backend`].
-    pub fn init(config: TakerInitConfig) -> Result<Self, TakerError> {
+    pub fn init(mut config: TakerInitConfig) -> Result<Self, TakerError> {
         // Init the Wallet
         let wallet_name = config.wallet_name.clone();
 
@@ -586,7 +586,10 @@ impl Taker {
         if let AnyBlockchain::CoreRPC(core) = &blockchain {
             core.check_node_requirements()?;
         }
-        let wallet = Wallet::load_or_init(&wallet_path, blockchain, config.password.clone())?;
+        // Take the passphrase out of the config: the wallet keeps the derived
+        // key material, so the cleartext passphrase must not linger in the
+        // long-lived server config.
+        let wallet = Wallet::load_or_init(&wallet_path, blockchain, config.password.take())?;
 
         // Init Watch Service
         let (watch_service, registry, initial_sync_complete) =
@@ -2945,24 +2948,28 @@ impl Taker {
     }
 
     /// Restore a wallet from a backup file (static — no taker instance needed).
+    /// A `None` wallet name restores under the backup's original filename.
     pub fn restore_wallet(
         data_dir: Option<PathBuf>,
         wallet_file_name: Option<String>,
         backend: BackendConfig,
         backup_file: &String,
-    ) {
+    ) -> Result<(), TakerError> {
         let backup_file_path = PathBuf::from(backup_file);
-        let restored_wallet_filename = wallet_file_name.unwrap_or_default();
 
-        let restored_wallet_path = match data_dir.map(Ok).unwrap_or_else(get_taker_dir) {
-            Ok(dir) => dir.join("wallets").join(restored_wallet_filename),
-            Err(e) => {
-                log::error!("Wallet restore failed: {e}");
-                return;
-            }
+        let wallets_dir = data_dir
+            .map(Ok)
+            .unwrap_or_else(get_taker_dir)
+            .map_err(|e| TakerError::General(format!("wallet restore failed: {e}")))?
+            .join("wallets");
+        // A nameless path resolves to the backup's filename inside `Wallet::restore`.
+        let restored_wallet_path = match wallet_file_name {
+            Some(name) => wallets_dir.join(name),
+            None => wallets_dir,
         };
 
-        Wallet::restore_interactive(&backup_file_path, &backend, &restored_wallet_path);
+        Wallet::restore_interactive(&backup_file_path, &backend, &restored_wallet_path)?;
+        Ok(())
     }
 }
 

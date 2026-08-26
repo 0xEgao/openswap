@@ -580,7 +580,10 @@ impl MakerServer {
         if let AnyBlockchain::CoreRPC(core) = &blockchain {
             core.check_node_requirements().map_err(MakerError::Wallet)?;
         }
-        let mut wallet = Wallet::load_or_init(&wallet_path, blockchain, config.password.clone())?;
+        // Take the passphrase out of the config: the wallet keeps the derived
+        // key material, so the cleartext passphrase must not linger in the
+        // long-lived server config.
+        let mut wallet = Wallet::load_or_init(&wallet_path, blockchain, config.password.take())?;
         let data_dir = config.data_dir.clone();
         log::info!("Sync at:----MakerServer init----");
         wallet.sync_and_save(&shutdown)?;
@@ -672,19 +675,19 @@ impl MakerServer {
     /// the maker create a second bond and doubly lock funds. Finalizing it
     /// here prevents that.
     fn finalize_pending_fidelity_bonds(&self) -> Result<(), MakerError> {
-        loop {
-            let pending = lock_debug!(self.wallet.read())
-                .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                .store
-                .fidelity_bond
-                .iter()
-                .find(|b| !b.is_spent && b.conf_height.is_none())
-                .map(|b| (b.bond_index, b.outpoint.txid));
+        // Snapshot the pending bonds once: an unrecoverable bond stays
+        // pending in the wallet, so re-finding inside the loop would spin
+        // on it forever.
+        let pending: Vec<(u32, bitcoin::Txid)> = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .store
+            .fidelity_bond
+            .iter()
+            .filter(|b| !b.is_spent && b.conf_height.is_none())
+            .map(|b| (b.bond_index, b.outpoint.txid))
+            .collect();
 
-            let Some((index, txid)) = pending else {
-                return Ok(());
-            };
-
+        for (index, txid) in pending {
             log::info!(
                 "[{}] Found unconfirmed fidelity bond {}, waiting for confirmation instead of creating a new one",
                 self.config.network_port,
@@ -694,10 +697,25 @@ impl MakerServer {
             // An evicted bond tx would never confirm; rebroadcast the stored
             // raw transaction before waiting. Returns the original txid
             // unchanged if the broadcast is still live.
-            let txid = lock_debug!(self.wallet.read())
+            let txid = match lock_debug!(self.wallet.read())
                 .map_err(|_| MakerError::General("Failed to lock wallet"))?
                 .ensure_fidelity_bond_broadcast(index)
-                .map_err(MakerError::Wallet)?;
+            {
+                Ok(txid) => txid,
+                // The bond was evicted and there is no stored transaction to
+                // rebroadcast: it can never confirm. Losing the bond must not
+                // take the maker down — log it and start up anyway.
+                Err(WalletError::Fidelity(FidelityError::BondTransactionMissing { .. })) => {
+                    log::error!(
+                        "[{}] Pending fidelity bond {} was evicted and has no stored transaction; \
+                         it is unrecoverable. Skipping it and continuing startup.",
+                        self.config.network_port,
+                        txid
+                    );
+                    continue;
+                }
+                Err(e) => return Err(MakerError::Wallet(e)),
+            };
 
             // Wait on a fresh backend connection so the wallet lock is not
             // held for the duration of the wait.
@@ -706,15 +724,30 @@ impl MakerServer {
                 .blockchain
                 .new_connection()
                 .map_err(MakerError::Wallet)?;
-            let conf_height = crate::wallet::wait_for_tx_confirmation(
+            let conf_height = match crate::wallet::wait_for_tx_confirmation(
                 &chain,
                 &[txid],
                 1,
                 crate::utill::TX_BROADCAST_TIMEOUT,
                 Some(&self.shutdown),
                 None,
-            )
-            .map_err(MakerError::Wallet)?;
+            ) {
+                Ok(height) => height,
+                // The bond tx may never confirm (e.g. evicted again at a low
+                // feerate). Losing it must not take the maker down: log it,
+                // skip it, and let the next restart retry.
+                Err(WalletError::TxConfirmationTimeout(msg)) => {
+                    log::error!(
+                        "[{}] Pending fidelity bond {} did not confirm ({}); \
+                         skipping it and continuing startup.",
+                        self.config.network_port,
+                        txid,
+                        msg
+                    );
+                    continue;
+                }
+                Err(e) => return Err(MakerError::Wallet(e)),
+            };
 
             lock_debug!(self.wallet.write())
                 .map_err(|_| MakerError::General("Failed to lock wallet"))?
@@ -728,6 +761,8 @@ impl MakerServer {
                 conf_height
             );
         }
+
+        Ok(())
     }
 
     /// Setup fidelity bond for this maker.
@@ -1994,12 +2029,45 @@ impl MakerRpc for MakerServer {
 
 #[cfg(test)]
 mod tests {
-    use super::{ShutdownSignal, ThreadPool};
+    use super::{MakerServerConfig, ShutdownSignal, ThreadPool};
+    use crate::utill::MIN_RELAY_FEE_RATE;
     use std::{
         sync::{atomic::Ordering, mpsc, Arc, TryLockError},
         thread,
         time::{Duration, Instant},
     };
+
+    /// Non-finite or below-minimum fidelity feerates clamp to the relay
+    /// minimum; a valid value is kept. A plain `<` comparison would let
+    /// `nan` through into the bond fee math.
+    #[test]
+    fn maker_config_clamps_invalid_fidelity_feerate() {
+        // The accepted timelock range depends on the integration-test
+        // feature, so write one that is valid for this build instead of
+        // inheriting the 15,000-block default (invalid under the feature).
+        let timelock = if cfg!(feature = "integration-test") {
+            950
+        } else {
+            15_000
+        };
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let resolve = |feerate: &str| {
+            let path = dir.path().join("config.toml");
+            std::fs::write(
+                &path,
+                format!("fidelity_timelock = {timelock}\nfidelity_feerate = {feerate}\n"),
+            )
+            .unwrap();
+            MakerServerConfig::new(Some(&path))
+                .unwrap()
+                .fidelity_feerate
+        };
+
+        assert_eq!(resolve("nan"), MIN_RELAY_FEE_RATE);
+        assert_eq!(resolve("inf"), MIN_RELAY_FEE_RATE);
+        assert_eq!(resolve("0.5"), MIN_RELAY_FEE_RATE);
+        assert_eq!(resolve("3.0"), 3.0);
+    }
 
     /// Keeps wallet inspection usable without clearing the terminal server latch.
     #[test]

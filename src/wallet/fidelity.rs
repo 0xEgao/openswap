@@ -56,10 +56,19 @@ pub enum FidelityError {
     BondAlreadyRedeemed,
     BondLocktimeExpired,
     InvalidCertHash,
-    InvalidConfirmationHeight { claimed: Option<u32>, actual: u32 },
+    InvalidConfirmationHeight {
+        claimed: Option<u32>,
+        actual: u32,
+    },
     General(String),
     InvalidBondLocktime,
     BondUncomfirmed,
+    /// The bond's funding transaction was evicted from the network and the
+    /// wallet holds no stored raw transaction to rebroadcast, so the bond
+    /// can never be recovered by this maker.
+    BondTransactionMissing {
+        index: u32,
+    },
 }
 
 impl std::fmt::Display for FidelityError {
@@ -82,6 +91,10 @@ impl std::fmt::Display for FidelityError {
                 write!(f, "Fidelity bond locktime is outside the acceptable range")
             }
             FidelityError::BondUncomfirmed => write!(f, "Fidelity bond transaction is unconfirmed"),
+            FidelityError::BondTransactionMissing { index } => write!(
+                f,
+                "fidelity bond at index {index} was evicted and has no stored transaction to rebroadcast"
+            ),
             FidelityError::General(msg) => write!(f, "{}", msg),
         }
     }
@@ -404,11 +417,11 @@ impl Wallet {
 
         let child_derivation_path = derivation_path.child(ChildNumber::Normal { index });
 
-        Ok(self
-            .store
-            .master_key
-            .derive_priv(&secp, &child_derivation_path)?
-            .to_keypair(&secp))
+        self.with_master_key(|mk| {
+            Ok(mk
+                .derive_priv(&secp, &child_derivation_path)?
+                .to_keypair(&secp))
+        })
     }
 
     /// Derives the fidelity redeemscript from bond values at a given index.
@@ -581,9 +594,10 @@ impl Wallet {
             bond.outpoint.txid
         );
 
-        let tx = bond.tx.as_ref().ok_or(WalletError::General(format!(
-            "fidelity bond at index {index} has no stored transaction to rebroadcast"
-        )))?;
+        let tx = bond
+            .tx
+            .as_ref()
+            .ok_or(FidelityError::BondTransactionMissing { index })?;
         let txid = self.send_tx(tx)?;
         debug_assert_eq!(txid, bond.outpoint.txid);
 
@@ -592,7 +606,7 @@ impl Wallet {
 
     /// Update the confirmation height of a fidelity bond after it confirms.
     /// Also drops the stored raw transaction, which is only kept as a
-    /// rebroadcast fallback until confirmation.
+    /// rebroadcast fallback until confirmation, and saves the wallet file.
     pub fn update_fidelity_bond_conf_details(
         &mut self,
         index: u32,
@@ -606,6 +620,10 @@ impl Wallet {
 
         bond.conf_height = Some(conf_height);
         bond.tx = None;
+
+        // Persist immediately: without this a stop before the next save
+        // replays the rebroadcast-and-wait cycle on the next start.
+        self.save_to_disk()?;
 
         Ok(())
     }

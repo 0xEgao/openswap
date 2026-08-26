@@ -10,8 +10,8 @@ use std::{path::PathBuf, sync::Arc};
 
 /// OpenSwap Maker Server
 ///
-/// The server requires a Bitcoin Core RPC connection running in Testnet4. It requires some starting balance, around 50,000 sats for Fidelity + Swap Liquidity (suggested 50,000 sats).
-/// So topup with at least 0.001 BTC to start all the node processses. Suggested [faucet here]<https://mempool.space/testnet4/faucet>
+/// The server requires a Bitcoin Core RPC connection or an Electrum server (via --electrum), running on the custom signet. It requires some starting balance — around 50,000 sats for Fidelity + Swap Liquidity.
+/// A 0.001 BTC top-up covers this with margin. Suggested faucet: <https://faucet.citadelfoss.xyz/>
 ///
 /// All server processes will start after the fidelity bond transaction is confirmed. This may take some time. Approx: 10 mins.
 /// Once the bond is confirmed, the server starts listening for incoming swap requests. As it performs swaps for clients, it keeps earning fees.
@@ -69,7 +69,9 @@ struct Cli {
     /// Optional wallet name. If the wallet exists, load the wallet, else create a new wallet with the given name. Default: maker
     #[clap(name = "WALLET", long, short = 'w')]
     pub(crate) wallet_name: Option<String>,
-    /// Optional Password for the encryption of the wallet.
+    /// Password for the encryption of the wallet. Required when creating a
+    /// new wallet (wallet files are always encrypted) and to open an
+    /// encrypted one.
     #[clap(name = "PASSWORD", long, short = 'p')]
     pub password: Option<String>,
 }

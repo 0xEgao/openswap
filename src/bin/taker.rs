@@ -20,8 +20,8 @@ use std::{path::PathBuf, str::FromStr};
 /// The app works as a regular Bitcoin wallet with the added capability to perform openswaps.
 /// It can talk to either a Bitcoin Core node (over RPC + ZMQ — the default) or an
 /// Electrum-protocol server (via `--electrum`). Both paths support the full swap flow
-/// and the `restore` subcommand. It currently only runs on Testnet4.
-/// Suggested faucet for getting Signet coins (tor browser required): <http://s2ncekhezyo2tkwtftti3aiukfpqmxidatjrdqmwie6xnf2dfggyscad.onion/>
+/// and the `restore` subcommand. It currently only runs on the custom signet.
+/// Suggested faucet for getting signet coins: <https://faucet.citadelfoss.xyz/>
 ///
 /// For more detailed usage information, please refer: <https://github.com/citadel-foss/openswap/blob/master/docs/taker.md>
 ///
@@ -76,7 +76,9 @@ struct Cli {
     #[clap(name = "WALLET", long, short = 'w')]
     pub wallet_name: Option<String>,
 
-    /// Optional Password for the encryption of the wallet.
+    /// Password for the encryption of the wallet. Required when creating a
+    /// new wallet (wallet files are always encrypted) and to open an
+    /// encrypted one.
     #[clap(name = "PASSWORD", long, short = 'p')]
     pub password: Option<String>,
 
@@ -179,15 +181,12 @@ enum Commands {
     /// The backup will be created in the current working directory with the filename:
     /// `<wallet_name>-backup.json`.
     ///
-    /// Use the `-e, --encrypt` flag to encrypt the backup. If enabled, you will be prompted
-    /// interactively to enter a passphrase.
+    /// Backups contain the master key and are always encrypted; you will be
+    /// prompted interactively to enter a passphrase.
     ///
     ///
     #[clap(verbatim_doc_comment)]
-    Backup {
-        #[clap(long, short = 'e')]
-        encrypt: bool,
-    },
+    Backup,
 
     /// Restore a wallet from a backup file.
     ///
@@ -320,7 +319,7 @@ fn main() -> Result<(), TakerError> {
             args.command,
             Commands::Recover
                 | Commands::FetchOffers
-                | Commands::Backup { .. }
+                | Commands::Backup
                 | Commands::Restore { .. }
                 | Commands::OpenSwap { .. }
         ),
@@ -368,7 +367,7 @@ fn main() -> Result<(), TakerError> {
             Some(wallet_name), // Use the actual translated wallet name here.
             backend,
             backup_file,
-        );
+        )?;
         return Ok(());
     }
 
@@ -654,9 +653,9 @@ fn main() -> Result<(), TakerError> {
         Commands::Recover => {
             taker.recover_active_swap()?;
         }
-        Commands::Backup { encrypt } => {
+        Commands::Backup => {
             let wallet = lock_debug!(taker.get_wallet().read()).unwrap();
-            Wallet::backup_interactive(&wallet, *encrypt);
+            Wallet::backup_interactive(&wallet)?;
         }
         Commands::Restore { .. } => {
             // Handled above before taker init
