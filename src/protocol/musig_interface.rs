@@ -39,7 +39,7 @@ pub fn get_aggregated_pubkey_compat(
     let pubkey2 = btc_pubkey_to_secp!(pubkey2);
     let agg_pubkey = get_aggregated_pubkey(&pubkey1, &pubkey2);
     Ok(btc_secp::XOnlyPublicKey::from_slice(
-        &agg_pubkey.serialize(),
+        &agg_pubkey.to_byte_array(),
     )?)
 }
 
