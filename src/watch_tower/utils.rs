@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashSet, VecDeque},
+    convert::TryFrom,
     str::FromStr,
 };
 
@@ -35,7 +36,7 @@ pub(crate) struct SeenTxids {
     in_flight: HashSet<Txid>,
 }
 
-/// Fidelity announcement done by watcher to registry
+/// Structurally validated fidelity candidate passed from discovery to the registry.
 #[derive(Debug)]
 pub struct FidelityAnnouncement {
     /// Maker address; integration-test builds use an IPv4 `ip:port` endpoint.
@@ -148,12 +149,15 @@ fn parse_fidelity_op_return(data: &[u8]) -> Option<FidelityAnnouncement> {
     })
 }
 
-/// Process a transaction for fidelity OP_RETURN announcement.
-pub fn process_fidelity(tx: &Transaction) -> Option<FidelityAnnouncement> {
-    let tx_height = match tx.lock_time {
-        LockTime::Blocks(height) if height != Height::ZERO => height.to_consensus_u32(),
-        _ => return None,
-    };
+/// Validates a fidelity announcement against its confirmed transaction and block height.
+pub fn process_fidelity(
+    tx: &Transaction,
+    confirmation_height: u64,
+) -> Option<FidelityAnnouncement> {
+    let confirmation_height = u32::try_from(confirmation_height).ok()?;
+    if !matches!(tx.lock_time, LockTime::Blocks(height) if height != Height::ZERO) {
+        return None;
+    }
     if tx.input.is_empty()
         || tx
             .input
@@ -173,7 +177,9 @@ pub fn process_fidelity(tx: &Transaction) -> Option<FidelityAnnouncement> {
     }
     let data = extract_op_return_data(announcement_output.script_pubkey.as_bytes())?;
     let announcement = parse_fidelity_op_return(data)?;
-    let relative_timelock = announcement.expires_at_height.checked_sub(tx_height)?;
+    let relative_timelock = announcement
+        .expires_at_height
+        .checked_sub(confirmation_height)?;
     if !(MIN_FIDELITY_TIMELOCK..=MAX_FIDELITY_TIMELOCK).contains(&relative_timelock) {
         return None;
     }
@@ -183,16 +189,24 @@ pub fn process_fidelity(tx: &Transaction) -> Option<FidelityAnnouncement> {
 /// Processes each transaction in a block, updating watch entries and recording fidelity data.
 pub fn process_block<R: Role>(
     block: Block,
+    confirmation_height: Option<u64>,
     registry: &mut FileRegistry,
 ) -> Result<(), WatcherError> {
+    if R::RUN_DISCOVERY && confirmation_height.is_none() {
+        log::warn!("Skipping fidelity discovery for block with unknown confirmation height");
+    }
+
     for tx in block.txdata.iter() {
         process_transaction(tx, registry, true)?;
         if R::RUN_DISCOVERY {
-            let fidelity_announcement = process_fidelity(tx);
+            let Some(confirmation_height) = confirmation_height else {
+                continue;
+            };
+            let fidelity_announcement = process_fidelity(tx, confirmation_height);
             if let Some(fidelity_announcement) = fidelity_announcement {
                 let txid = tx.compute_txid();
                 if registry.insert_fidelity(txid, fidelity_announcement)? {
-                    log::info!("Stored verified fidelity via blockchain: {}", txid);
+                    log::info!("Stored validated fidelity candidate via blockchain: {txid}");
                 }
             }
         }
@@ -209,6 +223,10 @@ pub fn process_transaction(
     let watch_requests = registry.list_watches()?;
     for input in &tx.input {
         let outpoint = input.previous_output;
+        if in_block && outpoint.vout == 0 {
+            registry.remove_fidelity(outpoint.txid)?;
+        }
+
         for watch_request in &watch_requests {
             if outpoint != watch_request.outpoint {
                 continue;
@@ -250,8 +268,7 @@ pub(crate) fn parse_fidelity_event(event: &nostr::Event) -> Option<(Txid, u32)> 
 
     let txid = Txid::from_str(txid).ok()?;
     let vout = vout.parse::<u32>().ok()?;
-
-    Some((txid, vout))
+    (vout == 0).then_some((txid, vout))
 }
 
 impl SeenTxids {
@@ -307,6 +324,10 @@ mod tests {
         absolute::{Height, LockTime},
         hashes::Hash,
         transaction, Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Txid, Witness,
+    };
+    use nostr::{
+        event::{EventBuilder, Kind},
+        key::{Keys, SecretKey},
     };
 
     #[cfg(not(feature = "integration-test"))]
@@ -374,6 +395,14 @@ mod tests {
         transaction
     }
 
+    fn fidelity_event(content: String) -> nostr::Event {
+        let keys = Keys::new(SecretKey::generate());
+        EventBuilder::new(Kind::Custom(37780), content)
+            .build(keys.public_key)
+            .sign_with_keys(&keys)
+            .unwrap()
+    }
+
     #[test]
     fn test_maker_address_validation() {
         #[cfg(not(feature = "integration-test"))]
@@ -413,25 +442,67 @@ mod tests {
     }
 
     #[test]
+    fn test_fidelity_event_requires_bond_vout_zero() {
+        let txid = Txid::from_slice(&[7u8; 32]).unwrap();
+        let canonical = fidelity_event(format!("{txid}:0"));
+        assert_eq!(parse_fidelity_event(&canonical), Some((txid, 0)));
+
+        let noncanonical = fidelity_event(format!("{txid}:1"));
+        assert!(parse_fidelity_event(&noncanonical).is_none());
+    }
+
+    #[test]
     fn test_process_fidelity_valid() {
         let lock = 500;
         let tx = fidelity_tx(lock, &announcement(lock));
 
-        let ann = process_fidelity(&tx).expect("expected valid fidelity announcement");
+        let ann =
+            process_fidelity(&tx, u64::from(lock)).expect("expected valid fidelity announcement");
 
         #[cfg(not(feature = "integration-test"))]
         assert_eq!(ann.onion, format!("{TEST_ONION_LABEL}.onion"));
         #[cfg(feature = "integration-test")]
         assert_eq!(ann.onion, "127.0.0.1:9050");
         assert_eq!(ann.expires_at_height, lock + MIN_FIDELITY_TIMELOCK);
+        let mut with_change = tx.clone();
+        with_change.output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new(),
+        });
+        assert!(process_fidelity(&with_change, u64::from(lock)).is_some());
+    }
+
+    #[test]
+    fn test_process_fidelity_uses_confirmation_height() {
+        let confirmation_height = 500;
+        let tx_locktime = 400;
+        let tx = fidelity_tx(tx_locktime, &announcement(confirmation_height));
+        assert!(process_fidelity(&tx, u64::from(confirmation_height)).is_some());
+
+        let max_payload = format!(
+            "{}#{}",
+            endpoint_for_test(),
+            confirmation_height + MAX_FIDELITY_TIMELOCK
+        );
+        assert!(process_fidelity(
+            &fidelity_tx(tx_locktime, max_payload.as_bytes()),
+            u64::from(confirmation_height)
+        )
+        .is_some());
+
+        let wrong_reference = fidelity_tx(tx_locktime, &announcement(tx_locktime));
+        assert!(process_fidelity(&wrong_reference, u64::from(confirmation_height)).is_none());
     }
 
     #[cfg(not(feature = "integration-test"))]
     #[test]
     fn test_process_fidelity_rejects_noncanonical_onion_suffix_in_payload() {
         let lock = 500;
+        assert!(normalize_onion_address(&format!("{TEST_ONION_LABEL}.onion")).is_none());
         let payload = format!("{TEST_ONION_LABEL}.onion#{}", lock + MIN_FIDELITY_TIMELOCK);
-        assert!(process_fidelity(&fidelity_tx(lock, payload.as_bytes())).is_none());
+        assert!(
+            process_fidelity(&fidelity_tx(lock, payload.as_bytes()), u64::from(lock)).is_none()
+        );
     }
 
     #[test]
@@ -440,14 +511,17 @@ mod tests {
         let valid_payload = announcement(lock);
 
         let tx0 = fidelity_tx(0, &valid_payload);
-        assert!(process_fidelity(&tx0).is_none());
+        assert!(process_fidelity(&tx0, u64::from(lock)).is_none());
+        let mut time_based = fidelity_tx(lock, &valid_payload);
+        time_based.lock_time = LockTime::from_consensus(500_000_000);
+        assert!(process_fidelity(&time_based, u64::from(lock)).is_none());
 
         let tx1 = tx(
             lock,
             vec![OutPoint::null()],
             vec![op_return(&valid_payload).into()],
         );
-        assert!(process_fidelity(&tx1).is_none());
+        assert!(process_fidelity(&tx1, u64::from(lock)).is_none());
 
         let tx4 = tx(
             lock,
@@ -459,11 +533,14 @@ mod tests {
                 ScriptBuf::new(),
             ],
         );
-        assert!(process_fidelity(&tx4).is_none());
+        assert!(process_fidelity(&tx4, u64::from(lock)).is_none());
 
         let mut tx_no = fidelity_tx(lock, &valid_payload);
         tx_no.output[1].script_pubkey = ScriptBuf::new();
-        assert!(process_fidelity(&tx_no).is_none());
+        assert!(process_fidelity(&tx_no, u64::from(lock)).is_none());
+        let mut valued_announcement = fidelity_tx(lock, &valid_payload);
+        valued_announcement.output[1].value = Amount::from_sat(1);
+        assert!(process_fidelity(&valued_announcement, u64::from(lock)).is_none());
 
         for hostile in [
             b"<script>#13460".as_slice(),
@@ -471,40 +548,46 @@ mod tests {
             b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1#13460".as_slice(),
             b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#013460".as_slice(),
         ] {
-            assert!(process_fidelity(&fidelity_tx(lock, hostile)).is_none());
+            assert!(process_fidelity(&fidelity_tx(lock, hostile), u64::from(lock)).is_none());
         }
+        let overlong = vec![b'a'; MAX_FIDELITY_ANNOUNCEMENT_BYTES + 1];
+        assert!(process_fidelity(&fidelity_tx(lock, &overlong), u64::from(lock)).is_none());
 
         let mut too_small = fidelity_tx(lock, &valid_payload);
         too_small.output[0].value = Amount::from_sat(MIN_FIDELITY_BOND_AMOUNT_SATS - 1);
-        assert!(process_fidelity(&too_small).is_none());
+        assert!(process_fidelity(&too_small, u64::from(lock)).is_none());
 
         let mut wrong_script = fidelity_tx(lock, &valid_payload);
         wrong_script.output[0].script_pubkey = ScriptBuf::new();
-        assert!(process_fidelity(&wrong_script).is_none());
+        assert!(process_fidelity(&wrong_script, u64::from(lock)).is_none());
 
         let mut noncanonical = fidelity_tx(lock, &valid_payload);
         let mut pushdata = vec![0x6a, 0x4c, valid_payload.len() as u8];
         pushdata.extend_from_slice(&valid_payload);
         noncanonical.output[1].script_pubkey = pushdata.into();
-        assert!(process_fidelity(&noncanonical).is_none());
+        assert!(process_fidelity(&noncanonical, u64::from(lock)).is_none());
 
         let too_soon = format!(
             "{}#{}",
             endpoint_for_test(),
             lock + MIN_FIDELITY_TIMELOCK - 1
         );
-        assert!(process_fidelity(&fidelity_tx(lock, too_soon.as_bytes())).is_none());
+        assert!(
+            process_fidelity(&fidelity_tx(lock, too_soon.as_bytes()), u64::from(lock)).is_none()
+        );
 
         let too_late = format!(
             "{}#{}",
             endpoint_for_test(),
             lock + MAX_FIDELITY_TIMELOCK + 1
         );
-        assert!(process_fidelity(&fidelity_tx(lock, too_late.as_bytes())).is_none());
+        assert!(
+            process_fidelity(&fidelity_tx(lock, too_late.as_bytes()), u64::from(lock)).is_none()
+        );
 
         let mut final_sequence = fidelity_tx(lock, &valid_payload);
         final_sequence.input[0].sequence = Sequence::MAX;
-        assert!(process_fidelity(&final_sequence).is_none());
+        assert!(process_fidelity(&final_sequence, u64::from(lock)).is_none());
     }
 
     fn endpoint_for_test() -> String {
@@ -536,6 +619,24 @@ mod tests {
         let w = reg.list_watches().unwrap().pop().unwrap();
         assert!(!w.in_block);
     }
+
+    #[test]
+    fn test_confirmed_bond_spend_removes_fidelity_candidate() {
+        let lock = 500;
+        let bond_tx = fidelity_tx(lock, &announcement(lock));
+        let txid = bond_tx.compute_txid();
+        let announcement = process_fidelity(&bond_tx, u64::from(lock)).unwrap();
+        let mut registry = FileRegistry::new();
+        registry.insert_fidelity(txid, announcement).unwrap();
+
+        let spending = tx(0, vec![OutPoint::new(txid, 0)], vec![]);
+        process_transaction(&spending, &mut registry, false).unwrap();
+        assert_eq!(registry.list_fidelity(0).unwrap().len(), 1);
+
+        process_transaction(&spending, &mut registry, true).unwrap();
+        assert!(registry.list_fidelity(0).unwrap().is_empty());
+    }
+
     #[test]
     fn test_confirmed_spend_survives_a_mempool_rival() {
         let mut reg = FileRegistry::new();

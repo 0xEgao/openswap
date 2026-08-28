@@ -134,7 +134,6 @@ impl MakerOfferCandidate {
                 self.state
             );
         }
-        self.fidelity_outpoint = Some(offer.fidelity.bond.outpoint());
         self.offer = Some(offer);
         self.protocol = Some(protocol);
         self.last_offer_update_ts = Some(now_ts);
@@ -617,6 +616,17 @@ impl OfferSyncService {
         if shutdown.load(Ordering::Relaxed) {
             return None;
         }
+        let announced_outpoint = match lock_debug!(offerbook.read()) {
+            Ok(book) => book
+                .makers
+                .iter()
+                .find(|maker| maker.address == addr)
+                .and_then(|maker| maker.fidelity_outpoint),
+            Err(_) => {
+                log::error!("offerbook lock poisoned; skipping maker {addr}");
+                return None;
+            }
+        };
         let downloaded = addr
             .clone()
             .download_offer_with_retries(socks_port, shutdown);
@@ -627,6 +637,7 @@ impl OfferSyncService {
                 blockchain,
                 &oa.offer.fidelity,
                 &oa.address.to_string(),
+                announced_outpoint,
                 &oa.offer.tweakable_point,
                 &oa.offer.tweak_chain_code,
             );
@@ -883,15 +894,31 @@ enum FidelityCheckError {
     BadBond(TakerError),
 }
 
+fn ensure_announced_outpoint_matches(
+    announced_outpoint: Option<OutPoint>,
+    offered_outpoint: OutPoint,
+) -> Result<(), FidelityCheckError> {
+    if let Some(expected) = announced_outpoint {
+        if expected != offered_outpoint {
+            return Err(FidelityCheckError::BadBond(TakerError::General(format!(
+                "Maker offered fidelity bond {offered_outpoint}, but discovery announced {expected}"
+            ))));
+        }
+    }
+    Ok(())
+}
+
 /// Verifies a fidelity proof against the blockchain.
 fn verify_fidelity_with_backend(
     blockchain: &AnyBlockchain,
     proof: &FidelityProof,
     onion_addr: &str,
+    announced_outpoint: Option<OutPoint>,
     tweakable_point: &bitcoin::PublicKey,
     tweak_chain_code: &bitcoin::bip32::ChainCode,
 ) -> Result<(), FidelityCheckError> {
     let backend_down = |e: WalletError| FidelityCheckError::BackendDown(TakerError::Wallet(e));
+    ensure_announced_outpoint_matches(announced_outpoint, proof.bond.outpoint)?;
 
     let txid = proof.bond.outpoint.txid;
     let vout = proof.bond.outpoint.vout;
@@ -947,7 +974,14 @@ impl OfferBook {
     }
 
     fn upsert_address(&mut self, address: MakerAddress, txid: Option<Txid>) {
-        if self.makers.iter().any(|m| m.address == address) {
+        if let Some(maker) = self
+            .makers
+            .iter_mut()
+            .find(|maker| maker.address == address)
+        {
+            if let Some(txid) = txid {
+                maker.fidelity_outpoint = Some(OutPoint::new(txid, 0));
+            }
             return;
         }
 
@@ -1379,6 +1413,19 @@ mod tests {
         for invalid in ["localhost:6102", "127.0.0.1:0", "127.0.0.1:65536"] {
             assert!(MakerAddress::try_from(invalid.to_string()).is_err());
         }
+    }
+
+    #[test]
+    fn offered_fidelity_outpoint_must_match_discovery() {
+        let announced = OutPoint::new(Txid::from_slice(&[1; 32]).unwrap(), 0);
+        let offered = OutPoint::new(Txid::from_slice(&[2; 32]).unwrap(), 0);
+
+        assert!(ensure_announced_outpoint_matches(None, offered).is_ok());
+        assert!(ensure_announced_outpoint_matches(Some(offered), offered).is_ok());
+        assert!(matches!(
+            ensure_announced_outpoint_matches(Some(announced), offered),
+            Err(FidelityCheckError::BadBond(_))
+        ));
     }
 
     #[test]
