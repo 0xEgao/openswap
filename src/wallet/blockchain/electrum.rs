@@ -259,8 +259,11 @@ pub struct Electrum {
     /// Set when `call` rebuilds the client. The fresh socket carries no
     /// server-side script subscriptions, so `poll_event` must re-arm them.
     needs_rearm: AtomicBool,
-    /// Times the transport was rebuilt. A healthy held connection leaves this at
-    /// 0; used by tests to prove we do not reconnect per sync or watch call.
+    /// Set after the final watcher for a script is removed. Recycling the
+    /// connection clears electrum-client's unsafe-to-unsubscribe local state.
+    subscription_reset_pending: AtomicBool,
+    /// Times the transport was rebuilt for failure recovery or subscription cleanup.
+    /// Used by tests to prove ordinary sync and watch calls reuse the connection.
     reconnects: AtomicU64,
     /// Scripts the wallet asked us to track (Core's server-side wallet equivalent).
     watched: Mutex<HashSet<ScriptBuf>>,
@@ -347,6 +350,7 @@ impl Electrum {
             config,
             ping_interval,
             needs_rearm: AtomicBool::new(false),
+            subscription_reset_pending: AtomicBool::new(false),
             reconnects: AtomicU64::new(0),
             watched: Mutex::new(HashSet::new()),
             hd_paths: Mutex::new(HashMap::new()),
@@ -458,15 +462,14 @@ impl Electrum {
 
     /// Times the transport was rebuilt since construction.
     ///
-    /// The connection is meant to be held, so a healthy run leaves this at 0.
-    /// A non-zero value means the socket died and was replaced, not that calls
-    /// failed.
+    /// The connection is normally held. A non-zero value means the socket was
+    /// replaced after a transport failure or to clean up inactive subscriptions.
     pub fn reconnect_count(&self) -> u64 {
         self.reconnects.load(Ordering::Relaxed)
     }
 
     /// Outpoints currently holding this script's subscription open. Zero means no
-    /// entry exists, so the server was told to unsubscribe.
+    /// active notifier entry; the connection is recycled to retire the server subscription.
     pub fn subscription_watchers(&self, spk: &Script) -> usize {
         lock_debug!(self.notifier.lock())
             .unwrap_or_else(|e| {
@@ -1316,18 +1319,14 @@ impl Blockchain for Electrum {
             guard.subscriptions.remove(spk);
         }
         guard.dirty.remove(spk);
-        // Always tell the server too: a partial subscribe can leave it armed
-        // with no local entry. `NotSubscribed` is the goal state already, and
-        // electrs has no unsubscribe method, so its "method not found" is too.
-        match self.call(|c| c.script_unsubscribe(spk).map(|_| ())) {
-            Ok(()) | Err(WalletError::Electrum(electrum_client::Error::NotSubscribed(_))) => Ok(()),
-            Err(WalletError::Electrum(electrum_client::Error::Protocol(e)))
-                if e.get("code").and_then(|c| c.as_i64()) == Some(-32601) =>
-            {
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        // Keep the electrum-client subscription alive until this connection is
+        // dropped. Its `script_unsubscribe` holds the internal notification-map
+        // mutex while waiting for the server response. If a queued script
+        // notification is read first, the same reader tries to lock that mutex
+        // and deadlocks forever, which in turn makes watcher shutdown hang.
+        self.subscription_reset_pending
+            .store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     fn poll_event(&self) -> Option<WatchEvent> {
@@ -1340,6 +1339,21 @@ impl Blockchain for Electrum {
         let state = &mut *guard;
         if let Some(ev) = state.pending.pop_front() {
             return Some(ev);
+        }
+
+        // Calling electrum-client's unsubscribe can self-deadlock. Drop the
+        // whole connection instead, then use the normal reconnect path below to
+        // restore only subscriptions that still have watcher entries.
+        if self
+            .subscription_reset_pending
+            .swap(false, Ordering::SeqCst)
+        {
+            if let Err(e) = self.reconnect_client() {
+                log::warn!("failed to recycle Electrum subscriptions: {e:?}");
+                self.subscription_reset_pending
+                    .store(true, Ordering::SeqCst);
+                return None;
+            }
         }
 
         // A reconnect hands us a socket with no server-side subscriptions.
@@ -1605,6 +1619,80 @@ mod tests {
             !overlapped,
             "two requests reached the shared electrum socket concurrently"
         );
+    }
+
+    #[test]
+    fn unwatch_avoids_upstream_unsubscribe_and_allows_rewatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock electrum");
+        let addr = listener.local_addr().unwrap();
+        let header_hex =
+            serialize_hex(&bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header);
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept electrum client");
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+
+            // Opening handshake.
+            let features = read_request(&mut reader);
+            serde_json::to_writer(
+                &mut writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": features["id"],
+                    "error": { "code": -32601, "message": "method not found" }
+                }),
+            )
+            .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer.flush().unwrap();
+            let genesis = read_request(&mut reader);
+            write_result(&mut writer, &genesis, json!(header_hex));
+            let headers = read_request(&mut reader);
+            write_result(
+                &mut writer,
+                &headers,
+                json!({ "height": 0, "hex": header_hex }),
+            );
+
+            let subscribe = read_request(&mut reader);
+            assert_eq!(subscribe["method"], "blockchain.scripthash.subscribe");
+            write_result(&mut writer, &subscribe, Value::Null);
+            let history = read_request(&mut reader);
+            assert_eq!(history["method"], "blockchain.scripthash.get_history");
+            write_result(&mut writer, &history, json!([]));
+
+            // Unwatch must not send `scripthash.unsubscribe`: electrum-client
+            // can self-deadlock there when a notification precedes the reply.
+            // Rewatching instead reuses the live client subscription and goes
+            // straight to the history replay.
+            let next = read_request(&mut reader);
+            let next_method = next["method"].as_str().unwrap().to_string();
+            write_result(&mut writer, &next, json!([]));
+            next_method
+        });
+
+        let mut config = cfg(&format!("tcp://{addr}"), None);
+        config.max_retries = 0;
+        let backend = Electrum::new(&config).expect("connect to mock electrum");
+        let script = ScriptBuf::new();
+        let first_watch = OutPoint::new(Txid::all_zeros(), 0);
+        let second_watch = OutPoint::new(Txid::all_zeros(), 1);
+
+        backend
+            .subscribe_script(&script, first_watch)
+            .expect("subscribe first watch");
+        backend
+            .unsubscribe_script(&script, first_watch)
+            .expect("remove first watch");
+        assert_eq!(backend.subscription_watchers(&script), 0);
+        assert!(backend.subscription_reset_pending.load(Ordering::SeqCst));
+        backend
+            .subscribe_script(&script, second_watch)
+            .expect("reuse subscription for second watch");
+        assert_eq!(backend.subscription_watchers(&script), 1);
+
+        assert_eq!(server.join().unwrap(), "blockchain.scripthash.get_history");
     }
 
     #[test]
