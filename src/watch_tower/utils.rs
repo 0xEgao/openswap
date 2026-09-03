@@ -214,7 +214,7 @@ pub fn process_block<R: Role>(
     Ok(())
 }
 
-/// Updates the registry for a transaction by clearing spent fidelities and marking watched spends.
+/// Updates the registry for a transaction by marking watched spends.
 pub fn process_transaction(
     tx: &Transaction,
     registry: &mut FileRegistry,
@@ -223,10 +223,6 @@ pub fn process_transaction(
     let watch_requests = registry.list_watches()?;
     for input in &tx.input {
         let outpoint = input.previous_output;
-        if in_block && outpoint.vout == 0 {
-            registry.remove_fidelity(outpoint.txid)?;
-        }
-
         for watch_request in &watch_requests {
             if outpoint != watch_request.outpoint {
                 continue;
@@ -621,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn test_confirmed_bond_spend_removes_fidelity_candidate() {
+    fn test_confirmed_bond_spend_keeps_candidate_for_reconciliation() {
         let lock = 500;
         let bond_tx = fidelity_tx(lock, &announcement(lock));
         let txid = bond_tx.compute_txid();
@@ -630,11 +626,8 @@ mod tests {
         registry.insert_fidelity(txid, announcement).unwrap();
 
         let spending = tx(0, vec![OutPoint::new(txid, 0)], vec![]);
-        process_transaction(&spending, &mut registry, false).unwrap();
-        assert_eq!(registry.list_fidelity(0).unwrap().len(), 1);
-
         process_transaction(&spending, &mut registry, true).unwrap();
-        assert!(registry.list_fidelity(0).unwrap().is_empty());
+        assert_eq!(registry.list_fidelity(0).unwrap().len(), 1);
     }
 
     #[test]
