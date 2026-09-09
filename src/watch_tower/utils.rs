@@ -129,9 +129,6 @@ fn normalize_onion_address(s: &str) -> Option<String> {
 }
 
 fn parse_fidelity_op_return(data: &[u8]) -> Option<FidelityAnnouncement> {
-    if data.len() > MAX_FIDELITY_ANNOUNCEMENT_BYTES {
-        return None;
-    }
     let decoded = std::str::from_utf8(data).ok()?;
     let (endpoint, locktime_str) = decoded.split_once('#')?;
     if locktime_str.is_empty()
@@ -192,22 +189,22 @@ pub fn process_block<R: Role>(
     confirmation_height: Option<u64>,
     registry: &mut FileRegistry,
 ) -> Result<(), WatcherError> {
-    if R::RUN_DISCOVERY && confirmation_height.is_none() {
-        log::warn!("Skipping fidelity discovery for block with unknown confirmation height");
-    }
-
     for tx in block.txdata.iter() {
         process_transaction(tx, registry, true)?;
-        if R::RUN_DISCOVERY {
-            let Some(confirmation_height) = confirmation_height else {
-                continue;
-            };
-            let fidelity_announcement = process_fidelity(tx, confirmation_height);
-            if let Some(fidelity_announcement) = fidelity_announcement {
-                let txid = tx.compute_txid();
-                if registry.insert_fidelity(txid, fidelity_announcement)? {
-                    log::info!("Stored validated fidelity candidate via blockchain: {txid}");
-                }
+    }
+    if !R::RUN_DISCOVERY {
+        return Ok(());
+    }
+
+    let confirmation_height = confirmation_height.ok_or_else(|| {
+        WatcherError::General("Connected block is missing its confirmation height".to_string())
+    })?;
+    for tx in block.txdata.iter() {
+        let fidelity_announcement = process_fidelity(tx, confirmation_height);
+        if let Some(fidelity_announcement) = fidelity_announcement {
+            let txid = tx.compute_txid();
+            if registry.insert_fidelity(txid, fidelity_announcement)? {
+                log::info!("Stored validated fidelity candidate via blockchain: {txid}");
             }
         }
     }
@@ -318,13 +315,19 @@ mod tests {
     use crate::watch_tower::registry_storage::{FileRegistry, WatchRequest};
     use bitcoin::{
         absolute::{Height, LockTime},
+        blockdata::constants::genesis_block,
         hashes::Hash,
-        transaction, Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Txid, Witness,
+        transaction, Amount, Network, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Txid, Witness,
     };
     use nostr::{
         event::{EventBuilder, Kind},
         key::{Keys, SecretKey},
     };
+
+    struct DiscoveryRole;
+    impl Role for DiscoveryRole {
+        const RUN_DISCOVERY: bool = true;
+    }
 
     #[cfg(not(feature = "integration-test"))]
     const TEST_ONION_LABEL: &str = "aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaea37ead";
@@ -490,6 +493,14 @@ mod tests {
         assert!(process_fidelity(&wrong_reference, u64::from(confirmation_height)).is_none());
     }
 
+    #[test]
+    fn test_process_block_requires_confirmation_height_for_discovery() {
+        let mut registry = FileRegistry::new();
+        let result =
+            process_block::<DiscoveryRole>(genesis_block(Network::Regtest), None, &mut registry);
+        assert!(matches!(result, Err(WatcherError::General(_))));
+    }
+
     #[cfg(not(feature = "integration-test"))]
     #[test]
     fn test_process_fidelity_rejects_noncanonical_onion_suffix_in_payload() {
@@ -621,13 +632,26 @@ mod tests {
         let lock = 500;
         let bond_tx = fidelity_tx(lock, &announcement(lock));
         let txid = bond_tx.compute_txid();
+        let outpoint = OutPoint::new(txid, 0);
         let announcement = process_fidelity(&bond_tx, u64::from(lock)).unwrap();
         let mut registry = FileRegistry::new();
         registry.insert_fidelity(txid, announcement).unwrap();
+        registry
+            .upsert_watch(&WatchRequest {
+                outpoint,
+                script_pubkey: bond_tx.output[0].script_pubkey.clone(),
+                in_block: false,
+                spent_tx: None,
+            })
+            .unwrap();
 
-        let spending = tx(0, vec![OutPoint::new(txid, 0)], vec![]);
+        let spending = tx(0, vec![outpoint], vec![]);
         process_transaction(&spending, &mut registry, true).unwrap();
+
         assert_eq!(registry.list_fidelity(0).unwrap().len(), 1);
+        let watch = registry.list_watches().unwrap().pop().unwrap();
+        assert_eq!(watch.spent_tx, Some(spending));
+        assert!(watch.in_block);
     }
 
     #[test]

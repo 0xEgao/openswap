@@ -518,12 +518,20 @@ impl<R: Role> Watcher<R> {
                         let confirmation_height = if b.height > 0 {
                             Some(b.height)
                         } else {
-                            block.txdata.first().and_then(|tx| {
-                                self.blockchain
-                                    .tx_block_height(&tx.compute_txid())
-                                    .ok()
-                                    .flatten()
-                            })
+                            match &self.blockchain {
+                                AnyBlockchain::CoreRPC(core) => {
+                                    match core.block_height(&block.block_hash()) {
+                                        Ok(height) => Some(height),
+                                        Err(e) => {
+                                            log::error!("Could not resolve connected Core block height: {e}");
+                                            None
+                                        }
+                                    }
+                                }
+                                AnyBlockchain::Electrum(_) => {
+                                    Some(b.height).filter(|height| *height > 0)
+                                }
+                            }
                         };
                         if let Err(e) =
                             process_block::<R>(block, confirmation_height, &mut self.registry)
