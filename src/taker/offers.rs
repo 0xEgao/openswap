@@ -562,6 +562,24 @@ fn sync_and_wait(cmd_tx: &mpsc::Sender<SyncCommand>, timeout: Duration) -> Resul
     }
 }
 
+/// Groups verified bonds by maker; `None` marks distinct live outpoints.
+fn group_live_fidelity_candidates(
+    candidates: impl IntoIterator<Item = (MakerAddress, OutPoint)>,
+) -> HashMap<MakerAddress, Option<OutPoint>> {
+    let mut grouped = HashMap::new();
+    for (address, outpoint) in candidates {
+        grouped
+            .entry(address)
+            .and_modify(|current: &mut Option<OutPoint>| {
+                if current.is_some_and(|existing| existing != outpoint) {
+                    *current = None;
+                }
+            })
+            .or_insert(Some(outpoint));
+    }
+    grouped
+}
+
 impl OfferSyncService {
     /// Constructor method
     pub fn new(
@@ -602,7 +620,7 @@ impl OfferSyncService {
         };
         let fidelities = self.registry.list_fidelity(height)?;
         let mut spent_outpoints = Vec::new();
-        let mut live_candidates: HashMap<MakerAddress, Option<OutPoint>> = HashMap::new();
+        let mut live_outpoints = Vec::new();
         let mut live_expiries = HashMap::new();
         for fidelity in fidelities {
             let outpoint = OutPoint::new(fidelity.txid, 0);
@@ -619,16 +637,7 @@ impl OfferSyncService {
                         }
                     };
                     live_expiries.insert(outpoint, fidelity.expire_height);
-                    live_candidates
-                        .entry(address)
-                        .and_modify(|current| {
-                            if let Some(existing) = *current {
-                                if existing != outpoint {
-                                    *current = None;
-                                }
-                            }
-                        })
-                        .or_insert(Some(outpoint));
+                    live_outpoints.push((address, outpoint));
                 }
                 Ok(None) => spent_outpoints.push(outpoint),
                 Err(e) => log::warn!(
@@ -636,6 +645,7 @@ impl OfferSyncService {
                 ),
             }
         }
+        let live_candidates = group_live_fidelity_candidates(live_outpoints);
 
         {
             let mut book = lock_debug!(self.offerbook.inner.write())
@@ -692,7 +702,7 @@ impl OfferSyncService {
 
         let to_poll = lock_debug!(self.offerbook.inner.read())
             .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?
-            .makers_to_poll(now);
+            .makers_to_poll(now, &live_candidates);
 
         if !to_poll.is_empty() {
             let handles = self.spawn_offer_workers(to_poll)?;
@@ -1326,10 +1336,18 @@ impl OfferBook {
         }
     }
 
-    fn makers_to_poll(&self, now_ts: u64) -> Vec<MakerAddress> {
+    fn makers_to_poll(
+        &self,
+        now_ts: u64,
+        live_candidates: &HashMap<MakerAddress, Option<OutPoint>>,
+    ) -> Vec<MakerAddress> {
         self.makers
             .iter()
             .filter(|m| !matches!(m.state, MakerState::Bad))
+            .filter(|m| match m.fidelity_outpoint {
+                None => true,
+                Some(outpoint) => live_candidates.get(&m.address) == Some(&Some(outpoint)),
+            })
             .filter(|m| match m.next_offer_check_ts {
                 Some(next_ts) => now_ts >= next_ts,
                 None => true,
@@ -1751,6 +1769,21 @@ mod tests {
     }
 
     #[test]
+    fn groups_distinct_live_bonds_for_one_address_as_conflicted() {
+        let address = addr("6108");
+        let first = OutPoint::new(Txid::from_slice(&[4; 32]).unwrap(), 0);
+        let second = OutPoint::new(Txid::from_slice(&[5; 32]).unwrap(), 0);
+
+        let repeated =
+            group_live_fidelity_candidates([(address.clone(), first), (address.clone(), first)]);
+        assert_eq!(repeated.get(&address), Some(&Some(first)));
+
+        let conflicted =
+            group_live_fidelity_candidates([(address.clone(), first), (address.clone(), second)]);
+        assert_eq!(conflicted.get(&address), Some(&None));
+    }
+
+    #[test]
     fn fidelity_candidate_transitions_enforce_one_live_bond() {
         let address = addr("6108");
         let old = Txid::from_slice(&[4; 32]).unwrap();
@@ -1861,7 +1894,7 @@ mod tests {
     }
 
     #[test]
-    fn makers_to_poll_respects_backoff_timer() {
+    fn makers_to_poll_requires_current_fidelity_and_respects_backoff() {
         let now_ts = 170000;
         let mut book = OfferBook::default();
         book.makers.push(MakerOfferCandidate {
@@ -1877,11 +1910,22 @@ mod tests {
             next_offer_check_ts: Some(now_ts + 10),
         });
 
-        let to_poll = book.makers_to_poll(now_ts);
+        let address = book.makers[0].address.clone();
+        let outpoint = book.makers[0].fidelity_outpoint.unwrap();
+        let live_candidates = HashMap::from([(address.clone(), Some(outpoint))]);
+
+        let to_poll = book.makers_to_poll(now_ts, &live_candidates);
         assert!(to_poll.is_empty());
 
-        let to_poll_after = book.makers_to_poll(now_ts + 11);
+        let to_poll_after = book.makers_to_poll(now_ts + 11, &live_candidates);
         assert_eq!(to_poll_after, vec![addr("6103")]);
+
+        assert!(book.makers_to_poll(now_ts + 11, &HashMap::new()).is_empty());
+        book.makers[0].fidelity_outpoint = None;
+        assert_eq!(
+            book.makers_to_poll(now_ts + 11, &HashMap::new()),
+            vec![addr("6103")]
+        );
     }
 
     #[test]
@@ -1908,8 +1952,14 @@ mod tests {
         assert!(book.makers[0].backend_retry_pending);
         assert_eq!(book.makers[0].next_offer_check_ts, Some(retry_at));
         assert_eq!(book.prune_stale_makers(recovery_ts + 1), 0);
-        assert!(book.makers_to_poll(retry_at - 1).is_empty());
-        assert_eq!(book.makers_to_poll(retry_at), vec![address.clone()]);
+        let live_candidates = HashMap::from([(address.clone(), outpoint)]);
+        assert!(book
+            .makers_to_poll(retry_at - 1, &live_candidates)
+            .is_empty());
+        assert_eq!(
+            book.makers_to_poll(retry_at, &live_candidates),
+            vec![address.clone()]
+        );
 
         let bad = FidelityCheckError::BadBond(TakerError::General("bond is spent".into()));
         book.record_fidelity_failure(&address, &bad, retry_at);
