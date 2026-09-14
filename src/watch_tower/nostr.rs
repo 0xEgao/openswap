@@ -372,6 +372,16 @@ fn handle_relay_message(
                 return Ok(false);
             }
 
+            // Decoding a raw relay message does not verify its event ID or signature.
+            if let Err(e) = event.verify() {
+                log::warn!(
+                    "Rejecting invalid Nostr event | relay={} | event_id={} | error={e}",
+                    relay_url,
+                    event.id
+                );
+                return Ok(false);
+            }
+
             let Some((txid, vout)) = parse_fidelity_event(&event) else {
                 log::debug!(
                     "Ignoring unparsable fidelity event | relay={} | event_id={} | content={}",
@@ -394,10 +404,7 @@ fn handle_relay_message(
             // Claim the txid before any RPC work, so duplicate events and
             // concurrent relay sessions don't repeat the fetch and validation.
             if !lock_debug!(seen_txid.lock())?.claim(txid) {
-                let refreshed = registry.touch_fidelity_announcement(txid, cursor)?;
-                log::info!(
-                    "Skipping already-seen txid {txid} via {relay_url}; refreshed={refreshed}"
-                );
+                log::info!("Skipping already-seen txid {txid} via {relay_url}");
                 registry.save_nostr_cursor(relay_url, cursor)?;
                 return Ok(false);
             }
@@ -421,7 +428,7 @@ fn handle_relay_message(
                 Some(fidelity) => {
                     let maker_address = fidelity.onion.clone();
                     let expires_at_height = fidelity.expires_at_height;
-                    if registry.insert_fidelity_announcement(txid, fidelity, cursor)? {
+                    if registry.insert_fidelity(txid, fidelity)? {
                         log::info!(
                                 "Stored verified fidelity | relay={} | event_id={} | txid={} | vout={} | maker_address={} | expires_at_height={}",
                                 relay_url,
@@ -485,5 +492,51 @@ mod tests {
 
         // A well-formed frame still decodes, so the skip is not swallowing everything.
         assert!(decode_relay_frame(Message::Text(r#"["EOSE","sub1"]"#.into()), relay).is_some());
+    }
+
+    #[test]
+    fn tampered_event_is_rejected_before_claiming_txid() {
+        use bitcoin::{hashes::Hash, Txid};
+        use nostr::{
+            event::{EventBuilder, Tag, TagStandard},
+            key::Keys,
+        };
+
+        use crate::wallet::{BackendConfig, CoreRpcConfig};
+
+        let kind = Kind::Custom(37_780);
+        let txid = Txid::from_slice(&[1; 32]).unwrap();
+        let keys = Keys::generate();
+        let mut event = EventBuilder::new(kind, format!("{txid}:0"))
+            .tag(Tag::from_standardized(TagStandard::Expiration(
+                Timestamp::from_secs(Timestamp::now().as_secs() + 60),
+            )))
+            .build(keys.public_key)
+            .sign_with_keys(&keys)
+            .unwrap();
+        event.content = format!("{txid}:1");
+        assert!(event.verify().is_err());
+
+        let message = RelayMessage::Event {
+            subscription_id: Cow::Owned(SubscriptionId::new("test")),
+            event: Cow::Owned(event),
+        };
+        let registry = Arc::new(FileRegistry::new());
+        let blockchain = Arc::new(
+            AnyBlockchain::from_config(&BackendConfig::CoreRpc(CoreRpcConfig::default())).unwrap(),
+        );
+        let seen_txid = Arc::new(Mutex::new(SeenTxids::new()));
+
+        assert!(!handle_relay_message(
+            registry.clone(),
+            message,
+            blockchain,
+            "wss://relay.example",
+            kind,
+            &seen_txid,
+        )
+        .unwrap());
+        assert!(registry.list_fidelity(0).unwrap().is_empty());
+        assert!(seen_txid.lock().unwrap().claim(txid));
     }
 }
