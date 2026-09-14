@@ -6,7 +6,7 @@
 //! It uses asynchronous channels for concurrent processing of maker offers.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::TryFrom,
     fmt,
     io::BufWriter,
@@ -585,6 +585,10 @@ impl OfferSyncService {
             }
         };
         let fidelities = self.registry.list_fidelity(height)?;
+        let registry_outpoints = fidelities
+            .iter()
+            .map(|fidelity| OutPoint::new(fidelity.txid, 0))
+            .collect::<HashSet<_>>();
         let mut spent_outpoints = Vec::new();
         let mut live_outpoints = Vec::new();
         for fidelity in fidelities {
@@ -615,6 +619,13 @@ impl OfferSyncService {
             let mut book = lock_debug!(self.offerbook.inner.write())
                 .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?;
             let mut changed = false;
+            let before = book.makers.len();
+            book.makers.retain(|maker| {
+                maker
+                    .fidelity_outpoint
+                    .is_none_or(|outpoint| registry_outpoints.contains(&outpoint))
+            });
+            changed |= book.makers.len() != before;
             for outpoint in spent_outpoints {
                 changed |= book.remove_fidelity_outpoint(outpoint);
             }
@@ -1417,6 +1428,7 @@ pub fn format_state(state: &MakerState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wallet::{CoreRPC, CoreRpcConfig};
     use bitcoin::{
         absolute::LockTime,
         hashes::Hash,
@@ -1603,6 +1615,51 @@ mod tests {
         assert_eq!(cleaned.makers.len(), 1);
         assert_eq!(cleaned.makers[0].address, addr("6102"));
         assert!(!std::fs::read_to_string(path).unwrap().contains("<script>"));
+    }
+
+    #[test]
+    fn sync_removes_cached_fidelity_absent_from_registry() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("offerbook.json");
+        let address = addr("6109");
+        let offer = dummy_offer(&address.to_string());
+        let outpoint = offer.fidelity.bond.outpoint;
+
+        let book = OfferBook {
+            makers: vec![MakerOfferCandidate {
+                address,
+                fidelity_outpoint: Some(outpoint),
+                offer: Some(offer),
+                state: MakerState::Good,
+                protocol: Some(MakerProtocol::Taproot),
+                last_offer_update_ts: Some(1),
+                next_offer_check_ts: None,
+            }],
+        };
+        book.write_to_disk(&path).unwrap();
+
+        let handle = OfferBookHandle {
+            inner: Arc::new(RwLock::new(book)),
+            path: path.clone(),
+            is_syncing: Arc::new(AtomicBool::new(false)),
+            last_sync_ts: Arc::new(AtomicU64::new(0)),
+        };
+        let config = CoreRpcConfig {
+            url: "127.0.0.1:0".to_string(),
+            ..CoreRpcConfig::default()
+        };
+        let service = OfferSyncService::new(
+            handle.clone(),
+            FileRegistry::new(),
+            0,
+            Arc::new(AnyBlockchain::CoreRPC(CoreRPC::new(&config).unwrap())),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        service.run_once().unwrap();
+        assert!(handle.snapshot().unwrap().makers.is_empty());
+        assert!(OfferBook::read_from_disk(&path).unwrap().makers.is_empty());
     }
 
     #[test]
