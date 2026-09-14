@@ -122,8 +122,7 @@ impl FileRegistry {
     pub fn list_fidelity(&self, height: u32) -> Result<HashSet<Fidelity>, WatcherError> {
         self.with_data(|data| {
             data.fidelity.retain(|fidelity| {
-                fidelity.expire_height > height
-                    && is_valid_maker_address(&fidelity.onion_address)
+                fidelity.expire_height > height && is_valid_maker_address(&fidelity.onion_address)
             });
             data.fidelity.clone()
         })

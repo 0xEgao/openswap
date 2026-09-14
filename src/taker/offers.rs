@@ -6,10 +6,9 @@
 //! It uses asynchronous channels for concurrent processing of maker offers.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::TryFrom,
     fmt,
-    io::BufWriter,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -26,6 +25,7 @@ use bitcoin::OutPoint;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    atomic_file::write_json_atomically,
     lock_debug,
     protocol::{
         common_messages::{
@@ -153,10 +153,6 @@ impl MakerOfferCandidate {
                 self.state
             );
         }
-        self.fidelity_outpoint
-            .get_or_insert(offer.fidelity.bond.outpoint());
-        self.fidelity_expiry_height
-            .get_or_insert(offer.fidelity.bond.lock_time.to_consensus_u32());
         self.offer = Some(offer);
         self.protocol = Some(protocol);
         self.last_offer_update_ts = Some(now_ts);
@@ -304,7 +300,7 @@ impl OfferBookHandle {
         let mut snapshot = lock_debug!(self.inner.read())
             .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?
             .clone();
-        snapshot.retain_valid_makers();
+        snapshot.retain_valid_addresses();
         Ok(snapshot)
     }
 
@@ -407,9 +403,7 @@ impl OfferBookHandle {
         } else {
             log::info!("Offerbook not found. Creating new at {path:?}");
             let empty_book = OfferBook::default();
-            let file = std::fs::File::create(&path)?;
-            let writer = BufWriter::new(file);
-            serde_json::to_writer_pretty(writer, &empty_book)?;
+            empty_book.write_to_disk(&path)?;
             empty_book
         };
 
@@ -619,23 +613,25 @@ impl OfferSyncService {
             }
         };
         let fidelities = self.registry.list_fidelity(height)?;
+        let mut registry_candidates = HashSet::new();
         let mut spent_outpoints = Vec::new();
         let mut live_outpoints = Vec::new();
         let mut live_expiries = HashMap::new();
         for fidelity in fidelities {
             let outpoint = OutPoint::new(fidelity.txid, 0);
+            let address = match MakerAddress::try_from(fidelity.onion_address) {
+                Ok(address) => address,
+                Err(e) => {
+                    log::warn!("Skipping invalid maker address from registry: {e}");
+                    continue;
+                }
+            };
+            registry_candidates.insert((address.clone(), outpoint));
             match self
                 .blockchain
                 .get_tx_out(&outpoint.txid, outpoint.vout, Some(true))
             {
                 Ok(Some(_)) => {
-                    let address = match MakerAddress::try_from(fidelity.onion_address) {
-                        Ok(address) => address,
-                        Err(e) => {
-                            log::warn!("Skipping invalid maker address from registry: {e}");
-                            continue;
-                        }
-                    };
                     live_expiries.insert(outpoint, fidelity.expire_height);
                     live_outpoints.push((address, outpoint));
                 }
@@ -653,6 +649,17 @@ impl OfferSyncService {
             let pruned = book.prune_stale_makers(now);
             let expired_suppressions = book.prune_expired_suppressions(height);
             let mut changed = pruned > 0 || expired_suppressions > 0;
+            // The registry is memory-only and starts empty. Until Nostr's initial
+            // snapshot completes, absence from it does not invalidate a saved offer.
+            if self.initial_sync_complete.load(Ordering::SeqCst) {
+                let before = book.makers.len();
+                book.makers.retain(|maker| {
+                    maker.fidelity_outpoint.is_none_or(|outpoint| {
+                        registry_candidates.contains(&(maker.address.clone(), outpoint))
+                    })
+                });
+                changed |= book.makers.len() != before;
+            }
             for outpoint in spent_outpoints {
                 changed |= book.remove_fidelity_outpoint(outpoint);
             }
@@ -1100,16 +1107,18 @@ pub struct OfferBook {
 }
 
 impl OfferBook {
-    fn retain_valid_makers(&mut self) -> usize {
-        let before = self.makers.len();
+    fn retain_valid_addresses(&mut self) -> usize {
+        let before = self.makers.len() + self.suppressed_makers.len();
         self.makers
             .retain(|maker| is_valid_maker_address(&maker.address.0));
-        before.saturating_sub(self.makers.len())
+        self.suppressed_makers
+            .retain(|address, _| is_valid_maker_address(&address.0));
+        before - (self.makers.len() + self.suppressed_makers.len())
     }
 
-    /// Adds a maker learned through discovery. A different verified bond is
-    /// admitted immediately; otherwise, a suppressed maker receives one recovery
-    /// probe only after its cooldown. Returns whether persisted state changed.
+    /// Adds a maker learned through discovery. An active candidate rejects a new
+    /// bond until its old outpoint is removed. A suppressed maker is admitted
+    /// immediately for a new bond, or retried after cooldown for the same bond.
     fn upsert_discovered(
         &mut self,
         address: MakerAddress,
@@ -1428,29 +1437,21 @@ impl OfferBook {
         result
     }
 
-    /// Load existing file, updates it, writes it back (create if path doesn't exist).
+    /// Atomically writes the offerbook to disk.
     fn write_to_disk(&self, path: &Path) -> Result<(), TakerError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-
-        // Truncate to avoid leaving stale bytes if the JSON becomes shorter.
-        let offerdata_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path)?;
-        let writer = BufWriter::new(offerdata_file);
-        Ok(serde_json::to_writer_pretty(writer, &self)?)
+        Ok(write_json_atomically(path, self)?)
     }
 
-    /// Reads from a path, removes invalid makers, and best-effort rewrites the cleaned book.
+    /// Reads from a path, removes invalid addresses, and best-effort rewrites the cleaned book.
     fn read_from_disk(path: &Path) -> Result<Self, TakerError> {
         let content = std::fs::read_to_string(path)?;
         let mut book: Self = serde_json::from_str(&content)?;
-        let removed = book.retain_valid_makers();
+        let removed = book.retain_valid_addresses();
         if removed > 0 {
-            log::warn!("Removed {removed} invalid maker record(s) from {path:?}");
+            log::warn!("Removed {removed} invalid offerbook record(s) from {path:?}");
             if let Err(error) = book.write_to_disk(path) {
                 log::error!("Could not rewrite cleaned offerbook at {path:?}: {error:?}");
             }
@@ -1636,6 +1637,10 @@ pub fn format_state(state: &MakerState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        wallet::{CoreRPC, CoreRpcConfig},
+        watch_tower::utils::FidelityAnnouncement,
+    };
     use bitcoin::{
         absolute::LockTime,
         hashes::Hash,
@@ -1806,22 +1811,139 @@ mod tests {
     }
 
     #[test]
-    fn offerbook_load_removes_invalid_persisted_makers() {
+    fn offerbook_load_removes_invalid_persisted_addresses() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("offerbook.json");
-        let book = OfferBook {
-            makers: vec![
-                candidate(addr("6102")),
-                candidate(MakerAddress("<script>alert(1)</script>.onion".into())),
-            ],
-            ..Default::default()
+        let invalid_address = MakerAddress("<script>alert(1)</script>.onion".into());
+        let valid_suppression = addr("6103");
+        let suppression = SuppressedMaker {
+            fidelity_outpoint: None,
+            fidelity_expiry_height: None,
+            retry_after_ts: 1,
         };
+        let book = OfferBook {
+            makers: vec![candidate(addr("6102")), candidate(invalid_address.clone())],
+            suppressed_makers: HashMap::from([
+                (valid_suppression.clone(), suppression.clone()),
+                (invalid_address, suppression),
+            ]),
+        };
+        let mut sanitized = book.clone();
+        assert_eq!(sanitized.retain_valid_addresses(), 2);
         book.write_to_disk(&path).unwrap();
 
         let cleaned = OfferBook::read_from_disk(&path).unwrap();
         assert_eq!(cleaned.makers.len(), 1);
         assert_eq!(cleaned.makers[0].address, addr("6102"));
+        assert_eq!(cleaned.suppressed_makers.len(), 1);
+        assert!(cleaned.suppressed_makers.contains_key(&valid_suppression));
         assert!(!std::fs::read_to_string(path).unwrap().contains("<script>"));
+    }
+
+    #[test]
+    fn failed_offerbook_write_preserves_existing_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("offerbook.json");
+        let mut book = OfferBook::default();
+        book.write_to_disk(&path).unwrap();
+
+        std::fs::create_dir(path.with_extension("partial")).unwrap();
+        book.makers.push(candidate(addr("6104")));
+        assert!(book.write_to_disk(&path).is_err());
+        assert!(OfferBook::read_from_disk(&path).unwrap().makers.is_empty());
+    }
+
+    #[test]
+    fn sync_removes_cached_fidelity_without_exact_registry_match() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("offerbook.json");
+        let address = addr("6109");
+        let offer = dummy_offer(&address.to_string());
+        let outpoint = offer.fidelity.bond.outpoint;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let book = OfferBook {
+            makers: vec![MakerOfferCandidate {
+                address,
+                fidelity_outpoint: Some(outpoint),
+                fidelity_expiry_height: Some(1_000),
+                offer: Some(offer),
+                state: MakerState::Good,
+                protocol: Some(MakerProtocol::Taproot),
+                last_offer_update_ts: Some(now),
+                first_seen_ts: Some(now),
+                backend_retry_pending: false,
+                next_offer_check_ts: None,
+            }],
+            ..Default::default()
+        };
+        book.write_to_disk(&path).unwrap();
+
+        let handle = OfferBookHandle {
+            inner: Arc::new(RwLock::new(book)),
+            path: path.clone(),
+            is_syncing: Arc::new(AtomicBool::new(false)),
+            last_sync_ts: Arc::new(AtomicU64::new(0)),
+        };
+        let config = CoreRpcConfig {
+            url: "127.0.0.1:0".to_string(),
+            ..CoreRpcConfig::default()
+        };
+        let registry = FileRegistry::new();
+        let initial_sync_complete = Arc::new(AtomicBool::new(false));
+        let service = OfferSyncService::new(
+            handle.clone(),
+            registry.clone(),
+            0,
+            Arc::new(AnyBlockchain::CoreRPC(CoreRPC::new(&config).unwrap())),
+            initial_sync_complete.clone(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        service.run_once().unwrap();
+        assert_eq!(handle.snapshot().unwrap().makers.len(), 1);
+        assert_eq!(OfferBook::read_from_disk(&path).unwrap().makers.len(), 1);
+
+        #[cfg(not(feature = "integration-test"))]
+        let registry_address = MakerAddress::try_from(
+            "aibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibejsqd.onion".to_string(),
+        )
+        .unwrap();
+        #[cfg(feature = "integration-test")]
+        let registry_address = addr("6112");
+        assert!(registry
+            .insert_fidelity(
+                outpoint.txid,
+                FidelityAnnouncement {
+                    onion: registry_address.to_string(),
+                    expires_at_height: 1_000,
+                },
+            )
+            .unwrap());
+
+        initial_sync_complete.store(true, Ordering::SeqCst);
+        service.run_once().unwrap();
+        assert!(handle.snapshot().unwrap().makers.is_empty());
+        assert!(OfferBook::read_from_disk(&path).unwrap().makers.is_empty());
+    }
+
+    #[test]
+    fn manual_offer_does_not_gain_a_registry_outpoint() {
+        let address = addr("6110");
+        let mut book = OfferBook::default();
+        book.insert_candidate(address.clone(), None, None, 1);
+
+        book.mark_success(
+            &address,
+            dummy_offer(&address.to_string()),
+            MakerProtocol::Taproot,
+            2,
+        );
+
+        assert_eq!(book.makers[0].fidelity_outpoint, None);
     }
 
     #[test]
@@ -2023,13 +2145,15 @@ mod tests {
     }
 
     #[test]
-    fn discovery_replaces_rotated_bond_metadata() {
+    fn discovery_replaces_spent_bond_metadata() {
         let address = addr("rotated");
-        let old_outpoint = Some(OutPoint::new(Txid::from_slice(&[10; 32]).unwrap(), 0));
+        let old_outpoint = OutPoint::new(Txid::from_slice(&[10; 32]).unwrap(), 0);
         let new_outpoint = Some(OutPoint::new(Txid::from_slice(&[11; 32]).unwrap(), 0));
         let mut book = OfferBook::default();
 
-        book.insert_candidate(address.clone(), old_outpoint, Some(500), 1_000);
+        book.insert_candidate(address.clone(), Some(old_outpoint), Some(500), 1_000);
+        assert!(!book.upsert_discovered(address.clone(), new_outpoint, Some(600), 1_001));
+        assert!(book.remove_fidelity_outpoint(old_outpoint));
         assert!(book.upsert_discovered(address, new_outpoint, Some(600), 1_001));
 
         assert_eq!(book.makers[0].fidelity_outpoint, new_outpoint);

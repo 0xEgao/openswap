@@ -242,7 +242,7 @@ impl<R: Role> Watcher<R> {
                 }
                 // Failed backend work retries on every pass, not just idle ticks;
                 // with empty queues this is a no-op.
-                self.retry_subscribes();
+                self.retry_pending_work();
             }
 
             // Stop and join the discovery thread on exit path.
@@ -449,7 +449,7 @@ impl<R: Role> Watcher<R> {
 
     /// Retry failed script subscriptions and Core block discovery. Successful
     /// subscriptions and completed or orphaned blocks leave their queues.
-    fn retry_subscribes(&mut self) {
+    fn retry_pending_work(&mut self) {
         if self.shutdown.load(Ordering::Relaxed) {
             return;
         }
@@ -614,7 +614,15 @@ impl<R: Role> Watcher<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::{consensus::serialize, constants::genesis_block};
+    use bitcoin::{
+        consensus::{encode::serialize_hex, serialize},
+        constants::genesis_block,
+    };
+    use serde_json::{json, Value};
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpListener,
+    };
 
     use crate::wallet::{blockchain::BlockRef, CoreRPC, CoreRpcConfig};
 
@@ -622,6 +630,102 @@ mod tests {
 
     impl Role for DiscoveryRole {
         const RUN_DISCOVERY: bool = true;
+    }
+
+    fn core_backend_for(
+        announced_block: &Block,
+        active_block: &Block,
+    ) -> (AnyBlockchain, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Core RPC");
+        let url = listener.local_addr().unwrap().to_string();
+        let announced_hash = announced_block.block_hash();
+        let active_hash = active_block.block_hash();
+        let active_block_hex = serialize_hex(active_block);
+        let merkle_root = announced_block.header.merkle_root.to_string();
+        let time = announced_block.header.time;
+        let nonce = announced_block.header.nonce;
+        let tx_count = announced_block.txdata.len();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept Core RPC client");
+            let mut writer = stream.try_clone().expect("clone Core RPC stream");
+            let mut reader = BufReader::new(stream);
+
+            for _ in 0..3 {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                assert!(line.starts_with("POST "));
+
+                let mut content_length = 0;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse().unwrap();
+                        }
+                    }
+                }
+
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body).unwrap();
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "getblockheader" => {
+                        assert_eq!(request["params"], json!([announced_hash, true]));
+                        json!({
+                            "hash": announced_hash,
+                            "confirmations": 1,
+                            "height": 0,
+                            "version": 1,
+                            "merkleroot": merkle_root,
+                            "time": time,
+                            "mediantime": time,
+                            "nonce": nonce,
+                            "bits": "207fffff",
+                            "difficulty": 1.0,
+                            "chainwork": "00",
+                            "nTx": tx_count,
+                        })
+                    }
+                    "getblockhash" => {
+                        assert_eq!(request["params"], json!([0]));
+                        json!(active_hash)
+                    }
+                    "getblock" => {
+                        assert_eq!(request["params"], json!([active_hash, 0]));
+                        json!(active_block_hex)
+                    }
+                    method => panic!("unexpected Core RPC method: {}", method),
+                };
+                let response = json!({
+                    "result": result,
+                    "error": Value::Null,
+                    "id": request["id"],
+                })
+                .to_string();
+                write!(
+                    writer,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    response.len(),
+                    response
+                )
+                .unwrap();
+                writer.flush().unwrap();
+            }
+        });
+
+        let config = CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        };
+        (
+            AnyBlockchain::CoreRPC(CoreRPC::new(&config).unwrap()),
+            server,
+        )
     }
 
     #[test]
@@ -651,7 +755,55 @@ mod tests {
         watcher.handle_event(event);
         assert_eq!(watcher.pending_block_discovery, vec![block_hash]);
 
-        watcher.retry_subscribes();
+        watcher.retry_pending_work();
         assert_eq!(watcher.pending_block_discovery, vec![block_hash]);
+    }
+
+    #[test]
+    fn successful_core_retry_processes_and_removes_pending_block() {
+        let block = genesis_block(Network::Regtest);
+        let block_hash = block.block_hash();
+        let (backend, server) = core_backend_for(&block, &block);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = Watcher::<DiscoveryRole>::new(
+            backend,
+            FileRegistry::new(),
+            rx,
+            Vec::new(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        watcher.pending_block_discovery.push(block_hash);
+
+        watcher.retry_pending_work();
+
+        assert!(watcher.pending_block_discovery.is_empty());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn core_retry_removes_block_orphaned_by_reorg() {
+        let announced_block = genesis_block(Network::Regtest);
+        let announced_hash = announced_block.block_hash();
+        let mut active_block = announced_block.clone();
+        active_block.header.nonce = active_block.header.nonce.wrapping_add(1);
+        assert_ne!(active_block.block_hash(), announced_hash);
+
+        let (backend, server) = core_backend_for(&announced_block, &active_block);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = Watcher::<DiscoveryRole>::new(
+            backend,
+            FileRegistry::new(),
+            rx,
+            Vec::new(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        watcher.pending_block_discovery.push(announced_hash);
+
+        watcher.retry_pending_work();
+
+        assert!(watcher.pending_block_discovery.is_empty());
+        server.join().unwrap();
     }
 }
