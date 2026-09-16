@@ -54,6 +54,15 @@ fn test_taproot_multi_confirm_swap() {
 }
 
 #[test]
+fn test_legacy_confirmation_wait_exceeds_admission_deadline() {
+    run_multi_confirm_swap(
+        ProtocolVersion::Legacy,
+        vec![(9402, Some(21701)), (19402, Some(21702))],
+        true,
+    );
+}
+
+#[test]
 fn test_taproot_confirmation_wait_exceeds_admission_deadline() {
     run_multi_confirm_swap(
         ProtocolVersion::Taproot,
