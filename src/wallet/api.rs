@@ -915,6 +915,16 @@ impl Wallet {
             .collect()
     }
 
+    /// Returns contract_txid keys of incoming swapcoins matching a swap_id.
+    pub(crate) fn incoming_keys_for_swap(&self, swap_id: &str) -> Vec<String> {
+        self.store
+            .incoming_swapcoins
+            .iter()
+            .filter(|(_, sc)| sc.swap_id.as_deref() == Some(swap_id))
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
     /// Ensure a swapcoin's contract tx is on-chain, broadcasting it when needed.
     ///
     /// Every answer comes from a chain query, never from parsing backend error
