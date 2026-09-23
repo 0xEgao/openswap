@@ -96,6 +96,30 @@ fn test_taproot_maker_abort2() {
         "Swap should fail due to Maker2 closing at private key handover"
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
+
+    // Retrying finalization must resume at the failing maker. Replaying the
+    // completed prefix sends a duplicate handover to Maker1 after it has
+    // removed its live state, which then produces the misleading
+    // Legacy-vs-Taproot error seen in the original failure.
+    let log = std::fs::read_to_string(test_framework.taker_log_path()).unwrap();
+    assert_eq!(
+        log.matches("Sending privkey to maker 0 and awaiting response")
+            .count(),
+        1,
+        "a completed maker must not receive finalization again"
+    );
+    assert_eq!(
+        log.matches("Sending privkey to maker 1 and awaiting response")
+            .count(),
+        2,
+        "only the failing maker should consume both integration-test attempts"
+    );
+    assert!(
+        !log.contains(
+            "UnexpectedMessage { expected: \"Legacy protocol message\", got: \"Taproot protocol message\" }"
+        ),
+        "retry replayed a Taproot handover into a completed maker's default Legacy state"
+    );
     taker.log_tracker_state();
 
     // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop

@@ -20,6 +20,7 @@ mod electrum_transport;
 mod fidelity;
 mod fidelity_renewal;
 mod fidelity_timelock_violation;
+mod finalization_timeout;
 mod maker_cli;
 mod malice1;
 mod malice2;

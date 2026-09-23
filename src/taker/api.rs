@@ -1307,6 +1307,16 @@ impl Taker {
 
         // Protocol-specific execution with phase-aware recovery triggers.
         let protocol = self.swap_state()?.params.protocol;
+        // Taproot knows its final route here, so one heartbeat can span both
+        // exchange and finalization. Legacy owns an exchange-local heartbeat
+        // because spare substitution may change its route; after exchange we
+        // reconnect a heartbeat to the settled route for finalization.
+        let mut route_heartbeat = if protocol == ProtocolVersion::Taproot {
+            let swap_id = self.swap_state()?.id.clone();
+            self.start_route_heartbeat(&swap_id)
+        } else {
+            None
+        };
 
         match protocol {
             ProtocolVersion::Legacy => {
@@ -1392,6 +1402,14 @@ impl Taker {
             },
         }
 
+        // Legacy's exchange-local heartbeat ended with exchange_legacy().
+        // Refresh every maker in the final route while private keys march
+        // forward, including retry delays and earlier makers' wallet sweeps.
+        if protocol == ProtocolVersion::Legacy {
+            let swap_id = self.swap_state()?.id.clone();
+            route_heartbeat = self.start_route_heartbeat(&swap_id);
+        }
+
         #[cfg(feature = "integration-test")]
         if self.behavior == TakerBehavior::BroadcastContractAfterFullSetup {
             log::warn!("Test behavior: broadcasting contract txs after full setup, then closing");
@@ -1440,7 +1458,7 @@ impl Taker {
             return Err(err);
         }
 
-        match self.finalize_with_retry() {
+        match self.finalize_swap() {
             Ok(()) => {}
             Err(e) => {
                 log::error!("Finalization failed after retries: {:?}", e);
@@ -1448,6 +1466,11 @@ impl Taker {
                 return Err(e);
             }
         }
+
+        // Every maker has now completed its handover. Keeping the route
+        // heartbeat alive during the wallet sweep would only ping makers whose
+        // live swap state has already been removed.
+        drop(route_heartbeat);
 
         // Finalization succeeded — disarm and stop the breach detector.
         if let Some(detector) = self.breach_detector.take() {
@@ -2577,48 +2600,6 @@ impl Taker {
         Ok(())
     }
 
-    /// Attempt finalization with retries between attempts.
-    fn finalize_with_retry(&mut self) -> Result<(), TakerError> {
-        // The loop runs at least once, so falling through means the last
-        // attempt failed and `last_error` is set.
-        let mut last_error = None;
-        for attempt in 1..=MAX_FINALIZE_RETRIES {
-            match self.finalize_swap() {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    log::warn!(
-                        "Finalization attempt {}/{} failed: {:?}",
-                        attempt,
-                        MAX_FINALIZE_RETRIES,
-                        e
-                    );
-
-                    if self
-                        .breach_detector
-                        .as_ref()
-                        .is_some_and(|d| d.requires_abort())
-                    {
-                        log::error!(
-                            "Contract broadcast detected during finalization — aborting retries"
-                        );
-                        return Err(TakerError::General(
-                            "Contract broadcast detected during finalization".to_string(),
-                        ));
-                    }
-
-                    if attempt < MAX_FINALIZE_RETRIES {
-                        log::info!("Retrying in {:?}...", FINALIZE_RETRY_DELAY);
-                        thread::sleep(FINALIZE_RETRY_DELAY);
-                    }
-                    last_error = Some(e);
-                }
-            }
-        }
-        Err(last_error.unwrap_or_else(|| {
-            TakerError::General("finalization failed with no recorded error".into())
-        }))
-    }
-
     /// Exchange private keys with all makers in forward order.
     /// Each maker receives the privkey for their incoming contract and
     /// responds with their outgoing privkey.
@@ -2639,36 +2620,84 @@ impl Taker {
         }
 
         for i in 0..num_makers {
-            let maker_address = self.swap_state()?.makers[i].address.to_string();
-            let mut stream = self.net_connect(&maker_address)?;
+            #[cfg(feature = "integration-test")]
+            if self.behavior == TakerBehavior::StallBeforeLastHandover && i + 1 == num_makers {
+                let stall = crate::maker::server::IDLE_CONNECTION_TIMEOUT
+                    + Duration::from_secs(2 * crate::utill::HEART_BEAT_INTERVAL.as_secs());
+                log::warn!(
+                    "Test behavior: stalling {:?} before last maker handover",
+                    stall
+                );
+                thread::sleep(stall);
+            }
 
-            self.net_handshake(&mut stream)?;
+            let received_privkeys = {
+                let mut attempt = 1;
+                loop {
+                    let result = (|| -> Result<Vec<SecretKey>, TakerError> {
+                        let maker_address = self.swap_state()?.makers[i].address.to_string();
+                        let mut stream = self.net_connect(&maker_address)?;
 
-            log::info!("Sending privkey to maker {} and awaiting response", i);
+                        self.net_handshake(&mut stream)?;
 
-            let msg = Self::msg_build_handover(protocol, swap_id.clone(), &current_privkeys);
-            send_message(&mut stream, &msg)?;
+                        log::info!("Sending privkey to maker {} and awaiting response", i);
 
-            let msg_bytes = read_message(&mut stream)?;
-            let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
+                        let msg =
+                            Self::msg_build_handover(protocol, swap_id.clone(), &current_privkeys);
+                        send_message(&mut stream, &msg)?;
 
-            let received_privkeys: Vec<SecretKey> = match msg {
-                MakerToTakerMessage::LegacyPrivateKeyHandover(handover)
-                | MakerToTakerMessage::TaprootPrivateKeyHandover(handover) => {
-                    log::info!("Received private key from maker {}", i);
-                    if handover.privkeys.is_empty() {
-                        return Err(TakerError::General(format!(
-                            "Empty privkey response from maker {}",
-                            i
-                        )));
+                        let msg_bytes = read_message(&mut stream)?;
+                        let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
+
+                        match msg {
+                            MakerToTakerMessage::LegacyPrivateKeyHandover(handover)
+                            | MakerToTakerMessage::TaprootPrivateKeyHandover(handover) => {
+                                log::info!("Received private key from maker {}", i);
+                                if handover.privkeys.is_empty() {
+                                    return Err(TakerError::General(format!(
+                                        "Empty privkey response from maker {}",
+                                        i
+                                    )));
+                                }
+                                Ok(handover.privkeys.iter().map(|p| p.key).collect())
+                            }
+                            _ => Err(TakerError::General(format!(
+                                "Unexpected response from maker {}: expected PrivateKeyHandover",
+                                i
+                            ))),
+                        }
+                    })();
+
+                    match result {
+                        Ok(privkeys) => break privkeys,
+                        Err(e) => {
+                            log::warn!(
+                                "Finalization with maker {} attempt {}/{} failed: {:?}",
+                                i,
+                                attempt,
+                                MAX_FINALIZE_RETRIES,
+                                e
+                            );
+                            if self
+                                .breach_detector
+                                .as_ref()
+                                .is_some_and(|detector| detector.requires_abort())
+                            {
+                                log::error!(
+                                    "Contract broadcast detected during finalization — aborting retries"
+                                );
+                                return Err(TakerError::General(
+                                    "Contract broadcast detected during finalization".to_string(),
+                                ));
+                            }
+                            if attempt >= MAX_FINALIZE_RETRIES {
+                                return Err(e);
+                            }
+                            log::info!("Retrying maker {} in {:?}...", i, FINALIZE_RETRY_DELAY);
+                            thread::sleep(FINALIZE_RETRY_DELAY);
+                            attempt += 1;
+                        }
                     }
-                    handover.privkeys.iter().map(|p| p.key).collect()
-                }
-                _ => {
-                    return Err(TakerError::General(format!(
-                        "Unexpected response from maker {}: expected PrivateKeyHandover",
-                        i
-                    )));
                 }
             };
 
@@ -2744,6 +2773,7 @@ impl Taker {
             }
 
             current_privkeys = received_privkeys;
+            self.persist_progress()?;
         }
 
         Ok(())
@@ -3722,4 +3752,8 @@ pub enum TakerBehavior {
     /// Withhold the contract tx broadcast and skip the wait, so the maker
     /// claims funding txids no backend can see (evidence-gated keepalive).
     WithholdFundingBroadcast,
+    /// Pause before the last private-key handover for longer than the maker
+    /// idle timeout. The route heartbeat must keep that last maker live after
+    /// the earlier makers have completed.
+    StallBeforeLastHandover,
 }

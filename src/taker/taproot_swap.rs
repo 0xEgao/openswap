@@ -213,14 +213,6 @@ impl Taker {
     /// 1. Broadcast our outgoing contract txs and wait for confirmation
     /// 2. Exchange contract data with each maker in the route
     pub(crate) fn exchange_taproot(&mut self) -> Result<(), TakerError> {
-        // Ping every maker for the life of the march: while we negotiate one
-        // hop, the others must not read our silence as a dropped swap.
-        let _heartbeat = self
-            .swap_state()
-            .ok()
-            .map(|swap| swap.id.clone())
-            .and_then(|swap_id| self.start_route_heartbeat(&swap_id));
-
         // Makers verify that contract txs are on-chain before creating their
         // own outgoing, so we must broadcast first.
         self.swap_state_mut()?.phase = SwapPhase::FundsBroadcast;
