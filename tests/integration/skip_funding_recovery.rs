@@ -589,14 +589,10 @@ fn run_taproot_timelock_only_recovery<B: TestBackend>() {
 /// A maker that answers normally but never sends its funding is not a dropped
 /// connection: the taker waits, our own node confirms every tx is absent, and
 /// that maker alone is banned.
-fn run_withheld_funding_bans_its_maker<B: TestBackend>(
-    protocol: ProtocolVersion,
-    maker1: (u16, u16),
-    maker2: (u16, u16),
-) {
+fn run_withheld_funding_bans_its_maker<B: TestBackend>(protocol: ProtocolVersion) {
     warn!("Running Test: Withheld Funding Bans Its Maker ({protocol:?})");
 
-    let makers_config_map = vec![(maker1.0, Some(maker1.1)), (maker2.0, Some(maker2.1))];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![
         MakerBehavior::Normal,
@@ -604,7 +600,7 @@ fn run_withheld_funding_bans_its_maker<B: TestBackend>(
     ];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<B>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<B>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -681,29 +677,17 @@ fn run_withheld_funding_bans_its_maker<B: TestBackend>(
 
 #[test]
 fn withheld_taproot_funding_bans_only_its_own_maker() {
-    run_withheld_funding_bans_its_maker::<BitcoindBackend>(
-        ProtocolVersion::Taproot,
-        (22102, 22111),
-        (22202, 22112),
-    );
+    run_withheld_funding_bans_its_maker::<BitcoindBackend>(ProtocolVersion::Taproot);
 }
 
 #[test]
 fn withheld_legacy_funding_bans_only_its_own_maker() {
-    run_withheld_funding_bans_its_maker::<BitcoindBackend>(
-        ProtocolVersion::Legacy,
-        (22302, 22113),
-        (22402, 22114),
-    );
+    run_withheld_funding_bans_its_maker::<BitcoindBackend>(ProtocolVersion::Legacy);
 }
 
 /// Same policy on Electrum: the indexer's definite "no such transaction" is
 /// taken at its word, exactly as our own node's would be.
 #[test]
 fn withheld_taproot_funding_bans_only_its_own_maker_electrum() {
-    run_withheld_funding_bans_its_maker::<ElectrumBackend>(
-        ProtocolVersion::Taproot,
-        (22902, 22119),
-        (23002, 22120),
-    );
+    run_withheld_funding_bans_its_maker::<ElectrumBackend>(ProtocolVersion::Taproot);
 }
