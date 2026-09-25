@@ -18,12 +18,16 @@ use std::thread;
 
 #[test]
 fn taproot_last_maker_survives_finalization_idle_window() {
-    let makers_config_map = vec![(7822, None), (17822, None), (27822, None)];
+    let maker_count = 3;
     let taker_behaviors = vec![TakerBehavior::StallBeforeLastHandover];
-    let maker_behaviors = vec![MakerBehavior::Normal; 3];
+    let maker_behaviors = vec![
+        MakerBehavior::Normal,
+        MakerBehavior::Normal,
+        MakerBehavior::DropHandoverResponse,
+    ];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behaviors, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behaviors, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.first_mut().unwrap();
@@ -66,6 +70,7 @@ fn taproot_last_maker_survives_finalization_idle_window() {
 
     let log = std::fs::read_to_string(test_framework.taker_log_path()).unwrap();
     assert!(log.contains("Test behavior: stalling"));
+    assert!(log.contains("Test behavior: dropping completed handover response"));
     assert!(
         !log.contains(&format!("Swap {} idle", summary.swap_id)),
         "the last maker timed out while the taker was still finalizing"
@@ -90,12 +95,16 @@ fn taproot_last_maker_survives_finalization_idle_window() {
 
 #[test]
 fn legacy_last_maker_survives_finalization_idle_window() {
-    let makers_config_map = vec![(7823, None), (17823, None), (27823, None)];
+    let maker_count = 3;
     let taker_behaviors = vec![TakerBehavior::StallBeforeLastHandover];
-    let maker_behaviors = vec![MakerBehavior::Normal; 3];
+    let maker_behaviors = vec![
+        MakerBehavior::Normal,
+        MakerBehavior::Normal,
+        MakerBehavior::DropHandoverResponse,
+    ];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behaviors, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behaviors, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.first_mut().unwrap();
@@ -138,6 +147,7 @@ fn legacy_last_maker_survives_finalization_idle_window() {
 
     let log = std::fs::read_to_string(test_framework.taker_log_path()).unwrap();
     assert!(log.contains("Test behavior: stalling"));
+    assert!(log.contains("Test behavior: dropping completed handover response"));
     assert!(
         !log.contains(&format!("Swap {} idle", summary.swap_id)),
         "the last Legacy maker timed out while the taker was still finalizing"

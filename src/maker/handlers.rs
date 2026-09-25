@@ -93,6 +93,8 @@ pub enum MakerBehavior {
     RefuseSwapDetails,
     /// Close connection at private key handover phase (taproot maker abort).
     CloseAtPrivateKeyHandover,
+    /// Process a handover but drop its first response.
+    DropHandoverResponse,
     /// Close connection at contract sigs exchange (taproot recovery test).
     CloseAtContractSigsExchange,
     /// Sweep the incoming swapcoins, then close before handing the private key
@@ -436,6 +438,9 @@ pub trait Maker: Send + Sync {
     /// Retrieve stored connection state.
     fn get_connection_state(&self, swap_id: &str) -> Result<Option<ConnectionState>, MakerError>;
 
+    /// Refresh an existing swap's idle timer without creating state.
+    fn touch_connection_state(&self, swap_id: &str) -> Result<(), MakerError>;
+
     /// Remove connection state for a completed swap.
     fn remove_connection_state(&self, swap_id: &str) -> Result<(), MakerError>;
 
@@ -720,9 +725,7 @@ pub fn handle_message<M: Maker>(
                 maker.network_port(),
                 id
             );
-            if let Some(stored_state) = maker.get_connection_state(id)? {
-                maker.store_connection_state(id, &stored_state, false)?;
-            }
+            maker.touch_connection_state(id)?;
             state.touch();
             Ok(None)
         }

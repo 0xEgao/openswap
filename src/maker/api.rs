@@ -22,7 +22,9 @@ use crate::{
     blocklist::AddressBlocklist,
     lock_debug,
     maker::nostr::NOSTR_RELAYS,
-    protocol::common_messages::{FidelityProof, ProtocolVersion, SwapDetails},
+    protocol::common_messages::{
+        FidelityProof, MakerToTakerMessage, PrivateKeyHandover, ProtocolVersion, SwapDetails,
+    },
     taker::api::REFUND_LOCKTIME_STEP,
     utill::{
         funding_fee_policy_sats, get_maker_dir, parse_field, parse_toml, sweep_fee_policy_sats,
@@ -57,6 +59,8 @@ use super::{
 
 /// Minimum swap amount in satoshis.
 pub const MIN_SWAP_AMOUNT: u64 = 10_000;
+// Covers all production response timeouts and finalization retry delays.
+const COMPLETED_HANDOVER_TTL: Duration = Duration::from_secs(65 * 60);
 
 /// One source for the lifetime so the drain and the confirmation wait agree;
 /// tests override it through the env to skip the two-hour default.
@@ -174,6 +178,14 @@ impl Default for SwapState {
             funding_confirmation_height: None,
         }
     }
+}
+
+#[derive(Clone)]
+struct CompletedHandover {
+    protocol: ProtocolVersion,
+    request: PrivateKeyHandover,
+    response: MakerToTakerMessage,
+    completed_at: Instant,
 }
 
 /// Maker Server configuration.
@@ -603,6 +615,8 @@ pub struct MakerServer {
     pub highest_fidelity_proof: RwLock<Option<FidelityProof>>,
     /// Ongoing swap states by swap_id.
     ongoing_swaps: Mutex<HashMap<String, SwapState>>,
+    /// Recently completed handovers, retained for exact retry replay.
+    completed_handovers: Mutex<HashMap<String, CompletedHandover>>,
     /// Watch service for contract monitoring.
     pub watch_service: WatchService,
     /// Thread pool for background threads.
@@ -721,6 +735,7 @@ impl MakerServer {
             highest_fidelity_proof: RwLock::new(None),
             ongoing_swaps: Mutex::new(HashMap::new()),
             watch_service,
+            completed_handovers: Mutex::new(HashMap::new()),
             thread_pool: Arc::new(ThreadPool::new(config.network_port)),
             data_dir,
             swap_tracker: Mutex::new(swap_tracker),
@@ -732,6 +747,39 @@ impl MakerServer {
             #[cfg(feature = "integration-test")]
             reserved_rpc_listener: Mutex::new(None),
         })
+    }
+
+    pub(super) fn replay_completed_handover(
+        &self,
+        protocol: ProtocolVersion,
+        request: &PrivateKeyHandover,
+    ) -> Result<Option<MakerToTakerMessage>, MakerError> {
+        let mut completed = lock_debug!(self.completed_handovers.lock())?;
+        completed.retain(|_, handover| handover.completed_at.elapsed() < COMPLETED_HANDOVER_TTL);
+        Ok(completed
+            .get(&request.id)
+            .filter(|handover| handover.protocol == protocol && handover.request == *request)
+            .map(|handover| handover.response.clone()))
+    }
+
+    pub(super) fn cache_completed_handover(
+        &self,
+        protocol: ProtocolVersion,
+        request: PrivateKeyHandover,
+        response: &MakerToTakerMessage,
+    ) -> Result<(), MakerError> {
+        let mut completed = lock_debug!(self.completed_handovers.lock())?;
+        completed.retain(|_, handover| handover.completed_at.elapsed() < COMPLETED_HANDOVER_TTL);
+        completed.insert(
+            request.id.clone(),
+            CompletedHandover {
+                protocol,
+                request,
+                response: response.clone(),
+                completed_at: Instant::now(),
+            },
+        );
+        Ok(())
     }
 
     /// Check if shutdown has been requested.
@@ -2218,6 +2266,15 @@ impl MakerTrait for MakerServer {
             state.last_activity = s.last_activity;
             state
         }))
+    }
+
+    fn touch_connection_state(&self, swap_id: &str) -> Result<(), MakerError> {
+        let mut swaps =
+            lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+        if let Some(state) = swaps.get_mut(swap_id) {
+            state.last_activity = Instant::now();
+        }
+        Ok(())
     }
 
     fn remove_connection_state(&self, swap_id: &str) -> Result<(), MakerError> {

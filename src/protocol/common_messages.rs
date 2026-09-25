@@ -179,7 +179,7 @@ pub struct SwapPrivkey {
 }
 
 /// Private key handover for swap completion.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PrivateKeyHandover {
     /// Unique swap ID.
     pub id: String,

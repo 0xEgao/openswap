@@ -579,15 +579,37 @@ fn handle_connection(
             message
         );
 
+        let handover = match &message {
+            TakerToMakerMessage::LegacyPrivateKeyHandover(request) => {
+                Some((ProtocolVersion::Legacy, request.clone()))
+            }
+            TakerToMakerMessage::TaprootPrivateKeyHandover(request) => {
+                Some((ProtocolVersion::Taproot, request.clone()))
+            }
+            _ => None,
+        };
+        let cached_response = match &handover {
+            Some((protocol, request)) => maker.replay_completed_handover(*protocol, request)?,
+            None => None,
+        };
+        let should_cache = cached_response.is_none();
         let handling_started = Instant::now();
-        let response = match handle_message(&maker, &mut state, message) {
-            Ok(resp) => resp,
-            Err(e) => {
-                log::error!("[{}] Handler error: {:?}", maker.config.network_port, e);
-                // Some errors are recoverable, some are not
-                break;
+        let response = if let Some(response) = cached_response {
+            Some(response)
+        } else {
+            match handle_message(&maker, &mut state, message) {
+                Ok(resp) => resp,
+                Err(e) => {
+                    log::error!("[{}] Handler error: {:?}", maker.config.network_port, e);
+                    break;
+                }
             }
         };
+        if should_cache {
+            if let (Some((protocol, request)), Some(response)) = (handover, response.as_ref()) {
+                maker.cache_completed_handover(protocol, request, response)?;
+            }
+        }
         // Maker-side processing does not spend the peer's admission budget.
         if permit.pending {
             pending_deadline += handling_started.elapsed();
@@ -602,7 +624,18 @@ fn handle_connection(
         // the connection right after a long productive call.
         state.touch();
 
-        if let Some(response) = response {
+        #[cfg(feature = "integration-test")]
+        let send_response = maker.behavior != super::handlers::MakerBehavior::DropHandoverResponse
+            || state.phase != super::handlers::SwapPhase::Completed;
+        #[cfg(not(feature = "integration-test"))]
+        let send_response = true;
+        if !send_response {
+            log::warn!(
+                "[{}] Test behavior: dropping completed handover response",
+                maker.config.network_port
+            );
+        }
+        if let Some(response) = response.filter(|_| send_response) {
             log::debug!(
                 "[{}] Sending response: {:?}",
                 maker.config.network_port,
@@ -615,7 +648,9 @@ fn handle_connection(
                     maker.config.network_port,
                     e
                 );
-                break;
+                if state.phase != super::handlers::SwapPhase::Completed {
+                    break;
+                }
             }
         }
 

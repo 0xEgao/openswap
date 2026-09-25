@@ -90,6 +90,7 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
         "Swap should fail at the private key handover"
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
+    test_framework.set_block_gen_paused(true);
 
     taker
         .get_wallet()
@@ -115,11 +116,39 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
         before_outgoing > 0,
         "taker should have persisted outgoing swapcoins before the restart"
     );
+    assert!(
+        before_incoming > 0,
+        "taker should have persisted incoming swapcoins before the restart"
+    );
 
-    // Kill the taker. Its Drop shuts down the in-process recovery loop, so from
-    // here on nothing but the persisted wallet knows about this swap.
-    info!("Dropping the taker mid-recovery");
+    let taker_dir = test_framework.temp_dir.join("taker1");
+    let wallet_path = taker_dir.join("wallets").join("taker1");
+    let tracker_path = taker_dir.join("swap_tracker.cbor");
+    let wallet_snapshot = taker_dir.join("wallet.snapshot");
+    let tracker_snapshot = taker_dir.join("tracker.snapshot");
+    std::fs::copy(&wallet_path, &wallet_snapshot).unwrap();
+    std::fs::copy(&tracker_path, &tracker_snapshot).unwrap();
+
+    test_framework.set_block_gen_paused(false);
+    let sweep_deadline = Instant::now() + Duration::from_secs(120);
+    while taker
+        .get_wallet()
+        .read()
+        .unwrap()
+        .get_incoming_swapcoins_count()
+        != 0
+    {
+        assert!(
+            Instant::now() < sweep_deadline,
+            "post-snapshot recovery sweep did not clear incoming swapcoins within 120s"
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    info!("Restoring the pre-sweep state to simulate a crash before cleanup");
     drop(taker);
+    std::fs::copy(wallet_snapshot, wallet_path).unwrap();
+    std::fs::copy(tracker_snapshot, tracker_path).unwrap();
     thread::sleep(Duration::from_secs(5));
 
     let restarted = Taker::init(test_framework.taker_init_config::<BitcoindBackend>(0))
