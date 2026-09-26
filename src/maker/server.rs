@@ -654,6 +654,17 @@ fn handle_connection(
             }
         }
 
+        #[cfg(feature = "integration-test")]
+        if state.phase == super::handlers::SwapPhase::Completed
+            && maker.behavior() == super::handlers::MakerBehavior::CloseAfterHandoverResponse
+        {
+            log::warn!(
+                "[{}] Test behavior: closing after handover response",
+                maker.config.network_port
+            );
+            break;
+        }
+
         if state.phase == super::handlers::SwapPhase::Completed {
             // Remove the completed in-memory state before slow wallet sweeping/syncing.
             // Otherwise the idle checker can race the sweep and launch recovery for
@@ -713,6 +724,15 @@ fn handle_connection(
             };
 
             if let Some((swap_id, sweep_outcome)) = completed_settlement {
+                #[cfg(feature = "integration-test")]
+                if maker.behavior() == super::handlers::MakerBehavior::CloseBeforeSwapFinalization {
+                    log::warn!(
+                        "[{}] Test behavior: closing before swap finalization",
+                        maker.config.network_port
+                    );
+                    break;
+                }
+
                 // Make the terminal state durable before reporting success. The
                 // in-memory state still owns everything needed by the report.
                 maker.finalize_successful_swap(swap_id, state.outgoing_swapcoins.len())?;
@@ -1257,53 +1277,89 @@ fn recover_from_swap(
         r.recovery.phase = MakerRecoveryPhase::Monitoring;
     });
 
-    // Compatibility cleanup for successful Taproot swaps persisted by older
-    // versions. Their incoming coins were already swept, while every outgoing
-    // contract was claimed by the taker. They are terminal, not recoverable,
-    // and must not wait for the timelock merely to be discarded.
-    let stale_completed = if incoming_swapcoins.is_empty() {
-        match all_outgoing_confirmed_spent() {
-            Ok(completed) => completed,
-            Err(error) => {
-                log::warn!(
-                    "[{}] Could not classify stale outgoing swapcoins for {}: {:?}; continuing normal recovery",
-                    maker.config.network_port,
-                    swap_id,
-                    error
-                );
-                false
-            }
-        }
-    } else {
-        false
-    };
-    if stale_completed {
-        {
-            let mut wallet = lock_debug!(maker.wallet.write())
-                .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-            for outgoing in &outgoing_swapcoins {
-                let key = outgoing.contract_tx.compute_txid().to_string();
-                wallet.remove_outgoing_swapcoin(&key);
-            }
-            wallet.release_swap_locks(&swap_id, None);
-            wallet.save_to_disk().map_err(MakerError::Wallet)?;
-        }
-        update_tracker(&maker, &swap_id, |r| {
-            r.phase = MakerSwapPhase::Completed;
-            r.recovery.phase = MakerRecoveryPhase::CleanedUp;
-        });
-        log::info!(
-            "[{}] Removed {} stale outgoing swapcoin(s) for completed swap {}",
-            maker.config.network_port,
-            outgoing_swapcoins.len(),
-            swap_id
-        );
-        return Ok(());
-    }
-
     let mut watchtower_down_logged = false;
     let mut discard_deferred_logged = false;
     while !maker.is_shutdown() {
+        let handover_persisted = !incoming_swapcoins.is_empty()
+            && incoming_swapcoins
+                .iter()
+                .all(|incoming| incoming.other_privkey.is_some());
+        let completed_candidate = incoming_swapcoins.is_empty() || handover_persisted;
+        // A confirmed spend of every outgoing contract proves the taker received
+        // our handover. A maker can crash after that response but before sweeping
+        // incoming coins or removing outgoing records. Resume that terminal
+        // settlement instead of waiting for an already-spent timelock.
+        let outgoing_spent = completed_candidate
+            && match all_outgoing_confirmed_spent() {
+                Ok(spent) => spent,
+                Err(error) => {
+                    log::warn!(
+                        "[{}] Could not classify stale outgoing swapcoins for {}: {:?}; continuing normal recovery",
+                        maker.config.network_port,
+                        swap_id,
+                        error
+                    );
+                    false
+                }
+            };
+        if outgoing_spent {
+            if handover_persisted {
+                maker.sweep_incoming_swapcoins(&incoming_swapcoins)?;
+                let fully_swept = {
+                    let wallet = lock_debug!(maker.wallet.read())
+                        .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+                    incoming_swapcoins.iter().all(|incoming| {
+                        let key = incoming.contract_tx.compute_txid().to_string();
+                        wallet.find_incoming_swapcoin(&key).is_none()
+                    })
+                };
+                if !fully_swept {
+                    if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
+                        break;
+                    }
+                    continue;
+                }
+            }
+
+            {
+                let mut wallet = lock_debug!(maker.wallet.write())
+                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+                for outgoing in &outgoing_swapcoins {
+                    let key = outgoing.contract_tx.compute_txid().to_string();
+                    wallet.remove_outgoing_swapcoin(&key);
+                }
+                wallet.release_swap_locks(&swap_id, None);
+                wallet.save_to_disk().map_err(MakerError::Wallet)?;
+            }
+            update_tracker(&maker, &swap_id, |r| {
+                r.phase = MakerSwapPhase::Completed;
+                r.recovery.phase = MakerRecoveryPhase::CleanedUp;
+            });
+
+            let incoming = incoming_swapcoins.iter().map(|s| &s.contract_tx);
+            let outgoing = outgoing_swapcoins.iter().map(|s| &s.contract_tx);
+            for contract_tx in incoming.chain(outgoing) {
+                let txid = contract_tx.compute_txid();
+                for (vout, txout) in contract_tx.output.iter().enumerate() {
+                    maker.unwatch_outpoint(
+                        bitcoin::OutPoint {
+                            txid,
+                            vout: vout as u32,
+                        },
+                        txout.script_pubkey.clone(),
+                    );
+                }
+            }
+
+            log::info!(
+                "[{}] Finalized completed swap {} from persisted state and removed {} outgoing swapcoin(s)",
+                maker.config.network_port,
+                swap_id,
+                outgoing_swapcoins.len()
+            );
+            return Ok(());
+        }
+
         // True while the discard decision is still waiting on the grace. The
         // swap is not finished until that is settled, whatever the contracts say.
         let discard_pending;

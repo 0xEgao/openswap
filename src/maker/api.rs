@@ -1993,8 +1993,8 @@ impl MakerTrait for MakerServer {
         swap_id: &str,
         expected_outgoing: usize,
     ) -> Result<(), MakerError> {
-        let removed = {
-            let mut wallet = lock_debug!(self.wallet.write())
+        let outgoing_keys = {
+            let wallet = lock_debug!(self.wallet.read())
                 .map_err(|_| MakerError::General("Failed to lock wallet"))?;
             let outgoing_keys = wallet.outgoing_keys_for_swap(swap_id);
             if outgoing_keys.len() != expected_outgoing {
@@ -2002,43 +2002,36 @@ impl MakerTrait for MakerServer {
                     "persisted outgoing swapcoin count does not match completed swap",
                 ));
             }
+            outgoing_keys
+        };
+
+        {
+            let mut tracker =
+                lock_debug!(self.swap_tracker.lock()).map_err(|_| MakerError::MutexPossion)?;
+            if let Some(record) = tracker.get_record_mut(swap_id) {
+                record.phase = MakerSwapPhase::Completed;
+                record.recovery.phase = MakerRecoveryPhase::CleanedUp;
+                record.updated_at = now_secs();
+                let completed = record.clone();
+                tracker.save_record(&completed)?;
+            }
+        }
+
+        {
+            let mut wallet = lock_debug!(self.wallet.write())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?;
             for key in &outgoing_keys {
                 wallet.remove_outgoing_swapcoin(key);
             }
             wallet.release_swap_locks(swap_id, None);
             wallet.save_to_disk().map_err(MakerError::Wallet)?;
-            outgoing_keys.len()
-        };
-
-        match lock_debug!(self.swap_tracker.lock()) {
-            Ok(mut tracker) => {
-                if let Some(record) = tracker.get_record_mut(swap_id) {
-                    record.phase = MakerSwapPhase::Completed;
-                    record.recovery.phase = MakerRecoveryPhase::CleanedUp;
-                    record.updated_at = now_secs();
-                    let completed = record.clone();
-                    if let Err(error) = tracker.save_record(&completed) {
-                        log::warn!(
-                            "[{}] Failed to persist completed tracker state for {}: {:?}",
-                            self.config.network_port,
-                            swap_id,
-                            error
-                        );
-                    }
-                }
-            }
-            Err(_) => log::warn!(
-                "[{}] Swap tracker lock poisoned while finalizing {}",
-                self.config.network_port,
-                swap_id
-            ),
         }
 
         log::info!(
             "[{}] Finalized successful swap {} and removed {} outgoing swapcoin(s)",
             self.config.network_port,
             swap_id,
-            removed
+            outgoing_keys.len()
         );
         Ok(())
     }
