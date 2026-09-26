@@ -2019,7 +2019,7 @@ impl Wallet {
     }
 
     /// Finds unfinished swapcoins.
-    /// Incoming unfinished: `other_privkey` is None.
+    /// Incoming swapcoins remain unfinished until they are swept and removed.
     /// Outgoing unfinished: `hash_preimage` is None.
     pub(crate) fn find_unfinished_swapcoins(
         &self,
@@ -2027,13 +2027,8 @@ impl Wallet {
         Vec<super::swapcoin::IncomingSwapCoin>,
         Vec<super::swapcoin::OutgoingSwapCoin>,
     ) {
-        let unfinished_incomings: Vec<_> = self
-            .store
-            .incoming_swapcoins
-            .values()
-            .filter(|ic| ic.other_privkey.is_none())
-            .cloned()
-            .collect();
+        let unfinished_incomings: Vec<_> =
+            self.store.incoming_swapcoins.values().cloned().collect();
         let unfinished_outgoings: Vec<_> = self
             .store
             .outgoing_swapcoins
@@ -3098,6 +3093,24 @@ impl Wallet {
         );
         for (swap_id, swapcoin) in completed_swapcoins.into_iter() {
             let contract_txid = swapcoin.contract_tx.compute_txid();
+            if let Some(spend_tx) = &swapcoin.spending_tx {
+                let txid = spend_tx.compute_txid();
+                if !chain.is_tx_unknown(&txid)? {
+                    wait_for_tx_confirmation(
+                        chain,
+                        &[txid],
+                        1,
+                        TX_BROADCAST_TIMEOUT,
+                        Some(shutdown),
+                        None,
+                    )?;
+                    outcome.resolved.push((contract_txid, txid));
+                    lock_debug!(wallet.write())
+                        .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?
+                        .remove_incoming_swapcoin(&swap_id);
+                    continue;
+                }
+            }
             // Determine which UTXO to spend based on protocol and spending path.
             let (utxo_txid, utxo_vout, input_value) = match swapcoin.protocol {
                 crate::protocol::ProtocolVersion::Legacy => {
@@ -3255,8 +3268,12 @@ impl Wallet {
             // skipped every pass would otherwise burn an index each time and
             // grow the watch window forever. Take the guard just for this, so
             // nothing below waits with it held.
-            let (internal_address, spend_result) = match &swapcoin.payment_target {
-                Some(target) => {
+            let (internal_address, spend_result) = match (
+                &swapcoin.spending_tx,
+                &swapcoin.payment_target,
+            ) {
+                (Some(tx), _) => (None, Ok(tx.clone())),
+                (None, Some(target)) => {
                     log::info!(
                         "Settling incoming swap coin {} (utxo: {}:{}) to payment receiver, exact output {}",
                         swap_id,
@@ -3271,7 +3288,7 @@ impl Wallet {
                     );
                     (None, spend)
                 }
-                None => {
+                (None, None) => {
                     let address = {
                         let mut w = lock_debug!(wallet.write()).map_err(|_| {
                             WalletError::General("wallet lock poisoned".to_string())
@@ -3316,6 +3333,18 @@ impl Wallet {
 
             match spend_result {
                 Ok(spend_tx) => {
+                    {
+                        let mut w = lock_debug!(wallet.write()).map_err(|_| {
+                            WalletError::General("wallet lock poisoned".to_string())
+                        })?;
+                        let stored = w.find_incoming_swapcoin_mut(&swap_id).ok_or_else(|| {
+                            WalletError::General(format!(
+                                "incoming swapcoin {swap_id} disappeared during sweep"
+                            ))
+                        })?;
+                        stored.spending_tx = Some(spend_tx.clone());
+                        w.save_to_disk()?;
+                    }
                     match chain.send_raw_transaction(&spend_tx) {
                         Ok(txid) => {
                             let conf_height = wait_for_tx_confirmation(
@@ -3347,7 +3376,6 @@ impl Wallet {
                                 swap_id,
                                 e
                             );
-                            unmark_on_failure(&internal_address)?;
                         }
                     }
                 }

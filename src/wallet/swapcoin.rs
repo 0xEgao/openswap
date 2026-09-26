@@ -115,7 +115,7 @@ pub struct IncomingSwapCoin {
     pub tap_tweak: Option<Scalar>,
     /// Taproot internal key.
     pub internal_key: Option<XOnlyPublicKey>,
-    /// Spending transaction (Taproot only, for preimage extraction).
+    /// Persisted incoming sweep transaction, reused during crash recovery.
     pub spending_tx: Option<Transaction>,
     /// PaySwap settlement destination; `None` sweeps to a wallet-internal address.
     pub payment_target: Option<PaymentTarget>,

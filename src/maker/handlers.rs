@@ -95,6 +95,11 @@ pub enum MakerBehavior {
     CloseAtPrivateKeyHandover,
     /// Process a handover but drop its first response.
     DropHandoverResponse,
+    /// Close after sending the successful handover response, before sweeping
+    /// incoming swapcoins.
+    CloseAfterHandoverResponse,
+    /// Close after sweeping incoming swapcoins, before finalizing the swap.
+    CloseBeforeSwapFinalization,
     /// Close connection at contract sigs exchange (taproot recovery test).
     CloseAtContractSigsExchange,
     /// Sweep the incoming swapcoins, then close before handing the private key
