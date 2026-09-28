@@ -33,6 +33,7 @@ use crate::{
             MakerToTakerMessage as RouterMakerToTakerMessage, Offer,
             TakerHello as RouterTakerHello, TakerToMakerMessage as RouterTakerToMakerMessage,
         },
+        contract::calculate_swap_fee,
         error::ProtocolError,
     },
     utill::{read_message, send_message},
@@ -104,6 +105,22 @@ pub struct OfferAndAddress {
     pub state: MakerState,
     /// Supporting protocol (Legacy or Taproot)
     pub protocol: MakerProtocol,
+}
+
+/// Rank eligible makers by their estimated fee at a common amount and locktime.
+/// Equal fees (rounded up to satoshis) are ordered by maker address.
+pub(super) fn sort_makers_by_fee(makers: &mut [OfferAndAddress], amount: u64, locktime: u16) {
+    makers.sort_by_cached_key(|maker| {
+        let offer = &maker.offer;
+        let fee = calculate_swap_fee(
+            amount,
+            locktime,
+            offer.base_fee,
+            offer.amount_relative_fee_pct,
+            offer.time_relative_fee_pct,
+        );
+        (fee, maker.address.clone())
+    });
 }
 
 /// Canonical maker record.
@@ -2085,6 +2102,51 @@ mod tests {
             backend_retry_pending: false,
             next_offer_check_ts: None,
         }
+    }
+
+    #[test]
+    fn maker_fee_ranking_includes_all_components_and_breaks_ties_by_address() {
+        let mut makers: Vec<_> = [
+            // At 100,000 sats and 20 blocks, these cost 1,000, 200, 200, 200 sats.
+            ("a", 0, 1.0, 0.0),
+            ("d", 0, 0.0, 0.01),
+            ("c", 0, 0.2, 0.0),
+            ("b", 200, 0.0, 0.0),
+        ]
+        .iter()
+        .copied()
+        .map(|(name, base, amount_pct, time_pct)| {
+            let address = MakerAddress(name.to_string());
+            let mut offer = dummy_offer(name);
+            offer.base_fee = base;
+            offer.amount_relative_fee_pct = amount_pct;
+            offer.time_relative_fee_pct = time_pct;
+            OfferAndAddress {
+                offer,
+                address,
+                state: MakerState::Good,
+                protocol: MakerProtocol::Unified,
+            }
+        })
+        .collect();
+
+        sort_makers_by_fee(&mut makers, 100_000, 20);
+        let addresses: Vec<_> = makers
+            .iter()
+            .map(|maker| maker.address.to_string())
+            .collect();
+        assert_eq!(addresses, ["b", "c", "d", "a"]);
+        // Two makers are needed: the lexicographically first two of the three
+        // tied cheapest offers win. The expensive 'a' is not selected.
+        assert_eq!(&addresses[..2], &["b", "c"]);
+
+        // Ranking responds to the swap amount rather than just the base fee.
+        sort_makers_by_fee(&mut makers, 1_000, 20);
+        let addresses: Vec<_> = makers
+            .iter()
+            .map(|maker| maker.address.to_string())
+            .collect();
+        assert_eq!(addresses, ["c", "d", "a", "b"]);
     }
 
     fn dummy_offer(maker_addr: &str) -> Offer {
