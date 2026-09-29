@@ -61,6 +61,10 @@ enum SyncCommand {
         address: MakerAddress,
         done: mpsc::Sender<Option<MakerOfferCandidate>>,
     },
+    RemoveMaker {
+        address: MakerAddress,
+        done: mpsc::Sender<Result<bool, TakerError>>,
+    },
 }
 
 #[cfg(not(feature = "integration-test"))]
@@ -711,6 +715,16 @@ impl OfferSyncHandle {
             ))
         })
     }
+
+    /// Remove a maker after any in-progress sync has finished.
+    pub fn remove_maker(&self, address: MakerAddress) -> Result<bool, TakerError> {
+        let (done_tx, done_rx) = mpsc::channel();
+        self.cmd_tx.send(SyncCommand::RemoveMaker {
+            address,
+            done: done_tx,
+        })?;
+        done_rx.recv()?.and_then(|removed| Ok(removed))
+    }
 }
 
 fn sync_and_wait(cmd_tx: &mpsc::Sender<SyncCommand>, timeout: Duration) -> Result<(), TakerError> {
@@ -1169,6 +1183,11 @@ impl OfferSyncService {
                             Ok(SyncCommand::PollMaker { address, done }) => {
                                 log::info!("Manual maker poll requested: {}", address);
                                 let result = self.poll_one(address);
+                                let _ = done.send(result);
+                            }
+                            Ok(SyncCommand::RemoveMaker { address, done }) => {
+                                log::info!("Manual maker removal requested: {}", address);
+                                let result = self.offerbook.remove(&address);
                                 let _ = done.send(result);
                             }
                             Err(mpsc::TryRecvError::Empty) => {}

@@ -3537,7 +3537,7 @@ impl Taker {
     pub fn remove_maker(&self, address: String) -> Result<bool, TakerError> {
         let parsed = MakerAddress::try_from(address)
             .map_err(|e| TakerError::General(format!("Invalid maker address: {e}")))?;
-        self.offerbook.remove(&parsed)
+        self.offer_sync_handle.remove_maker(parsed)
     }
 
     /// Add a funding-source address to the shared blocklist, or update its label.
