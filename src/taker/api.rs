@@ -708,7 +708,23 @@ impl Taker {
             initial_sync_complete,
             shutdown.clone(),
         )?;
-        let swap_tracker = Arc::new(Mutex::new(SwapTracker::load_or_create(&data_dir)?));
+        let mut tracker = SwapTracker::load_or_create(&data_dir)?;
+        // The wallet may have been saved just before persist_progress crashed.
+        for incoming in wallet.find_unfinished_swapcoins().0 {
+            if let Some(record) = incoming
+                .swap_id
+                .as_deref()
+                .and_then(|id| tracker.get_record_mut(id))
+            {
+                let txid = incoming.contract_tx.compute_txid();
+                if !record.incoming_contract_txids.contains(&txid) {
+                    record.incoming_contract_txids.push(txid);
+                    let record = record.clone();
+                    tracker.save_record(&record)?;
+                }
+            }
+        }
+        let swap_tracker = Arc::new(Mutex::new(tracker));
         lock_debug!(swap_tracker.lock())
             .map_err(|_| TakerError::General("swap tracker lock poisoned".into()))?
             .cleanup_incomplete();

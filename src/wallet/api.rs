@@ -1021,10 +1021,12 @@ impl Wallet {
                     return Ok(ContractChainState::RecoveredByTimelock(recovery_txid));
                 }
                 log::info!(
-                    "Contract output for {} spent by a confirmed tx — discarding swapcoin",
+                    "Contract output for {} spent by a confirmed tx — keeping swapcoin until settlement",
                     swap_id
                 );
-                return Ok(ContractChainState::Discarded);
+                // The spender may reveal a preimage our watcher has not seen.
+                // Keep the outgoing record across restarts until swap cleanup.
+                return Ok(ContractChainState::NotYet);
             }
             return Ok(ContractChainState::NotYet);
         }

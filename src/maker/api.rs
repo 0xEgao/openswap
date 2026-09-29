@@ -753,7 +753,8 @@ impl MakerServer {
             log::error!("could not initialize watches on startup: {e}; recovery-only mode");
         }
 
-        let swap_tracker = MakerSwapTracker::load_or_create(&data_dir)?;
+        let mut swap_tracker = MakerSwapTracker::load_or_create(&data_dir)?;
+        swap_tracker.reconcile_cleanup(&wallet, &data_dir)?;
         let incomplete = swap_tracker.incomplete_swaps();
         if !incomplete.is_empty() {
             log::info!(

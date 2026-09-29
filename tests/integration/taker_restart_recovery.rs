@@ -149,18 +149,28 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
     drop(taker);
     std::fs::copy(wallet_snapshot, wallet_path).unwrap();
     std::fs::copy(tracker_snapshot, tracker_path).unwrap();
+    // Simulate the wallet save succeeding before the incoming tracker update.
+    let mut tracker =
+        openswap::taker::swap_tracker::SwapTracker::load_or_create(&taker_dir).unwrap();
+    tracker
+        .update_and_save(&summary.swap_id, |record| {
+            record.incoming_contract_txids.clear();
+        })
+        .unwrap();
     thread::sleep(Duration::from_secs(5));
 
     let restarted = Taker::init(test_framework.taker_init_config::<BitcoindBackend>(0))
         .expect("restarted taker should open the same wallet");
-
-    // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
-    // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
-    // 5 blocks/3s; remaining ~105s is scheduling margin.
-    info!("Waiting for timelocks to mature...");
-    thread::sleep(Duration::from_secs(300));
-
-    shutdown_makers(&makers, maker_threads);
+    let tracker = openswap::taker::swap_tracker::SwapTracker::load_or_create(&taker_dir).unwrap();
+    assert_eq!(
+        tracker
+            .get_record(&summary.swap_id)
+            .unwrap()
+            .incoming_contract_txids
+            .len(),
+        before_incoming,
+        "startup must restore the wallet's incoming coins to the recovery scope"
+    );
 
     info!("Waiting for the restarted taker's recovery loop to finish...");
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -172,6 +182,7 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
         thread::sleep(Duration::from_secs(5));
     }
 
+    shutdown_makers(&makers, maker_threads);
     generate_blocks(bitcoind, 1);
     restarted
         .get_wallet()

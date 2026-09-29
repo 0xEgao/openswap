@@ -25,7 +25,7 @@ use std::{
     net::TcpStream,
     sync::{atomic::Ordering::Relaxed, Arc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Test: maker reboot recovery preserves funded Taproot swapcoins. Maker2 funds
@@ -125,6 +125,37 @@ fn run_reboot_recovery_with_watcher<B: TestBackend>(watcher_available: bool) {
 
     shutdown_makers(&makers, maker_threads);
 
+    // The maker's watcher is stopped while its next hop claims the outgoing.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while taker
+        .get_wallet()
+        .read()
+        .unwrap()
+        .get_incoming_swapcoins_count()
+        != 0
+    {
+        assert!(
+            Instant::now() < deadline,
+            "next hop did not confirm its hashlock claim"
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+    generate_blocks(bitcoind, 160);
+    let chain = openswap::wallet::AnyBlockchain::from_config(&victim.config.backend).unwrap();
+    openswap::wallet::Wallet::recover_timelocked_swapcoins(
+        &victim.wallet,
+        &chain,
+        &openswap::utill::NO_SHUTDOWN,
+        None,
+        &|_| true,
+    )
+    .unwrap();
+    assert_eq!(
+        victim.wallet.read().unwrap().get_outgoing_swapcoins_count(),
+        before_outgoing,
+        "a non-refund spend must retain the outgoing record until the maker learns its preimage"
+    );
+
     drop(victim);
     drop(makers);
 
@@ -164,7 +195,10 @@ fn run_reboot_recovery_with_watcher<B: TestBackend>(watcher_available: bool) {
         );
         wait_for_log(
             &log_path,
-            "Removed outgoing swapcoin",
+            &format!(
+                "[{}] Recovered {} incoming swapcoins via hashlock",
+                restarted.config.network_port, before_incoming
+            ),
             Duration::from_secs(120),
         );
         let log_contents = std::fs::read_to_string(&log_path).unwrap();
@@ -215,6 +249,61 @@ fn run_reboot_recovery_with_watcher<B: TestBackend>(watcher_available: bool) {
             "restarted maker did not clean up its spent outgoing contracts"
         );
     }
+
+    // Replay a crash after wallet cleanup but before tracker cleanup/reporting.
+    use openswap::maker::swap_tracker::{MakerRecoveryPhase, MakerSwapPhase};
+    assert_eq!(
+        restarted
+            .wallet
+            .read()
+            .unwrap()
+            .get_incoming_swapcoins_count(),
+        0
+    );
+    assert_eq!(
+        restarted
+            .wallet
+            .read()
+            .unwrap()
+            .get_outgoing_swapcoins_count(),
+        0
+    );
+    {
+        let mut tracker = restarted.swap_tracker.lock().unwrap();
+        let mut record = tracker.get_record(&summary.swap_id).unwrap().clone();
+        assert!(!record.recovery.incoming_swept.is_empty());
+        record.phase = MakerSwapPhase::Recovering;
+        record.recovery.phase = MakerRecoveryPhase::HashlockRecovered;
+        tracker.save_record(&record).unwrap();
+    }
+    let report_path = restarted
+        .data_dir
+        .join("wallets")
+        .join(format!("{}_swap_report.json", restarted.config.wallet_name));
+    std::fs::remove_file(&report_path).unwrap();
+    let mut config = restarted.config.clone();
+    config.password = Some("integration-test".to_string());
+    drop(restarted);
+    let reconciled = MakerServer::init(config).unwrap();
+    assert_eq!(
+        reconciled
+            .swap_tracker
+            .lock()
+            .unwrap()
+            .get_record(&summary.swap_id)
+            .unwrap()
+            .recovery
+            .phase,
+        MakerRecoveryPhase::CleanedUp
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
+    assert!(report["recovery"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["swap_id"] == summary.swap_id && r["recovery_type"] == "hashlock"));
+    reconciled.shutdown.store(true, Relaxed);
 
     test_framework.stop();
     block_generation_handle.join().unwrap();

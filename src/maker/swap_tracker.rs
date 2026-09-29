@@ -265,6 +265,43 @@ impl MakerSwapTracker {
             .collect()
     }
 
+    /// Finish cleanup interrupted between the wallet save and tracker save.
+    pub(crate) fn reconcile_cleanup(
+        &mut self,
+        wallet: &crate::wallet::Wallet,
+        data_dir: &Path,
+    ) -> Result<(), MakerError> {
+        let records: Vec<_> = self.incomplete_swaps().into_iter().cloned().collect();
+        for mut record in records {
+            if !wallet.incoming_keys_for_swap(&record.swap_id).is_empty()
+                || !wallet.outgoing_keys_for_swap(&record.swap_id).is_empty()
+            {
+                continue;
+            }
+            for (kind, txids) in [
+                ("hashlock", &record.recovery.incoming_swept),
+                ("timelock", &record.recovery.outgoing_recovered),
+            ] {
+                if !txids.is_empty() {
+                    crate::wallet::RecoveryReport::emit_maker(
+                        data_dir,
+                        record.swap_id.clone(),
+                        wallet.store.network.to_string(),
+                        kind.to_string(),
+                        txids.iter().map(ToString::to_string).collect(),
+                    );
+                }
+            }
+            if record.phase != MakerSwapPhase::Completed {
+                record.phase = MakerSwapPhase::Recovered;
+            }
+            record.recovery.phase = MakerRecoveryPhase::CleanedUp;
+            record.updated_at = now_secs();
+            self.save_record(&record)?;
+        }
+        Ok(())
+    }
+
     /// Log all swap records at INFO level.
     pub fn log_state(&self) {
         if self.data.swaps.is_empty() {
