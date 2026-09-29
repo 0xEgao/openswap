@@ -2561,15 +2561,17 @@ impl Wallet {
             self.store.utxo_cache.remove(outpoint);
         }
 
-        // Process and add only new UTXOs
+        // Refresh backend metadata for cached UTXOs without rebuilding their
+        // derived spend info. Confirmations and other list-unspent fields can
+        // change while the outpoint remains the same.
         for utxo in utxos {
             let outpoint = OutPoint {
                 txid: utxo.txid,
                 vout: utxo.vout,
             };
 
-            // Skip if the UTXO already exists in the cache
-            if self.store.utxo_cache.contains_key(&outpoint) {
+            if let Some((cached_utxo, _)) = self.store.utxo_cache.get_mut(&outpoint) {
+                *cached_utxo = utxo;
                 continue;
             }
 

@@ -159,12 +159,19 @@ fn is_terminal(e: &electrum_client::Error) -> bool {
     )
 }
 
-/// True only for the server's unknown-txid answer, the one `Protocol` error
-/// that means "no such transaction" rather than a server problem. electrs and
-/// Fulcrum both use bitcoind's wording.
+/// True only for protocol errors that explicitly say the transaction is
+/// unknown. Electrs and Fulcrum usually use bitcoind's wording, while some
+/// servers return the shorter "missing transaction" message.
 fn is_unknown_txid(e: &electrum_client::Error) -> bool {
-    matches!(e, electrum_client::Error::Protocol(v)
-        if v.to_string().contains("No such mempool or blockchain transaction"))
+    matches!(e, electrum_client::Error::Protocol(v) if {
+        let message = v
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        message.contains("no such mempool or blockchain transaction")
+            || message.contains("missing transaction")
+    })
 }
 
 /// `scripthash.listunspent` entry with a signed height. The crate's own type
@@ -1956,6 +1963,11 @@ mod tests {
             "message": "No such mempool or blockchain transaction. Use gettransaction for wallet transactions."
         }));
         assert!(is_unknown_txid(&unknown));
+        let missing = Error::Protocol(json!({
+            "code": -32603,
+            "message": "missing transaction"
+        }));
+        assert!(is_unknown_txid(&missing));
         // Every other Protocol value is a server problem, not an absence.
         let other = Error::Protocol(json!({ "code": -32600, "message": "rate limited" }));
         assert!(!is_unknown_txid(&other));

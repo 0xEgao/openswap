@@ -723,7 +723,7 @@ impl OfferSyncHandle {
             address,
             done: done_tx,
         })?;
-        done_rx.recv()?.and_then(|removed| Ok(removed))
+        done_rx.recv()?
     }
 }
 
