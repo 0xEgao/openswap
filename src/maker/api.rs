@@ -1500,6 +1500,20 @@ impl MakerServer {
             .any(|coin| coin.swap_id.as_deref() == Some(swap_id)))
     }
 
+    /// The signed outgoing contract txs of `swap_id`, so a test can publish
+    /// one after the maker withheld it.
+    #[cfg(feature = "integration-test")]
+    pub fn outgoing_contract_txs(&self, swap_id: &str) -> Result<Vec<Transaction>, MakerError> {
+        let wallet = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        let (_, outgoing) = wallet.find_unfinished_swapcoins();
+        Ok(outgoing
+            .into_iter()
+            .filter(|coin| coin.swap_id.as_deref() == Some(swap_id))
+            .map(|coin| coin.contract_tx)
+            .collect())
+    }
+
     /// Verify the deniability proof for a specific swap.
     pub fn verify_deniability(&self, swap_id: &str) -> Result<bool, std::io::Error> {
         lock_debug!(self.wallet.read())
@@ -3301,7 +3315,7 @@ impl MakerTrait for MakerServer {
         crate::wallet::wait_for_tx_confirmation(
             &chain,
             &[*txid],
-            required_confirms.max(crate::utill::MIN_REQUIRED_CONFIRM),
+            required_confirms,
             crate::utill::TX_BROADCAST_TIMEOUT,
             Some(&self.shutdown),
             None,

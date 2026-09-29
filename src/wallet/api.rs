@@ -373,7 +373,7 @@ pub(crate) fn infer_address_type(script_pubkey: &Script) -> AddressType {
 pub struct RecoveryOutcome {
     /// (contract_txid, spending_txid) for contracts we successfully spent.
     pub resolved: Vec<(Txid, Txid)>,
-    /// Contract txids that were discarded (already spent or never broadcast).
+    /// Contract txids that were discarded (never broadcast, or their funding is gone).
     pub discarded: Vec<Txid>,
 }
 
@@ -991,7 +991,7 @@ impl Wallet {
         // The confirmed view has no such output: it was spent, or the
         // contract tx was never broadcast.
         if chain.tx_block_height(&contract_txid)?.is_some() {
-            // Discard only on a confirmed spend. On Electrum a mempool-spent
+            // Classify only a confirmed spend. On Electrum a mempool-spent
             // output looks identical here, and such a spend can be evicted;
             // the backend answers from the script's history instead.
             let outpoint = OutPoint::new(contract_txid, contract_vout);
@@ -1013,11 +1013,12 @@ impl Wallet {
                     );
                     return Ok(ContractChainState::RecoveredByTimelock(recovery_txid));
                 }
+                // The other side claimed it, and that spend may carry the preimage
+                // we still need. Keep the coin until the swap settles.
                 log::info!(
-                    "Contract output for {} spent by a confirmed tx — discarding swapcoin",
+                    "Contract output for {} claimed by a confirmed tx — keeping swapcoin",
                     swap_id
                 );
-                return Ok(ContractChainState::Discarded);
             }
             return Ok(ContractChainState::NotYet);
         }
@@ -1225,6 +1226,7 @@ impl Wallet {
             swap_scope,
             funding_shared_with_peer,
             &|_| false,
+            &|_| false,
         )?;
         Ok(Self::finish_recoveries(wallet, chain, shutdown, Vec::new(), refunds, discarded)?.1)
     }
@@ -1242,7 +1244,9 @@ impl Wallet {
     ///
     /// `claimed_by_hashlock` names swaps whose incoming coin we claimed. Their
     /// outgoing coins are the first maker's to claim with the preimage, so they
-    /// are refunded only once that can provably never happen.
+    /// are refunded only once that can provably never happen. `claim_proven`
+    /// is the part of those with real evidence of a claim; only such a swap
+    /// keeps its preimage when it is refunded.
     fn broadcast_timelock_recoveries(
         wallet: &std::sync::RwLock<Wallet>,
         chain: &AnyBlockchain,
@@ -1250,6 +1254,7 @@ impl Wallet {
         swap_scope: Option<&HashSet<String>>,
         funding_shared_with_peer: &dyn Fn(Option<&str>) -> bool,
         claimed_by_hashlock: &dyn Fn(&str) -> bool,
+        claim_proven: &dyn Fn(&str) -> bool,
     ) -> Result<(Vec<SentSpend>, Vec<String>), WalletError> {
         // Snapshot everything the recovery needs, then drop the guard before any backend call.
         let candidates = {
@@ -1398,11 +1403,9 @@ impl Wallet {
                 // The first maker learns the preimage only from a spend of its own
                 // outgoing: the first hops, all at the one locktime we gave it.
                 // Once each went back by timelock, our outgoing is left dangling.
-                if let Some(swap_id) = swapcoin
-                    .swap_id
-                    .as_deref()
-                    .filter(|id| claimed_by_hashlock(id))
-                {
+                let claimed = swapcoin.swap_id.as_deref().is_some_and(claimed_by_hashlock);
+                let proven = swapcoin.swap_id.as_deref().is_some_and(claim_proven);
+                if let Some(swap_id) = swapcoin.swap_id.as_deref().filter(|_| claimed) {
                     let hops = lock_debug!(wallet.read())
                         .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?
                         .store
@@ -1460,6 +1463,17 @@ impl Wallet {
                             .clone()
                             .into_unchecked())
                     })?;
+                    // Checked before any write: a refund that cannot go out must
+                    // not give up the claim below.
+                    let checked =
+                        address
+                            .clone()
+                            .require_network(w.store.network)
+                            .map_err(|e| {
+                                WalletError::General(format!(
+                                    "invalid recovery address network: {e}"
+                                ))
+                            })?;
                     if created {
                         w.store
                             .outgoing_swapcoins
@@ -1471,11 +1485,29 @@ impl Wallet {
                                 ))
                             })?
                             .recovery_address = Some(address.clone());
+                    }
+                    // This refund settles an unclaimed swap: a hashlock sweep of
+                    // its incoming after it would take both sides. Give up that
+                    // claim before it goes out. A maker never refunds a known preimage.
+                    // A sweep we already built proves a claim too.
+                    let unclaimed = swapcoin.swap_id.as_ref().filter(|id| {
+                        !proven
+                            && !w.store.incoming_swapcoins.values().any(|coin| {
+                                coin.swap_id.as_ref() == Some(*id) && coin.spending_tx.is_some()
+                            })
+                    });
+                    let mut changed = created;
+                    if let Some(id) = unclaimed {
+                        for coin in w.store.incoming_swapcoins.values_mut() {
+                            if coin.swap_id.as_ref() == Some(id) {
+                                changed |= coin.hash_preimage.take().is_some();
+                            }
+                        }
+                    }
+                    if changed {
                         w.save_to_disk()?;
                     }
-                    address.require_network(w.store.network).map_err(|e| {
-                        WalletError::General(format!("invalid recovery address network: {e}"))
-                    })?
+                    checked
                 };
 
                 // Read once, at the first ready coin: no refund in this pass waits
@@ -1608,6 +1640,8 @@ impl Wallet {
             Some(swap_ids),
             funding_shared_with_peer,
             &|swap_id| sweep_failed || claiming.contains(swap_id) || incoming_claimed(swap_id),
+            // A failed sweep step holds every refund, but proves no claim.
+            &|swap_id| claiming.contains(swap_id) || incoming_claimed(swap_id),
         )?;
         Self::finish_recoveries(wallet, chain, shutdown, sweeps, refunds, discarded)
     }
@@ -5153,6 +5187,22 @@ mod timelock_reconcile_tests {
             state,
             ContractChainState::RecoveredByTimelock(recovery.compute_txid())
         );
+    }
+
+    /// The next hop's claim of our contract can carry the preimage the maker
+    /// still needs for its incoming, so the coin stays until the swap settles.
+    #[test]
+    fn electrum_keeps_a_contract_the_other_side_claimed() {
+        let (coin, _) = legacy_coin_and_recovery();
+        let claim = tx(
+            OutPoint::new(coin.contract_tx.compute_txid(), 0),
+            49_000,
+            ScriptBuf::new_p2wpkh(&pubkey(6).wpubkey_hash().unwrap()),
+        );
+        let url = start_electrum_stub(coin.contract_tx.clone(), claim);
+        let state =
+            Wallet::ensure_contract_on_chain(&electrum(&url), "swap", &coin, &|_| true).unwrap();
+        assert_eq!(state, ContractChainState::NotYet);
     }
 
     /// A Taproot outgoing swapcoin whose contract output commits to both

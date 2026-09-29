@@ -586,6 +586,44 @@ impl SwapTracker {
         (swap_ids, incoming_contract_txids)
     }
 
+    /// [`Self::recovery_scope`], after each failed record lists every incoming
+    /// coin the wallet holds for it. A crash can save a coin before the record
+    /// lists it, and `incoming_claimed` reads a listed coin gone as claimed.
+    pub(crate) fn recovery_scope_listing(
+        &mut self,
+        wallet: &Wallet,
+    ) -> Result<(HashSet<String>, HashSet<Txid>), TakerError> {
+        let mut unlisted = Vec::new();
+        for record in self.data.swaps.values_mut().filter(|record| {
+            record.phase == SwapPhase::Failed && record.recovery.phase < RecoveryPhase::CleanedUp
+        }) {
+            // The wallet keys each incoming coin by its contract txid.
+            for txid in wallet.incoming_keys_for_swap(&record.swap_id) {
+                let txid = txid
+                    .parse()
+                    .map_err(|_| TakerError::General(format!("incoming key {txid} is no txid")))?;
+                if !record.incoming_contract_txids.contains(&txid) {
+                    record.incoming_contract_txids.push(txid);
+                    unlisted.push((record.swap_id.clone(), txid));
+                }
+            }
+        }
+        // Undo on a failed save, so the next pass lists them again.
+        if !unlisted.is_empty() {
+            if let Err(e) = self.flush() {
+                for (swap_id, txid) in &unlisted {
+                    if let Some(record) = self.data.swaps.get_mut(swap_id) {
+                        record
+                            .incoming_contract_txids
+                            .retain(|listed| listed != txid);
+                    }
+                }
+                return Err(e);
+            }
+        }
+        Ok(self.recovery_scope())
+    }
+
     /// Get a mutable reference to a swap record by ID.
     pub fn get_record_mut(&mut self, swap_id: &str) -> Option<&mut SwapRecord> {
         self.data.swaps.get_mut(swap_id)
