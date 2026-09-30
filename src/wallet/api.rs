@@ -2571,6 +2571,9 @@ impl Wallet {
             };
 
             if let Some((cached_utxo, _)) = self.store.utxo_cache.get_mut(&outpoint) {
+                let mut utxo = utxo;
+                utxo.amount = cached_utxo.amount;
+                utxo.script_pub_key = cached_utxo.script_pub_key.clone();
                 *cached_utxo = utxo;
                 continue;
             }
@@ -4372,6 +4375,7 @@ impl Wallet {
 mod utxo_corroboration_tests {
     use super::*;
     use bitcoin::{absolute::LockTime, hashes::Hash, transaction::Version};
+    use bitcoind::tempfile::tempdir;
 
     fn entry_for(
         tx: &Transaction,
@@ -4431,6 +4435,47 @@ mod utxo_corroboration_tests {
         let mut lying = entry_for(&tx, 0, spk, value);
         lying.txid = Txid::all_zeros();
         assert!(!utxo_matches_tx(&tx, &lying));
+    }
+
+    #[test]
+    fn cached_utxo_refresh_preserves_transaction_value_and_script() {
+        let dir = tempdir().unwrap();
+        let mut wallet = super::test_support::test_wallet(&dir.path().join("cache-test-wallet"));
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let amount = Amount::from_sat(1_000);
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: amount,
+                script_pubkey: script.clone(),
+            }],
+        };
+        let original = entry_for(&tx, 0, script.clone(), amount);
+        let outpoint = OutPoint::new(original.txid, original.vout);
+        wallet.store.utxo_cache.insert(
+            outpoint,
+            (
+                original.clone(),
+                UTXOSpendInfo::SeedCoin {
+                    path: "m/0/0".into(),
+                    input_value: amount,
+                    address_type: AddressType::P2WPKH,
+                },
+            ),
+        );
+        let mut refreshed = original;
+        refreshed.amount = Amount::from_sat(2_000);
+        refreshed.script_pub_key = ScriptBuf::from_bytes(vec![0x52]);
+        refreshed.confirmations = 6;
+
+        wallet.update_utxo_cache(vec![refreshed]).unwrap();
+
+        let (cached, _) = &wallet.store.utxo_cache[&outpoint];
+        assert_eq!(cached.amount, amount);
+        assert_eq!(cached.script_pub_key, script);
+        assert_eq!(cached.confirmations, 6);
     }
 }
 

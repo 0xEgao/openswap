@@ -167,6 +167,7 @@ fn is_unknown_txid(e: &electrum_client::Error) -> bool {
         let message = v
             .get("message")
             .and_then(serde_json::Value::as_str)
+            .or_else(|| v.as_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
         message.contains("no such mempool or blockchain transaction")
@@ -1968,6 +1969,13 @@ mod tests {
             "message": "missing transaction"
         }));
         assert!(is_unknown_txid(&missing));
+        assert!(is_unknown_txid(&Error::Protocol(json!(
+            "Missing transaction"
+        ))));
+        assert!(is_unknown_txid(&Error::Protocol(json!(
+            "No such mempool or blockchain transaction"
+        ))));
+        assert!(!is_unknown_txid(&Error::Protocol(json!("rate limited"))));
         // Every other Protocol value is a server problem, not an absence.
         let other = Error::Protocol(json!({ "code": -32600, "message": "rate limited" }));
         assert!(!is_unknown_txid(&other));

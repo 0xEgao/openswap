@@ -632,6 +632,7 @@ pub struct OfferSyncHandle {
     shutdown: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     cmd_tx: mpsc::Sender<SyncCommand>,
+    offerbook: OfferBookHandle,
 }
 
 /// Lightweight clone-able client for triggering offer sync operations from
@@ -716,14 +717,32 @@ impl OfferSyncHandle {
         })
     }
 
-    /// Remove a maker after any in-progress sync has finished.
+    /// Remove after sync, falling back to local removal if the service is busy or stopped.
     pub fn remove_maker(&self, address: MakerAddress) -> Result<bool, TakerError> {
+        let was_present = {
+            let book = lock_debug!(self.offerbook.inner.read())
+                .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?;
+            book.makers.iter().any(|maker| maker.address == address)
+                || book.suppressed_makers.contains_key(&address)
+        };
         let (done_tx, done_rx) = mpsc::channel();
-        self.cmd_tx.send(SyncCommand::RemoveMaker {
-            address,
-            done: done_tx,
-        })?;
-        done_rx.recv()?
+        if self
+            .cmd_tx
+            .send(SyncCommand::RemoveMaker {
+                address: address.clone(),
+                done: done_tx,
+            })
+            .is_ok()
+        {
+            if let Ok(result) = done_rx.recv_timeout(Duration::from_secs(1)) {
+                return result.map(|removed| removed || was_present);
+            }
+        }
+        // A queued removal still runs after the in-flight sync, cleaning up
+        // any entry it rediscovered after this immediate local removal.
+        self.offerbook
+            .remove(&address)
+            .map(|removed| removed || was_present)
     }
 }
 
@@ -1148,6 +1167,7 @@ impl OfferSyncService {
     pub fn start(self) -> Result<OfferSyncHandle, TakerError> {
         let shutdown = self.shutdown.clone();
         let shutdown_flag = shutdown.clone();
+        let offerbook = self.offerbook.clone();
         let (cmd_tx, cmd_rx) = mpsc::channel::<SyncCommand>();
 
         let join = std::thread::Builder::new()
@@ -1177,7 +1197,7 @@ impl OfferSyncService {
                                     log::warn!("Manual offer sync failed: {e:?}");
                                 }
                                 let _ = done_tx.send(());
-                                Self::drain_and_ack(&cmd_rx);
+                                self.drain_and_ack(&cmd_rx);
                                 break;
                             }
                             Ok(SyncCommand::PollMaker { address, done }) => {
@@ -1206,6 +1226,7 @@ impl OfferSyncService {
             shutdown,
             join: Some(join),
             cmd_tx,
+            offerbook,
         })
     }
 
@@ -1230,10 +1251,20 @@ impl OfferSyncService {
         }
     }
 
-    /// This is used while periodic sync is running and on-demand syncs are initiated, then, acknowledge and discardall queued sync requests.
-    fn drain_and_ack(rx: &mpsc::Receiver<SyncCommand>) {
-        while let Ok(SyncCommand::SyncNow(done_tx)) = rx.try_recv() {
-            let _ = done_tx.send(());
+    /// Coalesce queued sync requests, but execute polls and removals in order.
+    fn drain_and_ack(&self, rx: &mpsc::Receiver<SyncCommand>) {
+        while let Ok(command) = rx.try_recv() {
+            match command {
+                SyncCommand::SyncNow(done) => {
+                    let _ = done.send(());
+                }
+                SyncCommand::PollMaker { address, done } => {
+                    let _ = done.send(self.poll_one(address));
+                }
+                SyncCommand::RemoveMaker { address, done } => {
+                    let _ = done.send(self.offerbook.remove(&address));
+                }
+            }
         }
     }
 }
@@ -3356,6 +3387,129 @@ mod tests {
         assert_eq!(persisted.makers[0].state, MakerState::Banned(first_ban));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn draining_sync_requests_preserves_polls_and_removals() {
+        let dir = tempdir().unwrap();
+        let offerbook = OfferBookHandle::load_or_create(dir.path()).unwrap();
+        let address = addr("6107");
+        // A banned maker can be polled without network access.
+        offerbook
+            .record_proven_violation(&address, BanReason::ProvenViolation)
+            .unwrap();
+        let config = CoreRpcConfig {
+            url: "127.0.0.1:0".into(),
+            ..CoreRpcConfig::default()
+        };
+        let service = OfferSyncService::new(
+            offerbook.clone(),
+            FileRegistry::new(),
+            0,
+            Arc::new(AnyBlockchain::CoreRPC(CoreRPC::new(&config).unwrap())),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (sync_tx, sync_rx) = mpsc::channel();
+        let (poll_tx, poll_rx) = mpsc::channel();
+        let (remove_tx, remove_rx) = mpsc::channel();
+        let (last_tx, last_rx) = mpsc::channel();
+        cmd_tx.send(SyncCommand::SyncNow(sync_tx)).unwrap();
+        cmd_tx
+            .send(SyncCommand::PollMaker {
+                address: address.clone(),
+                done: poll_tx,
+            })
+            .unwrap();
+        cmd_tx
+            .send(SyncCommand::RemoveMaker {
+                address: address.clone(),
+                done: remove_tx,
+            })
+            .unwrap();
+        cmd_tx.send(SyncCommand::SyncNow(last_tx)).unwrap();
+
+        service.drain_and_ack(&cmd_rx);
+
+        sync_rx.try_recv().unwrap();
+        assert_eq!(poll_rx.try_recv().unwrap().unwrap().address, address);
+        assert!(remove_rx.try_recv().unwrap().unwrap());
+        last_rx.try_recv().unwrap();
+        assert!(offerbook.all_makers().unwrap().is_empty());
+        assert!(OfferBook::read_from_disk(&offerbook.path)
+            .unwrap()
+            .makers
+            .is_empty());
+    }
+
+    #[test]
+    fn removal_falls_back_when_sync_is_busy_or_stopped() {
+        for stopped in [false, true] {
+            let dir = tempdir().unwrap();
+            let offerbook = OfferBookHandle::load_or_create(dir.path()).unwrap();
+            let address = addr("6107");
+            offerbook
+                .record_proven_violation(&address, BanReason::ProvenViolation)
+                .unwrap();
+            let (cmd_tx, cmd_rx) = mpsc::channel();
+            let receiver = if stopped {
+                drop(cmd_rx);
+                None
+            } else {
+                Some(cmd_rx)
+            };
+            let handle = OfferSyncHandle {
+                shutdown: Arc::new(AtomicBool::new(false)),
+                join: None,
+                cmd_tx,
+                offerbook: offerbook.clone(),
+            };
+
+            assert!(handle.remove_maker(address).unwrap());
+            assert!(offerbook.all_makers().unwrap().is_empty());
+            assert!(OfferBook::read_from_disk(&offerbook.path)
+                .unwrap()
+                .makers
+                .is_empty());
+            if let Some(receiver) = receiver {
+                // The busy service still has a removal queued for after sync.
+                assert!(matches!(
+                    receiver.try_recv().unwrap(),
+                    SyncCommand::RemoveMaker { .. }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn removal_reports_an_entry_removed_during_the_request() {
+        let dir = tempdir().unwrap();
+        let offerbook = OfferBookHandle::load_or_create(dir.path()).unwrap();
+        let address = addr("6107");
+        offerbook
+            .record_proven_violation(&address, BanReason::ProvenViolation)
+            .unwrap();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let worker_book = offerbook.clone();
+        let worker = std::thread::spawn(move || {
+            let SyncCommand::RemoveMaker { address, done } = cmd_rx.recv().unwrap() else {
+                panic!("expected a removal request");
+            };
+            worker_book.remove(&address).unwrap();
+            // Models a second queued removal after a timeout fallback.
+            let _ = done.send(Ok(worker_book.remove(&address).unwrap()));
+        });
+        let handle = OfferSyncHandle {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            join: None,
+            cmd_tx,
+            offerbook: offerbook.clone(),
+        };
+
+        assert!(handle.remove_maker(address).unwrap());
+        worker.join().unwrap();
+        assert!(offerbook.all_makers().unwrap().is_empty());
     }
 
     #[test]
