@@ -4904,18 +4904,22 @@ mod timelock_reconcile_tests {
     const TIP: i64 = 10;
     const PASSWORD: &str = "test-password";
 
-    fn key(byte: u8) -> SecretKey {
+    pub(super) fn key(byte: u8) -> SecretKey {
         SecretKey::from_slice(&[byte; 32]).unwrap()
     }
 
-    fn pubkey(byte: u8) -> PublicKey {
+    pub(super) fn pubkey(byte: u8) -> PublicKey {
         PublicKey::new(bitcoin::secp256k1::PublicKey::from_secret_key(
             crate::utill::global_secp(),
             &key(byte),
         ))
     }
 
-    fn tx(previous_output: OutPoint, value: u64, script_pubkey: ScriptBuf) -> Transaction {
+    pub(super) fn tx(
+        previous_output: OutPoint,
+        value: u64,
+        script_pubkey: ScriptBuf,
+    ) -> Transaction {
         Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: LockTime::ZERO,
@@ -4968,7 +4972,7 @@ mod timelock_reconcile_tests {
         (coin, recovery, replaced)
     }
 
-    fn scripthash(script: &Script) -> String {
+    pub(super) fn scripthash(script: &Script) -> String {
         use bitcoin::hex::DisplayHex;
         use electrum_client::ToElectrumScriptHash;
         script.to_electrum_scripthash().to_lower_hex_string()
@@ -5083,7 +5087,7 @@ mod timelock_reconcile_tests {
         url
     }
 
-    fn electrum(url: &str) -> AnyBlockchain {
+    pub(super) fn electrum(url: &str) -> AnyBlockchain {
         AnyBlockchain::Electrum(
             Electrum::new(&crate::wallet::ElectrumConfig {
                 url: url.to_string(),
@@ -5093,7 +5097,7 @@ mod timelock_reconcile_tests {
         )
     }
 
-    fn stub_wallet(path: &Path, blockchain: AnyBlockchain) -> Wallet {
+    pub(super) fn stub_wallet(path: &Path, blockchain: AnyBlockchain) -> Wallet {
         let master_key = Xpriv::new_master(bitcoin::Network::Regtest, &[42; 32]).unwrap();
         let enc_material = KeyMaterial::new_from_password(Some(PASSWORD.to_string())).unwrap();
         let store = WalletStore::init(
@@ -5118,7 +5122,7 @@ mod timelock_reconcile_tests {
 
     /// Fails the pass instead of hanging if the stub cannot satisfy a sync:
     /// `sync_no_fail` retries forever until shutdown.
-    fn shutdown_after(secs: u64) -> Arc<AtomicBool> {
+    pub(super) fn shutdown_after(secs: u64) -> Arc<AtomicBool> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let flag = shutdown.clone();
         thread::spawn(move || {
@@ -5425,6 +5429,331 @@ mod timelock_reconcile_tests {
             state,
             ContractChainState::RecoveredByTimelock(recovery.compute_txid())
         );
+    }
+}
+
+/// An incoming contract still in the mempool is swept on a later pass, and its
+/// swap's refund waits meanwhile.
+#[cfg(test)]
+mod mempool_deferral_tests {
+    use super::{
+        timelock_reconcile_tests::{
+            electrum, key, pubkey, scripthash, shutdown_after, stub_wallet, tx,
+        },
+        *,
+    };
+    use crate::{
+        protocol::contract::{create_contract_redeemscript, Hash160},
+        wallet::swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
+    };
+    use bitcoin::{
+        consensus::encode::{deserialize_hex, serialize_hex},
+        hashes::Hash,
+    };
+    use bitcoind::tempfile::tempdir;
+    use std::{
+        io::{BufRead, BufReader, Write as IoWrite},
+        net::TcpListener,
+        sync::{Arc, Mutex, RwLock},
+    };
+
+    const TIP: i64 = 100;
+    /// Leaves the outgoing contract's 20-block CSV matured at `TIP`.
+    const OUTGOING_HEIGHT: i64 = 50;
+    const SWAP: &str = "swap";
+
+    /// What the stub server knows. A height of `0` is the mempool.
+    #[derive(Default)]
+    struct StubChain {
+        txs: HashMap<Txid, (Transaction, i64)>,
+        broadcast: Vec<Txid>,
+    }
+
+    impl StubChain {
+        fn with(txs: &[(&Transaction, i64)]) -> Arc<Mutex<Self>> {
+            Arc::new(Mutex::new(StubChain {
+                txs: txs
+                    .iter()
+                    .map(|(tx, height)| (tx.compute_txid(), ((*tx).clone(), *height)))
+                    .collect(),
+                broadcast: Vec::new(),
+            }))
+        }
+
+        fn script_of(&self, outpoint: &OutPoint) -> Option<&ScriptBuf> {
+            self.txs
+                .get(&outpoint.txid)
+                .and_then(|(tx, _)| tx.output.get(outpoint.vout as usize))
+                .map(|output| &output.script_pubkey)
+        }
+
+        fn is_spent(&self, outpoint: &OutPoint) -> bool {
+            self.txs
+                .values()
+                .any(|(tx, _)| tx.input.iter().any(|i| i.previous_output == *outpoint))
+        }
+
+        /// Every tx paying to or spending from the script.
+        fn history(&self, scripthash_hex: &str) -> Value {
+            let matches = |script: &ScriptBuf| scripthash(script) == scripthash_hex;
+            self.txs
+                .iter()
+                .filter(|(_, (tx, _))| {
+                    tx.output.iter().any(|o| matches(&o.script_pubkey))
+                        || tx
+                            .input
+                            .iter()
+                            .any(|i| self.script_of(&i.previous_output).is_some_and(&matches))
+                })
+                .map(|(txid, (_, height))| json!({"tx_hash": txid.to_string(), "height": height}))
+                .collect()
+        }
+
+        fn unspent(&self, scripthash_hex: &str) -> Value {
+            let mut entries = Vec::new();
+            for (txid, (tx, height)) in &self.txs {
+                for (vout, output) in tx.output.iter().enumerate() {
+                    let outpoint = OutPoint::new(*txid, vout as u32);
+                    if scripthash(&output.script_pubkey) == scripthash_hex
+                        && !self.is_spent(&outpoint)
+                    {
+                        entries.push(json!({
+                            "tx_hash": txid.to_string(), "tx_pos": vout, "height": height,
+                            "value": output.value.to_sat(),
+                        }));
+                    }
+                }
+            }
+            Value::Array(entries)
+        }
+    }
+
+    /// Electrum server over `chain`. A broadcast tx is mined at `TIP` at once,
+    /// so a pass's confirmation wait returns on its first poll.
+    fn start_electrum_stub(chain: Arc<Mutex<StubChain>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let url = format!("tcp://{}", listener.local_addr().unwrap());
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = genesis.block_hash().to_string();
+        let header_hex = serialize_hex(&genesis.header);
+
+        thread::spawn(move || {
+            for incoming in listener.incoming() {
+                let Ok(stream) = incoming else { continue };
+                let _ = stream.set_nodelay(true);
+                let (genesis_hash, header_hex) = (genesis_hash.clone(), header_hex.clone());
+                let chain = chain.clone();
+                thread::spawn(move || {
+                    let answer = |req: &Value| -> Value {
+                        let param = req["params"][0].as_str().unwrap_or_default();
+                        let mut chain = chain.lock().unwrap();
+                        let result = match req["method"].as_str().unwrap_or_default() {
+                            "server.features" => json!({
+                                "server_version": "stub",
+                                "genesis_hash": genesis_hash,
+                                "protocol_min": "1.4",
+                                "protocol_max": "1.4",
+                                "hash_function": "sha256",
+                                "pruning": Value::Null,
+                            }),
+                            "blockchain.headers.subscribe" => {
+                                json!({"height": TIP, "hex": header_hex})
+                            }
+                            "blockchain.block.header" => json!(header_hex),
+                            "blockchain.estimatefee" => json!(0.00001),
+                            "blockchain.scripthash.get_history" => chain.history(param),
+                            "blockchain.scripthash.listunspent" => chain.unspent(param),
+                            "blockchain.transaction.get" => {
+                                match param.parse::<Txid>().ok().and_then(|t| chain.txs.get(&t)) {
+                                    Some((tx, _)) => json!(serialize_hex(tx)),
+                                    None => {
+                                        return json!({"jsonrpc": "2.0", "id": req["id"], "error": {
+                                            "code": 2,
+                                            "message": "No such mempool or blockchain transaction",
+                                        }})
+                                    }
+                                }
+                            }
+                            "blockchain.transaction.broadcast" => {
+                                let tx: Transaction = deserialize_hex(param).unwrap();
+                                let txid = tx.compute_txid();
+                                chain.txs.insert(txid, (tx, TIP));
+                                chain.broadcast.push(txid);
+                                json!(txid.to_string())
+                            }
+                            _ => Value::Null,
+                        };
+                        json!({"jsonrpc": "2.0", "id": req["id"], "result": result})
+                    };
+                    let mut out = stream.try_clone().expect("clone stub stream");
+                    for line in BufReader::new(stream).lines() {
+                        let Ok(line) = line else { return };
+                        let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                            return;
+                        };
+                        let resp = match req.as_array() {
+                            Some(batch) => Value::Array(batch.iter().map(answer).collect()),
+                            None => answer(&req),
+                        };
+                        if writeln!(out, "{resp}").is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        url
+    }
+
+    /// Our Legacy incoming coin, claimable by hashlock: we hold the preimage.
+    fn incoming_coin() -> IncomingSwapCoin {
+        let preimage = [7; 32];
+        let redeemscript =
+            create_contract_redeemscript(&pubkey(2), &pubkey(3), &Hash160::hash(&preimage), &20);
+        let contract_tx = tx(
+            OutPoint::new(Txid::from_byte_array([8; 32]), 0),
+            50_000,
+            redeemscript.to_p2wsh(),
+        );
+        let mut coin = IncomingSwapCoin::new_legacy(
+            key(1),
+            pubkey(4),
+            contract_tx,
+            redeemscript,
+            key(2),
+            Amount::from_sat(50_000),
+            1,
+        );
+        coin.hash_preimage = Some(preimage);
+        coin.swap_id = Some(SWAP.to_string());
+        coin
+    }
+
+    /// Our Legacy outgoing coin of the same swap.
+    fn outgoing_coin() -> OutgoingSwapCoin {
+        let redeemscript =
+            create_contract_redeemscript(&pubkey(5), &pubkey(6), &Hash160::all_zeros(), &20);
+        let contract_tx = tx(
+            OutPoint::new(Txid::from_byte_array([9; 32]), 0),
+            50_000,
+            redeemscript.to_p2wsh(),
+        );
+        let mut coin = OutgoingSwapCoin::new_legacy(
+            key(1),
+            pubkey(4),
+            contract_tx,
+            redeemscript,
+            key(6),
+            Amount::from_sat(50_000),
+            1,
+        );
+        coin.swap_id = Some(SWAP.to_string());
+        coin
+    }
+
+    fn wallet_with(
+        path: &Path,
+        url: &str,
+        incoming: &IncomingSwapCoin,
+        outgoing: Option<&OutgoingSwapCoin>,
+    ) -> RwLock<Wallet> {
+        let mut wallet = stub_wallet(path, electrum(url));
+        wallet.add_incoming_swapcoin(incoming);
+        if let Some(outgoing) = outgoing {
+            wallet.add_outgoing_swapcoin(outgoing);
+        }
+        wallet.save_to_disk().unwrap();
+        RwLock::new(wallet)
+    }
+
+    /// The first pass meets the contract in the mempool: it holds the swap as
+    /// claimed and broadcasts nothing. Once the contract is mined, the next
+    /// pass sweeps it.
+    #[test]
+    fn mempool_contract_is_swept_on_a_later_pass() {
+        let incoming = incoming_coin();
+        let contract_txid = incoming.contract_tx.compute_txid();
+        let chain = StubChain::with(&[(&incoming.contract_tx, 0)]);
+        let url = start_electrum_stub(chain.clone());
+        let temp_dir = tempdir().unwrap();
+        let wallet = wallet_with(&temp_dir.path().join("wallet.cbor"), &url, &incoming, None);
+        let backend = electrum(&url);
+        let shutdown = shutdown_after(60);
+
+        let (sweeps, claiming) =
+            Wallet::broadcast_incoming_sweeps(&wallet, &backend, &shutdown, None).unwrap();
+        assert!(sweeps.is_empty());
+        assert_eq!(claiming, HashSet::from([SWAP.to_string()]));
+        assert!(chain.lock().unwrap().broadcast.is_empty());
+
+        chain.lock().unwrap().txs.get_mut(&contract_txid).unwrap().1 = TIP;
+        let outcome = Wallet::sweep_incoming_swapcoins(&wallet, &backend, &shutdown, None).unwrap();
+        let chain = chain.lock().unwrap();
+        let [sweep] = chain.broadcast[..] else {
+            panic!("expected one sweep, got {:?}", chain.broadcast);
+        };
+        assert_eq!(
+            chain.txs[&sweep].0.input[0].previous_output,
+            OutPoint::new(contract_txid, 0)
+        );
+        assert_eq!(outcome.resolved, vec![(contract_txid, sweep)]);
+        assert!(wallet.read().unwrap().store.incoming_swapcoins.is_empty());
+    }
+
+    /// Txs one recovery pass broadcasts for a swap whose outgoing timelock has
+    /// matured, with the incoming contract at `incoming_height` (`None`: never
+    /// broadcast).
+    fn broadcast_by_recovery(incoming_height: Option<i64>) -> Vec<Transaction> {
+        let (incoming, outgoing) = (incoming_coin(), outgoing_coin());
+        let chain = StubChain::with(&[(&outgoing.contract_tx, OUTGOING_HEIGHT)]);
+        if let Some(height) = incoming_height {
+            let contract = &incoming.contract_tx;
+            chain
+                .lock()
+                .unwrap()
+                .txs
+                .insert(contract.compute_txid(), (contract.clone(), height));
+        }
+        let url = start_electrum_stub(chain.clone());
+        let temp_dir = tempdir().unwrap();
+        let wallet = wallet_with(
+            &temp_dir.path().join("wallet.cbor"),
+            &url,
+            &incoming,
+            Some(&outgoing),
+        );
+
+        Wallet::recover_swapcoins(
+            &wallet,
+            &electrum(&url),
+            &shutdown_after(60),
+            &HashSet::from([incoming.contract_tx.compute_txid()]),
+            &HashSet::from([SWAP.to_string()]),
+            &|_| true,
+            &|_| false,
+        )
+        .unwrap();
+        let chain = chain.lock().unwrap();
+        chain
+            .broadcast
+            .iter()
+            .map(|txid| chain.txs[txid].0.clone())
+            .collect()
+    }
+
+    /// The taker side: its incoming contract is still in the mempool when its
+    /// outgoing timelock matures. It will sweep that coin, so a refund now
+    /// would settle the swap both ways; the refund waits.
+    #[test]
+    fn mempool_incoming_holds_the_matured_refund() {
+        assert!(broadcast_by_recovery(Some(0)).is_empty());
+
+        // With no incoming contract anywhere, the same pass refunds, so the
+        // hold above comes from the mempool contract.
+        let refunds = broadcast_by_recovery(None);
+        let outgoing_contract = OutPoint::new(outgoing_coin().contract_tx.compute_txid(), 0);
+        assert_eq!(refunds.len(), 1);
+        assert_eq!(refunds[0].input[0].previous_output, outgoing_contract);
     }
 }
 
