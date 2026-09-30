@@ -61,8 +61,8 @@ use super::{
     config::TakerConfig,
     error::TakerError,
     offers::{
-        MakerAddress, MakerOfferCandidate, MakerProtocol, OfferAndAddress, OfferBook,
-        OfferBookHandle, OfferSyncClient, OfferSyncHandle, OfferSyncService,
+        sort_makers_by_fee, MakerAddress, MakerOfferCandidate, MakerProtocol, OfferAndAddress,
+        OfferBook, OfferBookHandle, OfferSyncClient, OfferSyncHandle, OfferSyncService,
     },
     payment::{hop_net_sats, HopFeeTerms, PaymentQuote},
 };
@@ -1647,7 +1647,7 @@ impl Taker {
                 return Err(TakerError::NotEnoughMakersInOfferBook);
             }
 
-            let suitable_makers: Vec<OfferAndAddress> = available_makers
+            let mut suitable_makers: Vec<OfferAndAddress> = available_makers
                 .into_iter()
                 .filter(|maker| {
                     let min_ok = send_amount.to_sat() >= maker.offer.min_size;
@@ -1665,6 +1665,11 @@ impl Taker {
                 return Err(TakerError::NotEnoughMakersInOfferBook);
             }
 
+            // Price every offer at the same amount and first-hop locktime.
+            let locktime =
+                REFUND_LOCKTIME_BASE + REFUND_LOCKTIME_STEP * maker_count.saturating_sub(1) as u16;
+            sort_makers_by_fee(&mut suitable_makers, send_amount.to_sat(), locktime);
+
             let spare_count = suitable_makers.len().saturating_sub(maker_count).min(2);
             let total_select = maker_count + spare_count;
 
@@ -1672,8 +1677,9 @@ impl Taker {
                 suitable_makers.into_iter().take(total_select).collect();
 
             let spare_oas = selected.split_off(maker_count);
+            // Spares are consumed with pop(), so try the cheapest first.
             let spare_addrs: Vec<MakerAddress> =
-                spare_oas.into_iter().map(|oa| oa.address).collect();
+                spare_oas.into_iter().rev().map(|oa| oa.address).collect();
             let makers: Vec<MakerConnection> = selected
                 .into_iter()
                 .map(|oa| MakerConnection::new(oa.address, protocol, Some(oa.offer)))
@@ -3537,7 +3543,7 @@ impl Taker {
     pub fn remove_maker(&self, address: String) -> Result<bool, TakerError> {
         let parsed = MakerAddress::try_from(address)
             .map_err(|e| TakerError::General(format!("Invalid maker address: {e}")))?;
-        self.offerbook.remove(&parsed)
+        self.offer_sync_handle.remove_maker(parsed)
     }
 
     /// Add a funding-source address to the shared blocklist, or update its label.

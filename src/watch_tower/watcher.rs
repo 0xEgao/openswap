@@ -317,7 +317,7 @@ impl<R: Role> Watcher<R> {
                 _ = reply.send(Ok(()));
             }
             WatcherCommand::WatchRequest { outpoint, reply } => {
-                log::info!("Intercepted watch request: {outpoint}");
+                log::debug!("Intercepted watch request: {outpoint}");
                 // Events queue while the loop waits for a command. Answer from the
                 // backend's current view, or a spend it already relayed reads as unspent.
                 self.drain_events();

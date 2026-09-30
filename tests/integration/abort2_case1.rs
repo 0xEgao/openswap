@@ -342,6 +342,13 @@ fn heterogeneous_substitution_aborts_without_cascade() {
         "maker admission logs should be captured in this file"
     );
     assert!(
+        taker_log_contents.contains(&format!(
+            "[{}] Accepting swap",
+            makers[3].config.network_port
+        )),
+        "the cheaper maker3 spare must be selected first"
+    );
+    assert!(
         !taker_log_contents.contains("parameters differ from stored swap"),
         "a downstream maker was re-negotiated with different terms"
     );
@@ -421,8 +428,8 @@ fn last_hop_expensive_spare_aborts_instead_of_repricing() {
     // prices cheap and drops; maker2 prices the same hop ~20k sats higher.
     let fee_overrides = vec![
         Some(MakerFeeOverride {
-            base_fee: 500,
-            amount_relative_fee_pct: 0.0025,
+            base_fee: 100,
+            amount_relative_fee_pct: 0.0005,
         }),
         Some(MakerFeeOverride {
             base_fee: 100,
@@ -568,8 +575,8 @@ fn last_hop_equal_priced_spare_completes() {
 
     let fee_overrides = vec![
         Some(MakerFeeOverride {
-            base_fee: 500,
-            amount_relative_fee_pct: 0.0025,
+            base_fee: 100,
+            amount_relative_fee_pct: 0.0005,
         }),
         Some(MakerFeeOverride {
             base_fee: 100,
@@ -634,11 +641,10 @@ fn last_hop_equal_priced_spare_completes() {
         "Taker balance: original={}, after={}",
         taker_original_balance, taker_balances.spendable
     );
-    // Pinned from a real run: the taker paid the cheap last-hop fee schedule
-    // (identical on the dropper and the spare) plus the default hop-0 fee.
+    // Pinned from a real run: both selected hops use the cheap fee schedule.
     assert_eq!(
         taker_balances.spendable.to_sat(),
-        14996395,
+        14996805,
         "Taker spendable balance mismatch"
     );
     assert_eq!(taker_balances.contract, Amount::ZERO);
@@ -653,7 +659,7 @@ fn last_hop_equal_priced_spare_completes() {
             "Maker {} balances: original={}, after={}",
             i, original, balances.spendable
         );
-        let expected_spendable = [15000415u64, 14999757, 14999968][i];
+        let expected_spendable = [15000005u64, 14999757, 14999968][i];
         assert_eq!(
             balances.spendable.to_sat(),
             expected_spendable,

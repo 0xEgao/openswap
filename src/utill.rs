@@ -105,6 +105,8 @@ pub(crate) const UNFUNDED_SWAP_LIFETIME: Duration =
 /// Default fee rate in sats/vb for all transactions, and the absolute floor:
 /// Bitcoin Core's default `minrelaytxfee`. Lower rates stop relaying.
 pub const MIN_RELAY_FEE_RATE: f64 = 1.0;
+/// Smallest supported confirmation requirement for peer-funded transactions.
+pub const MIN_REQUIRED_CONFIRM: u32 = 1;
 
 /// True when a caller-supplied fee rate cannot be used: not a real number, or
 /// under the floor Bitcoin nodes forward at. Callers word their own refusal.

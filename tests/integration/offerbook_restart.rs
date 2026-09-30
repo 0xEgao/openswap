@@ -91,9 +91,12 @@ fn test_offerbook_removal_survives_restart() {
     // The relay goes first: with it up, the periodic sync re-upserts a removed
     // maker within milliseconds and the drop would persist the wrong book.
     test_framework.kill_relay();
+    // The sync service can evict the entry as the relay goes down, in which
+    // case remove_maker correctly reports false. What must hold is its absence.
+    taker.remove_maker(maker_addrs[0].clone()).unwrap();
     assert!(
-        taker.remove_maker(maker_addrs[0].clone()).unwrap(),
-        "remove_maker must find the entry"
+        !listed_addresses(&taker).contains(&maker_addrs[0]),
+        "maker must be absent before restart"
     );
     drop(taker);
 
