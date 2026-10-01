@@ -2,7 +2,7 @@
 
 A dockerized version of the **Complete OpenSwap Backend**.
 
-The Docker spawns multiple containers, with Mutinynet, Tor, makerd, maker-cli, and taker configured to communicate with each other.
+The Docker stack runs up to three containers: `bitcoind`, Tor, and `makerd`. The `makerd` image also holds the `maker-cli` and `taker` apps.
 
 Various subsets of the stack can be used for different application needs and environments.
 
@@ -33,8 +33,6 @@ graph TD
     tor_vol["tor-data"]
     maker_vol["maker-data"]
     
-    network["openswap-network"]
-    
     makerd <-->|"RPC calls <br> (on bitcoind rpc-port)"| bitcoind
     makerd -->|SOCKS proxy| tor
     makerd -->|Control commands| tor
@@ -43,18 +41,15 @@ graph TD
     tor --> tor_vol
     makerd --> maker_vol
     
-    bitcoind --> network
-    tor --> network
-    makerd --> network
-    
     style bitcoind fill:#f9a825
     style tor fill:#7d4698
     style makerd fill:#3498db
-    style network fill:#e8f4f
     style bitcoin_vol fill:#ecf0f
     style tor_vol fill:#ecf0f
     style maker_vol fill:#fcf0f
 ```
+
+All three containers share your host network. Bitcoind RPC and ZMQ and the Tor ports listen only on `127.0.0.1`.
 
 The Docker setup uses:
 
@@ -88,7 +83,9 @@ cd openswap
 # Check status
 ./docker-setup status
 
-# View logs
+# View maker logs with the bundled Tor
+./docker-setup logs makerd-internal
+# View maker logs with your own Tor
 ./docker-setup logs makerd
 ```
 
@@ -98,7 +95,7 @@ The setup script will prompt for:
 
 1. **Bitcoin Core Configuration**:
    - Data directory path
-   - Network selection (regtest/signet/testnet/mainnet)
+   - Network selection (signet or regtest)
    - Use existing Bitcoin Core instance or spawn new one
    - Custom RPC and ZMQ ports
 
@@ -108,10 +105,12 @@ The setup script will prompt for:
    - Custom SOCKS and control ports
 
 3. **Service Ports**:
-   - Makerd network port (default: 6102)
    - Makerd RPC port (default: 6103)
 
-Configuration is saved to `.docker-config` and reused on subsequent runs.
+4. **Maker Wallet**:
+   - Wallet passphrase. The maker wallet is always encrypted, so makerd needs it on every start.
+
+Configuration is saved to `.docker-config` and reused on subsequent runs. The file holds your RPC password and wallet passphrase, so the script makes it readable only by you.
 
 ## Building Docker Images
 
@@ -128,7 +127,7 @@ cd openswap
 ./docker-setup build-bitcoin
 
 # Or build manually
-docker build -f docker/Dockerfile -t openswap:latest .
+docker build -f docker/Dockerfile -t openswap/openswap:latest .
 ```
 
 ### Available Images
@@ -146,17 +145,20 @@ Run the maker daemon with persistent data storage:
 # Using the setup script (recommended)
 ./docker-setup start
 
-# Or manually with specific image
+# Or manually, using the Tor and bitcoind on your host
 docker run -d \
   --name openswap-makerd \
-  -p 6102:6102 \
-  -p 6103:6103 \
+  --network host \
   -v openswap-maker-data:/home/openswap/.openswap \
-  --network openswap-network \
-  openswap:latest makerd
+  openswap/openswap:latest makerd \
+    -r 127.0.0.1:38332 \
+    -a user:password \
+    -p <wallet-passphrase>
 ```
 
-**Port mappings:**
+The container shares your host network. That way makerd reaches Tor and `bitcoind` on your machine. Makerd always encrypts its wallet. You must set its passphrase with `-p`. Add `-t <tor-password>` if your Tor control port uses a password.
+
+**Ports:**
 - `6102`: Maker network port for openswap protocol
 - `6103`: Maker RPC port for `maker-cli` commands
 
@@ -166,14 +168,14 @@ Control the maker daemon:
 
 ```bash
 # Using the setup script
-./docker-setup maker-cli ping
-./docker-setup maker-cli wallet-balance
+./docker-setup maker-cli send-ping
+./docker-setup maker-cli get-balances
 ./docker-setup maker-cli stop
 
-# Or manually
-docker run --rm --network openswap-network openswap:latest maker-cli ping
-docker run --rm --network openswap-network openswap:latest maker-cli wallet-balance
-docker run --rm --network openswap-network openswap:latest maker-cli stop
+# Or manually, inside the running makerd container
+docker exec -it openswap-makerd maker-cli send-ping
+docker exec -it openswap-makerd maker-cli get-balances
+docker exec -it openswap-makerd maker-cli stop
 ```
 
 ### Taker
@@ -187,8 +189,8 @@ Run taker operations:
 # Or manually
 docker run --rm -it \
   -v openswap-taker-data:/home/openswap/.openswap \
-  --network openswap-network \
-  openswap:latest taker --help
+  --network host \
+  openswap/openswap:latest taker --help
 ```
 
 ## Docker Compose Setup
@@ -205,7 +207,9 @@ The setup script uses a standard `docker-compose.yml` with environment variables
 # Check status
 ./docker-setup status
 
-# View logs
+# View maker logs with the bundled Tor
+./docker-setup logs makerd-internal
+# View maker logs with your own Tor
 ./docker-setup logs makerd
 ```
 
@@ -222,11 +226,13 @@ All application data is stored in Docker volumes:
 ### Check logs
 
 ```bash
-# using setup script
+# using setup script, with the bundled Tor
+./docker-setup logs makerd-internal
+# using setup script, with your own Tor
 ./docker-setup logs makerd
 
 # or directly with docker-compose (requires env vars)
-docker compose logs -f makerd
+docker compose logs -f makerd-internal   # or makerd with your own Tor
 ```
 
 ### Interactive debugging
@@ -236,5 +242,5 @@ docker compose logs -f makerd
 ./docker-setup shell
 
 # or manually
-docker run --rm -it openswap:latest sh
+docker run --rm -it openswap/openswap:latest sh
 ```
