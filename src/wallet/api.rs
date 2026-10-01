@@ -73,7 +73,7 @@ pub(crate) const ADDRESS_IMPORT_COUNT: u32 = 20;
 /// funding (see [`Wallet::get_next_internal_addresses`]) must be bridged by
 /// scanning alone; a run of unused indices longer than the gap would otherwise
 /// end discovery early and strand funds past it. Only costs restore-time
-/// queries — regular syncs stay at [`ADDRESS_IMPORT_COUNT`].
+/// queries — syncs after the first completed scan stay at [`ADDRESS_IMPORT_COUNT`].
 pub(crate) const RESTORE_ADDRESS_GAP: u32 = 100;
 /// Hard caps on the rolling-gap sync loop: a server inventing UTXOs at ever
 /// higher indices must not keep the loop or the watch window growing forever.
@@ -113,8 +113,8 @@ pub struct Wallet {
     /// Wallet-side set of outpoints excluded from coin selection.
     pub(crate) locked_utxos: HashSet<OutPoint>,
     /// Transient (never persisted): widens the gap-limit window to
-    /// [`RESTORE_ADDRESS_GAP`] while the restore sync runs. Set only by
-    /// [`Wallet::restore`].
+    /// [`RESTORE_ADDRESS_GAP`] during restore or when reopening a wallet whose
+    /// first scan never saved a height.
     pub(crate) restore_scan: bool,
 }
 
@@ -581,6 +581,9 @@ impl Wallet {
             store.incoming_swapcoins.len(),
             store.outgoing_swapcoins.len()
         );
+        // The first restore writes the encrypted file before its scan. A file
+        // without a saved tip must finish that scan before it is usable.
+        let restore_scan = store.last_synced_height.is_none();
         let mut wallet = Self {
             blockchain,
             wallet_file_path: path.to_path_buf(),
@@ -588,7 +591,7 @@ impl Wallet {
             store_enc_material,
             new_mnemonic: None,
             locked_utxos: HashSet::new(),
-            restore_scan: false,
+            restore_scan,
         };
         wallet.seal_master_key()?;
         Ok(wallet)
@@ -605,7 +608,11 @@ impl Wallet {
     ) -> Result<Wallet, WalletError> {
         let wallet = if path.exists() {
             // wallet already exists, load the wallet
-            let wallet = Wallet::load(path, blockchain, password)?;
+            let mut wallet = Wallet::load(path, blockchain, password)?;
+            if wallet.restore_scan {
+                log::warn!("Wallet at {path:?} has an unfinished first scan; resuming it");
+                wallet.sync_and_save(&crate::utill::NO_SHUTDOWN)?;
+            }
             log::info!("Wallet file at {path:?} successfully loaded.");
             wallet
         } else {
@@ -4129,6 +4136,7 @@ impl Wallet {
         log::info!("Sync Started for {:?}", self.store.file_name);
         self.sync_no_fail(shutdown)?;
         self.save_to_disk()?;
+        self.restore_scan = false;
         log::info!("Synced & Saved {:?}", self.store.file_name);
         Ok(())
     }
@@ -4222,7 +4230,7 @@ impl Wallet {
 
         let mut descriptors_to_import = self.descriptors_to_import()?;
 
-        if descriptors_to_import.is_empty() {
+        if descriptors_to_import.is_empty() && !self.restore_scan {
             // Nothing new to import, but the chain may have moved: refresh state.
             Self::check_shutdown(shutdown)?;
             self.update_utxo_cache(self.get_all_utxo_from_blockchain()?)?;
@@ -4250,6 +4258,16 @@ impl Wallet {
         }
 
         log::info!("Re-scanning Blockchain from:{last_synced_height} to:{node_synced}");
+        // A resumed restore may have imported its full descriptor range before
+        // the process died. Recheck those already-imported scripts from the
+        // birthday instead of mistaking an empty import list for a full scan.
+        if self.restore_scan && descriptors_to_import.is_empty() {
+            Self::check_shutdown(shutdown)?;
+            self.blockchain.rescan_wallet_from(last_synced_height)?;
+            // The rescan can reveal a UTXO near the old range boundary, so
+            // import the newly required range before testing for convergence.
+            descriptors_to_import = self.descriptors_to_import()?;
+        }
 
         let Header { time, .. } = self.blockchain.header_at_height(last_synced_height)?;
 
@@ -4257,7 +4275,9 @@ impl Wallet {
         // widened range is scanned over the same blocks on later passes.
         self.sync_with_rolling_gap_limit(shutdown, |w| {
             Self::check_shutdown(shutdown)?;
-            w.import_descriptors(&descriptors_to_import, Some(time), None)?;
+            if !descriptors_to_import.is_empty() {
+                w.import_descriptors(&descriptors_to_import, Some(time), None)?;
+            }
 
             // Returns when the scanning is completed.
             loop {
@@ -4823,6 +4843,7 @@ mod restore_history_probe_tests {
                                     json!([])
                                 }
                             }
+                            "blockchain.scripthash.listunspent" => json!([]),
                             _ => json!(Value::Null),
                         };
                         let resp = json!({"jsonrpc": "2.0", "id": id, "result": result});
@@ -4908,6 +4929,49 @@ mod restore_history_probe_tests {
         // Without the restore flag the probe is off and the empty UTXO set decides.
         wallet.restore_scan = false;
         assert_eq!(wallet.find_hd_next_index(external).unwrap(), 0);
+    }
+
+    #[test]
+    fn interrupted_restore_finishes_before_wallet_is_loaded() {
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("restore-probe-test");
+        let script = derive_child_script(
+            &account_for(AddressType::P2TR),
+            AddressType::P2TR,
+            KeychainKind::External,
+            60,
+        )
+        .unwrap();
+        let url = start_stub(StdHashSet::from([scripthash_hex(&script)]));
+        let password = "restore-test-password".to_string();
+        let material = KeyMaterial::new_from_password(Some(password.clone())).unwrap();
+        let master = Xpriv::new_master(bitcoin::Network::Regtest, &MASTER_SEED).unwrap();
+        // This is the on-disk state after restore created the file but before
+        // its first scan saved a height.
+        WalletStore::init(
+            path.file_name().unwrap().to_str().unwrap().to_string(),
+            &path,
+            bitcoin::Network::Regtest,
+            master,
+            None,
+            &material,
+        )
+        .unwrap();
+
+        let backend = AnyBlockchain::Electrum(
+            Electrum::new(&crate::wallet::ElectrumConfig {
+                url,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let wallet = Wallet::load_or_init(&path, backend, Some(password.clone())).unwrap();
+        assert_eq!(wallet.store.external_index, 61);
+        assert!(!wallet.restore_scan);
+
+        let (saved, _) = WalletStore::read_from_disk(&path, Some(password)).unwrap();
+        assert_eq!(saved.external_index, 61);
+        assert!(saved.last_synced_height.is_some());
     }
 
     /// Proves a stopped sync returns before making its first backend request.

@@ -499,6 +499,11 @@ impl Blockchain for CoreRPC {
         Ok(())
     }
 
+    fn rescan_wallet_from(&self, height: u64) -> Result<(), WalletError> {
+        let _: Value = self.rpc.call("rescanblockchain", &[json!(height)])?;
+        Ok(())
+    }
+
     fn wallet_scanning_status(&self) -> Result<Option<ScanningDetails>, WalletError> {
         #[derive(Deserialize)]
         struct WalletInfoScanningOnly {

@@ -173,7 +173,6 @@ impl Wallet {
         };
         tmp_wallet.seal_master_key()?;
         tmp_wallet.sync_and_save(&crate::utill::NO_SHUTDOWN)?;
-        tmp_wallet.restore_scan = false;
 
         Ok(tmp_wallet)
     }

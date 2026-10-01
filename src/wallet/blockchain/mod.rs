@@ -289,6 +289,10 @@ pub trait Blockchain: Send + Sync + 'static {
     fn import_descriptors(&self, _requests: &[Value]) -> Result<(), WalletError> {
         Ok(())
     }
+    /// Rescan already-imported descriptors after an interrupted restore.
+    fn rescan_wallet_from(&self, _height: u64) -> Result<(), WalletError> {
+        Err(unsupported("rescan_wallet_from"))
+    }
     /// Current rescan status (`getwalletinfo.scanning`); `None` when not scanning.
     /// Defaults to `None` (Electrum never rescans).
     fn wallet_scanning_status(&self) -> Result<Option<ScanningDetails>, WalletError> {
@@ -614,6 +618,12 @@ impl Blockchain for AnyBlockchain {
         match self {
             AnyBlockchain::CoreRPC(b) => b.import_descriptors(requests),
             AnyBlockchain::Electrum(b) => b.import_descriptors(requests),
+        }
+    }
+    fn rescan_wallet_from(&self, height: u64) -> Result<(), WalletError> {
+        match self {
+            AnyBlockchain::CoreRPC(b) => b.rescan_wallet_from(height),
+            AnyBlockchain::Electrum(b) => b.rescan_wallet_from(height),
         }
     }
     fn wallet_scanning_status(&self) -> Result<Option<ScanningDetails>, WalletError> {
