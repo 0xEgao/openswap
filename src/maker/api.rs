@@ -28,16 +28,16 @@ use crate::{
     },
     taker::api::{REFUND_LOCKTIME_BASE, REFUND_LOCKTIME_STEP},
     utill::{
-        funding_fee_policy_sats, get_maker_dir, parse_field, parse_toml, sweep_fee_policy_sats,
-        MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
+        fee_at_rate_sats, funding_fee_policy_sats, get_maker_dir, parse_field, parse_toml,
+        sweep_fee_policy_sats, MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
     },
     wallet::{
         funding::{net_policy_fees, SplitPlan},
         min_contract_value_sats,
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
-        AddressType, AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig, FidelityError,
-        RecoveryOutcome, Wallet, WalletError, MAX_FIDELITY_TIMELOCK, MIN_FIDELITY_BOND_AMOUNT_SATS,
-        MIN_FIDELITY_TIMELOCK,
+        AddressType, AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig, FeePriority,
+        FidelityError, RecoveryOutcome, Wallet, WalletError, MAX_FIDELITY_TIMELOCK,
+        MIN_FIDELITY_BOND_AMOUNT_SATS, MIN_FIDELITY_TIMELOCK,
     },
     watch_tower::service::WatchService,
 };
@@ -749,12 +749,6 @@ pub struct MakerServer {
 #[cfg(feature = "lightning")]
 const LN_OFFER_TTL: Duration = Duration::from_secs(15);
 
-/// Confirmation target for a Lightning HTLC funding, in blocks. Comfortably
-/// inside the budget the swap-out hold-window check assumes, so the promise
-/// that check makes is one the funding can keep.
-#[cfg(feature = "lightning")]
-const FUNDING_CONF_TARGET: u16 = 6;
-
 /// Idle swap data returned by [`MakerServer::drain_idle_swaps`].
 pub struct IdleSwapData {
     /// Unique swap identifier.
@@ -1235,9 +1229,43 @@ impl MakerServer {
                         } = e
                         {
                             log::warn!("Insufficient funds to create fidelity bond.");
-                            let needed = required - available;
+                            // Bond change must also fund the first swap and stay at our minimum
+                            // swap size, or the liquidity check right after keeps us off the market.
+                            let (op_return_len, swap_feerate) = {
+                                let wallet = lock_debug!(self.wallet.read())
+                                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+                                let op_return = wallet
+                                    .encode_fidelity_op_return(maker_address, locktime)
+                                    .map_err(MakerError::Wallet)?;
+                                let rate = match wallet
+                                    .blockchain
+                                    .estimate_feerate(FeePriority::Urgent)
+                                {
+                                    Ok(rate) if rate.is_finite() => rate.max(MIN_RELAY_FEE_RATE),
+                                    other => {
+                                        log::error!("Fee estimation for urgent priority failed, using the relay floor: {other:?}");
+                                        MIN_RELAY_FEE_RATE
+                                    }
+                                };
+                                (op_return.len() as u64, rate)
+                            };
+                            // Coin selection priced only the bond output and coins we hold. The tx
+                            // also carries the OP_RETURN, P2TR change and the deposit as a P2TR input.
+                            let unpriced_vsize = ((11 + op_return_len + 43) * 4 + 230).div_ceil(4);
+                            let needed =
+                                fee_at_rate_sats(unpriced_vsize, self.config.fidelity_feerate)
+                                    .zip(funding_fee_policy_sats(1, 1, swap_feerate))
+                                    .and_then(|(bond_fee, swap_fee)| {
+                                        (required - available)
+                                            .checked_add(bond_fee)?
+                                            .checked_add(swap_fee)?
+                                            .checked_add(min_swap_amount(&self.config))
+                                    })
+                                    .ok_or(MakerError::General(
+                                        "Fee settings cannot price the fidelity funding amount",
+                                    ))?;
                             log::info!(
-                                "Send at least {:.8} BTC to {:?}",
+                                "Send at least {:.8} BTC to {:?} (fidelity bond + fees + minimum swap liquidity) to be visible in the market",
                                 Amount::from_sat(needed).to_btc(),
                                 addr
                             );
@@ -3358,11 +3386,11 @@ impl MakerTrait for MakerServer {
         // confirms late moves the CSV refund past the Lightning deadline.
         let feerate = {
             use crate::wallet::Blockchain;
-            match wallet.blockchain.estimate_feerate(FUNDING_CONF_TARGET) {
+            match wallet.blockchain.estimate_feerate(FeePriority::High) {
                 Ok(rate) if rate.is_finite() => rate.max(MIN_RELAY_FEE_RATE),
                 other => {
                     log::warn!(
-                        "lightning: no feerate estimate for {FUNDING_CONF_TARGET} blocks \
+                        "lightning: no feerate estimate for high priority \
                          ({other:?}); funding at the relay floor"
                     );
                     MIN_RELAY_FEE_RATE

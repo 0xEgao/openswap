@@ -719,7 +719,7 @@ impl Wallet {
         })
     }
 
-    fn encode_fidelity_op_return(
+    pub(crate) fn encode_fidelity_op_return(
         &self,
         onion: &str,
         locktime: LockTime,
