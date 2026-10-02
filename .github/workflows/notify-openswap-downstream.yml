@@ -25,10 +25,8 @@ jobs:
         include:
           - downstream: openswap-ffi
             repository: citadel-foss/openswap-ffi
-          - downstream: maker-dashboard
-            repository: citadel-foss/maker-dashboard
-          - downstream: taker-app
-            repository: citadel-foss/taker-app
+          - downstream: portal
+            repository: citadel-foss/portal
     steps:
       - name: Dispatch compatibility check
         env:
