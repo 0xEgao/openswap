@@ -4,7 +4,7 @@ use std::{
 };
 
 use bip39::rand;
-use bitcoin::{Address, Amount};
+use bitcoin::{absolute::LockTime, Address, Amount};
 use bitcoind::{
     bitcoincore_rpc::{self, Auth},
     BitcoinD,
@@ -16,7 +16,10 @@ use openswap::wallet::{
     Wallet, WalletBackup,
 };
 
-use openswap::security::{load_sensitive_struct, KeyMaterial, SecurityError, SerdeCbor, SerdeJson};
+use openswap::{
+    security::{load_sensitive_struct, KeyMaterial, SecurityError, SerdeCbor, SerdeJson},
+    utill::MIN_RELAY_FEE_RATE,
+};
 
 use super::test_framework::{
     generate_blocks, init_bitcoind, init_electrsd, send_to_address, wait_for_electrs_tip,
@@ -80,6 +83,21 @@ fn send_and_mine(
     Ok(())
 }
 
+/// Locks a bond the way a maker does, OP_RETURN included. A backup holds only
+/// the seed, so the restore must find this bond on-chain.
+fn create_maker_bond(wallet: &mut Wallet, blocks: u32) {
+    let (tip, _) = wallet.chain_tip().unwrap();
+    wallet
+        .create_fidelity(
+            Amount::from_btc(0.02).unwrap(),
+            LockTime::from_height(tip as u32 + blocks).unwrap(),
+            Some("127.0.0.1:6102"),
+            MIN_RELAY_FEE_RATE,
+            AddressType::P2TR,
+        )
+        .unwrap();
+}
+
 /// Asserts the wallet file on disk is genuinely encrypted with the given
 /// passphrase: it must be an encrypted container, reject a wrong password,
 /// and open with the correct one. (The missing-password `PasswordRequired`
@@ -129,6 +147,17 @@ fn encwallet_encbackup_encrestore() {
 
     let _ = wallet.backup(&wallet_backup_file, km.clone());
 
+    // Bond 0 expires at once and is redeemed, so the restore must see it spent.
+    wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
+    create_maker_bond(&mut wallet, 1);
+    generate_blocks(&bitcoind, 2);
+    wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
+    create_maker_bond(&mut wallet, 950);
+    wallet
+        .redeem_fidelity(0, MIN_RELAY_FEE_RATE, AddressType::P2TR)
+        .unwrap();
+    generate_blocks(&bitcoind, 1);
+
     let addr = wallet.get_next_external_address(AddressType::P2TR).unwrap();
     send_and_mine(&mut bitcoind, &addr, 0.05, 1).unwrap();
 
@@ -152,6 +181,12 @@ fn encwallet_encbackup_encrestore() {
         wallet == restored_wallet, // only compares .store!
         "restored wallet does not match the original"
     );
+    let spent: Vec<bool> = restored_wallet
+        .get_fidelity_bonds()
+        .iter()
+        .map(|b| b.is_spent())
+        .collect();
+    assert_eq!(spent, [true, false]);
 
     // The restore must have written an *encrypted* wallet file, keyed by the
     // restore passphrase.
@@ -238,6 +273,18 @@ fn encwallet_encbackup_encrestore_electrum() {
 
     wallet.backup(&s.backup_file, km.clone()).unwrap();
 
+    // Bond 0 expires at once and is redeemed, so the restore must see it spent.
+    wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
+    create_maker_bond(&mut wallet, 1);
+    generate_blocks(&s.bitcoind, 2);
+    wait_for_electrs_tip(&s.bitcoind, &s.electrsd, &s.electrum_cfg);
+    wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
+    create_maker_bond(&mut wallet, 950);
+    wallet
+        .redeem_fidelity(0, MIN_RELAY_FEE_RATE, AddressType::P2TR)
+        .unwrap();
+    generate_blocks(&s.bitcoind, 1);
+
     let addr = wallet.get_next_external_address(AddressType::P2TR).unwrap();
     send_and_mine(&mut s.bitcoind, &addr, 0.05, 1).unwrap();
     wait_for_electrs_tip(&s.bitcoind, &s.electrsd, &s.electrum_cfg);
@@ -259,6 +306,12 @@ fn encwallet_encbackup_encrestore_electrum() {
     .unwrap();
 
     assert_eq!(wallet, restored_wallet);
+    let spent: Vec<bool> = restored_wallet
+        .get_fidelity_bonds()
+        .iter()
+        .map(|b| b.is_spent())
+        .collect();
+    assert_eq!(spent, [true, false]);
 
     // The restore must have written an *encrypted* wallet file, keyed by the
     // restore passphrase.
