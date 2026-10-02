@@ -3844,6 +3844,45 @@ pub(crate) fn wait_for_tx_confirmation(
     shutdown: Option<&std::sync::atomic::AtomicBool>,
     abort_check: Option<&dyn Fn() -> bool>,
 ) -> Result<u32, WalletError> {
+    wait_for_tx_confirmation_with_deadline(
+        blockchain,
+        txids,
+        required_confirms,
+        arrival_timeout,
+        Some(TX_CONFIRMATION_TIMEOUT),
+        shutdown,
+        abort_check,
+    )
+}
+
+/// Waits as long as a maker's fidelity bond remains visible but unconfirmed.
+/// Mempool arrival and eviction checks still catch a transaction that cannot
+/// make progress; shutdown remains interruptible.
+pub(crate) fn wait_for_fidelity_bond_confirmation(
+    blockchain: &AnyBlockchain,
+    txid: Txid,
+    shutdown: &std::sync::atomic::AtomicBool,
+) -> Result<u32, WalletError> {
+    wait_for_tx_confirmation_with_deadline(
+        blockchain,
+        &[txid],
+        1,
+        TX_BROADCAST_TIMEOUT,
+        None,
+        Some(shutdown),
+        None,
+    )
+}
+
+fn wait_for_tx_confirmation_with_deadline(
+    blockchain: &AnyBlockchain,
+    txids: &[Txid],
+    required_confirms: u32,
+    arrival_timeout: Duration,
+    confirmation_timeout: Option<Duration>,
+    shutdown: Option<&std::sync::atomic::AtomicBool>,
+    abort_check: Option<&dyn Fn() -> bool>,
+) -> Result<u32, WalletError> {
     if required_confirms == 0 || txids.is_empty() {
         return Ok(0);
     }
@@ -3867,11 +3906,8 @@ pub(crate) fn wait_for_tx_confirmation(
         if abort_check.is_some_and(|f| f()) {
             return Err(WalletError::Interrupted("Abort requested"));
         }
-        if started.elapsed() > TX_CONFIRMATION_TIMEOUT {
-            log::error!(
-                "Tx(s) did not confirm within {}s",
-                TX_CONFIRMATION_TIMEOUT.as_secs()
-            );
+        if let Some(timeout) = confirmation_timeout.filter(|timeout| started.elapsed() > *timeout) {
+            log::error!("Tx(s) did not confirm within {}s", timeout.as_secs());
             return Err(WalletError::TxConfirmationTimeout(
                 "Tx did not confirm before the confirmation deadline".to_string(),
             ));

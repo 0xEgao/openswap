@@ -1057,13 +1057,10 @@ impl MakerServer {
                 .blockchain
                 .new_connection()
                 .map_err(MakerError::Wallet)?;
-            let conf_height = match crate::wallet::wait_for_tx_confirmation(
+            let conf_height = match crate::wallet::wait_for_fidelity_bond_confirmation(
                 &chain,
-                &[txid],
-                1,
-                crate::utill::TX_BROADCAST_TIMEOUT,
-                Some(&self.shutdown),
-                None,
+                txid,
+                &self.shutdown,
             ) {
                 Ok(height) => height,
                 // The bond tx may never confirm (e.g. evicted again at a low
@@ -1290,10 +1287,17 @@ impl MakerServer {
                             self.config.network_port,
                             txid
                         );
-                        let conf_height = lock_debug!(self.wallet.read())
+                        let chain = lock_debug!(self.wallet.read())
                             .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                            .wait_for_tx_confirmation(&[txid], 1, Some(&self.shutdown), None)
+                            .blockchain
+                            .new_connection()
                             .map_err(MakerError::Wallet)?;
+                        let conf_height = crate::wallet::wait_for_fidelity_bond_confirmation(
+                            &chain,
+                            txid,
+                            &self.shutdown,
+                        )
+                        .map_err(MakerError::Wallet)?;
 
                         // Re-acquire write lock briefly to finalize
                         lock_debug!(self.wallet.write())
