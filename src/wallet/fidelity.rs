@@ -5,7 +5,7 @@ use crate::{
     watch_tower::utils::{extract_op_return_data, parse_fidelity_op_return},
 };
 use bitcoin::{
-    absolute::LockTime,
+    absolute::{Height, LockTime, Time},
     bip32::{ChildNumber, DerivationPath},
     consensus::encode::{serialize, VarInt},
     hashes::{sha256d, Hash},
@@ -18,6 +18,7 @@ use bitcoind::bitcoincore_rpc::json::GetTransactionResultDetailCategory;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
+    convert::TryFrom,
     str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -356,6 +357,40 @@ impl FidelityBond {
 
         sha256d::Hash::hash(&btc_signed_msg)
     }
+
+    /// Ensure this bond's funding transaction is visible to the network,
+    /// returning its txid.
+    ///
+    /// If the original broadcast is still in the mempool or already confirmed,
+    /// its txid is returned unchanged. Otherwise the transaction was evicted
+    /// (e.g. while the maker was offline) and waiting for it would never
+    /// succeed: the raw transaction stored at creation is rebroadcast, which
+    /// reproduces the same txid, so the bond keeps its original outpoint and
+    /// no replacement spending different coins can double-lock funds.
+    pub fn ensure_broadcast(&self, chain: &impl Blockchain) -> Result<Txid, WalletError> {
+        // Only a proven "unknown transaction" answer means eviction; any
+        // other backend failure surfaces as an error instead of triggering
+        // a spurious rebroadcast.
+        if !chain.is_tx_unknown(&self.outpoint.txid)? {
+            return Ok(self.outpoint.txid);
+        }
+
+        log::warn!(
+            "Fidelity bond tx {} is not visible to the backend (evicted from mempool?); rebroadcasting",
+            self.outpoint.txid
+        );
+
+        let tx = self
+            .tx
+            .as_ref()
+            .ok_or(FidelityError::BondTransactionMissing {
+                index: self.bond_index,
+            })?;
+        // The stored tx is this bond's, so its txid is known: the backend's
+        // answer is never trusted to name what we wait on.
+        chain.send_raw_transaction(tx)?;
+        Ok(self.outpoint.txid)
+    }
 }
 
 // Wallet APIs related to fidelity bonds.
@@ -401,6 +436,27 @@ impl Wallet {
             .collect::<Result<Vec<serde_json::Value>, _>>()?;
 
         serde_json::to_string_pretty(&serialized).map_err(|e| WalletError::General(e.to_string()))
+    }
+
+    /// Whether a confirmed, unspent bond is still locked at the tip. Read from
+    /// the bond records, so a failed valuation never reads as no live bond.
+    pub(crate) fn has_live_fidelity_bond(&self) -> Result<bool, WalletError> {
+        let mut confirmed = self
+            .store
+            .fidelity_bond
+            .iter()
+            .filter(|bond| !bond.is_spent && bond.conf_height.is_some())
+            .peekable();
+        if confirmed.peek().is_none() {
+            return Ok(false);
+        }
+        let (tip_height, tip_time) = self.chain_tip()?;
+        let out_of_range = |what| WalletError::General(format!("tip {what} is out of range"));
+        let height =
+            Height::from_consensus(u32::try_from(tip_height).map_err(|_| out_of_range("height"))?)?;
+        let time =
+            Time::from_consensus(u32::try_from(tip_time).map_err(|_| out_of_range("time"))?)?;
+        Ok(confirmed.any(|bond| !bond.lock_time.is_satisfied_by(height, time)))
     }
 
     /// Get the highest value fidelity bond. Returns None, if no bond exists.
@@ -590,44 +646,6 @@ impl Wallet {
         }
 
         Ok((index, txid))
-    }
-
-    /// Ensure the funding transaction of the bond at `index` is visible to the
-    /// network, returning its txid.
-    ///
-    /// If the original broadcast is still in the mempool or already confirmed,
-    /// its txid is returned unchanged. Otherwise the transaction was evicted
-    /// (e.g. while the maker was offline) and waiting for it would never
-    /// succeed: the raw transaction stored at creation is rebroadcast, which
-    /// reproduces the same txid, so the bond keeps its original outpoint and
-    /// no replacement spending different coins can double-lock funds.
-    pub fn ensure_fidelity_bond_broadcast(&self, index: u32) -> Result<Txid, WalletError> {
-        let bond = self
-            .store
-            .fidelity_bond
-            .get(index as usize)
-            .ok_or(FidelityError::BondDoesNotExist)?;
-
-        // Only a proven "unknown transaction" answer means eviction; any
-        // other backend failure surfaces as an error instead of triggering
-        // a spurious rebroadcast.
-        if !self.blockchain.is_tx_unknown(&bond.outpoint.txid)? {
-            return Ok(bond.outpoint.txid);
-        }
-
-        log::warn!(
-            "Fidelity bond tx {} is not visible to the backend (evicted from mempool?); rebroadcasting",
-            bond.outpoint.txid
-        );
-
-        let tx = bond
-            .tx
-            .as_ref()
-            .ok_or(FidelityError::BondTransactionMissing { index })?;
-        let txid = self.send_tx(tx)?;
-        debug_assert_eq!(txid, bond.outpoint.txid);
-
-        Ok(txid)
     }
 
     /// Update the confirmation height of a fidelity bond after it confirms.

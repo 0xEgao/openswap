@@ -243,23 +243,14 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
         .then(|| maker.get_tor_hostname())
         .transpose()?;
 
+    maker.release_orphan_reservations()?;
+
     // Before the fidelity and liquidity waits, not after: both loop until the
     // wallet has funds, and a maker whose coins are locked in a Lightning
     // HTLC needs the watchdog to refund them before it can ever satisfy
     // those waits. Recovery must not depend on being ready for new swaps.
     #[cfg(feature = "lightning")]
     spawn_lightning_threads(&maker)?;
-
-    if let Some(maker_address) = maker_address.as_ref() {
-        log::info!(
-            "[{}] Setting up fidelity bond...",
-            maker.config.network_port
-        );
-        maker.setup_fidelity_bond(maker_address)?;
-        spawn_nostr_broadcast_thread(&maker)?;
-        log::info!("[{}] Checking swap liquidity...", maker.config.network_port);
-        maker.check_swap_liquidity()?;
-    }
 
     // A crash between a finish's wallet save and its tracker save leaves a
     // recovering record with no coins behind. Close it as the finish would have.
@@ -356,6 +347,19 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
                 maker.thread_pool.add_thread(handle)?;
             }
         }
+    }
+
+    // Only after recovery has started: the bond wait has no deadline, and
+    // contracts left from a previous run must not wait on it.
+    if let Some(maker_address) = maker_address.as_ref() {
+        log::info!(
+            "[{}] Setting up fidelity bond...",
+            maker.config.network_port
+        );
+        maker.setup_fidelity_bond(maker_address)?;
+        spawn_nostr_broadcast_thread(&maker)?;
+        log::info!("[{}] Checking swap liquidity...", maker.config.network_port);
+        maker.check_swap_liquidity()?;
     }
 
     {
@@ -1573,24 +1577,16 @@ fn recover_from_swap(
             // it yet, both read as "no broadcast". Funding already in flight is
             // committed money, so age the record before believing that. Age is
             // measured from creation: recovery progress refreshes `updated_at`,
-            // which would hold the grace open forever.
-            //
-            // Legacy never reaches this discard: its outgoing swapcoins are
-            // persisted only with the contract-sig response, which carries the
-            // funding txs fully signed — so the peer may hold and broadcast
-            // them even when we never did. Only Taproot, which broadcasts
-            // before responding, can prove never-exposed here.
-            let legacy_exposed = outgoing_swapcoins
-                .first()
-                .is_some_and(|sc| sc.protocol == ProtocolVersion::Legacy);
+            // which would hold the grace open forever. Legacy hands its funding
+            // txs out unsigned, so only we can broadcast them, as with Taproot.
             let unrecorded_for = lock_debug!(maker.swap_tracker.lock())
                 .map_err(|_| MakerError::MutexPossion)?
                 .get_record(&swap_id)
                 .filter(|r| r.funding_broadcast_txids.is_empty())
                 .map(|r| now_secs().saturating_sub(r.created_at));
-            let never_recorded = !legacy_exposed
-                && unrecorded_for.is_some_and(|age| age >= UNBROADCAST_DISCARD_GRACE.as_secs());
-            discard_pending = !legacy_exposed && unrecorded_for.is_some() && !never_recorded;
+            let never_recorded =
+                unrecorded_for.is_some_and(|age| age >= UNBROADCAST_DISCARD_GRACE.as_secs());
+            discard_pending = unrecorded_for.is_some() && !never_recorded;
             if let Some(age) = unrecorded_for.filter(|_| discard_pending) {
                 if !discard_deferred_logged {
                     discard_deferred_logged = true;
@@ -1883,6 +1879,8 @@ fn recover_from_swap(
                         let key = outgoing.contract_tx.compute_txid().to_string();
                         wallet.remove_outgoing_swapcoin(&key);
                     }
+                    // A partly broadcast batch still holds its unsent inputs.
+                    wallet.release_swap_locks(&swap_id, None);
                     wallet.save_to_disk().map_err(MakerError::Wallet)?;
                 }
                 // An incoming the sender took back is a loss, not a recovery.
@@ -1913,19 +1911,15 @@ fn recover_from_swap(
 
             let chain = chain.as_ref().expect("connection created for this branch");
 
-            let legacy_funding_shared = outgoing_swapcoins
-                .first()
-                .is_some_and(|sc| sc.protocol == ProtocolVersion::Legacy);
             let swap_scope = HashSet::from([swap_id.clone()]);
             let recovered = Wallet::recover_timelocked_swapcoins(
                 &maker.wallet,
                 chain,
                 &maker.shutdown,
                 Some(&swap_scope),
-                // Legacy funding rides the contract-sig response, so the peer
-                // may hold it even when we never broadcast. The pass is scoped
-                // to one swap, so every coin gets the same answer.
-                &|_| legacy_funding_shared,
+                // Our funding txs leave us unsigned, so no peer can broadcast
+                // them for us.
+                &|_| false,
             )
             // Nothing respawns this thread: a failed wait retries on the next pass.
             .unwrap_or_else(|e| {
@@ -1973,6 +1967,8 @@ fn recover_from_swap(
                         let key = incoming.contract_tx.compute_txid().to_string();
                         wallet.remove_incoming_swapcoin(&key);
                     }
+                    // A partly broadcast batch still holds its unsent inputs.
+                    wallet.release_swap_locks(&swap_id, None);
                     wallet.save_to_disk().map_err(MakerError::Wallet)?;
                 }
                 finish_swap(

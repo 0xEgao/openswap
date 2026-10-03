@@ -134,9 +134,19 @@ The planner works like this:
   feerate. On top of that, it keeps enough for an output that Bitcoin
   nodes still forward. At 1 sat/vB the floor is 485 sats for taproot and
   630 sats for legacy. A higher feerate raises it.
-- Once the maker accepts a swap, it freezes the plan. It reserves the
-  chosen coins for that swap. Nothing else can spend them. Funding follows
-  the frozen plan exactly and never re-plans.
+- Once the maker accepts a swap, it freezes the plan. It does not lock any
+  coins yet. It locks the chosen coins only when it funds its hop. Another
+  swap may take one of those coins first. The maker then plans again from
+  its free coins. The new plan keeps the same number of splits and sends
+  the same total. Each new split spends at least as many coins as the old
+  one. If the maker cannot meet that, the swap fails. You still pay only
+  for the old coin count. The swap also fails if the extra coins cost the
+  maker more than the hop earns.
+- Accepting a swap locks nothing. That way, nobody can lock up a maker's
+  coins just by asking. The cost lands on you if you lose a race for the
+  maker's last coins. By then your coins already sit in your contract.
+  Your node takes them back after the contract's refund time, minus the
+  miner fees.
 
 ## What the maker checks
 
@@ -155,11 +165,17 @@ chain:
 
 - **Exact totals and counts.** The funded amount must equal the agreed
   amount to the sat. The contract count must equal the accepted plan.
+- **Coins per split.** The maker declares how many coins each split
+  spends. You pay the funding fee for that many, up to your input budget.
+  Each split must spend at least that many coins. A maker that spent fewer
+  would keep the difference.
 - **Real outputs.** Every claimed amount must match a real on-chain
   output. One funded output cannot back two contracts in the same hop.
 - **The real miner fee.** Your node fetches the maker's funding inputs and
   recomputes the fee actually paid. Your node catches a maker that charges
-  one rate and builds cheaper.
+  one rate and builds cheaper. On legacy, your node checks once the maker's
+  funding confirms. The maker shows you that funding unsigned, so only the
+  maker can broadcast it.
 
 Your node records a proven cheat in the offerbook, its local record of
 known makers. One proof bans the maker for good. Only removing the maker

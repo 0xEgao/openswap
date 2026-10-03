@@ -157,6 +157,57 @@ fn maker_abort2_case1() {
     block_generation_handle.join().unwrap();
 }
 
+/// Maker 0 has to re-plan its funding, then rebuild it for the spare's keys
+/// after maker 1 drops. The rebuild must reuse the coins the re-plan claimed,
+/// not the frozen plan's, or the substitution fails.
+#[test]
+fn rebuild_after_replan_uses_the_claimed_coins() {
+    warn!("Running Test: a rebuild after a re-plan uses the claimed coins");
+
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(
+            3,
+            vec![TakerBehavior::Normal],
+            vec![
+                MakerBehavior::ForceReplan,
+                MakerBehavior::CloseAtReqContractSigsForSender,
+                MakerBehavior::Normal,
+            ],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
+    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+
+    let summary = taker
+        .prepare_swap(
+            SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 2)
+                .with_tx_count(1)
+                .with_required_confirms(1),
+        )
+        .expect("prepare swap");
+    taker
+        .start_swap(&summary.swap_id)
+        .expect("the rebuild must reuse the re-planned coins");
+
+    let contents = fs::read_to_string(test_framework.taker_log_path()).unwrap();
+    assert_eq!(
+        contents.matches("Re-planned funding for swap").count(),
+        1,
+        "only the first pass re-plans; the rebuild reuses its claim"
+    );
+    assert!(
+        contents.contains("Substituting maker 1 with spare"),
+        "maker 0 must rebuild its funding for the spare"
+    );
+    assert_eq!(makers[0].reserved_inputs().unwrap(), 0);
+
+    shutdown_makers(&makers, maker_threads);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
 /// The setup all three heterogeneous-route tests share: funded makers with
 /// per-maker fee overrides and a prepared 2-hop Legacy route.
 #[allow(clippy::type_complexity)]
@@ -290,7 +341,7 @@ fn heterogeneous_substitution_aborts_without_cascade() {
 
     // Baseline: hop 1 admitted these exact terms; a replay is still accepted.
     let downstream_details = taker
-        .current_swap_details(1)
+        .test_current_swap_details(1)
         .expect("downstream swap details should rebuild");
     match taker
         .test_resend_swap_details(1)
@@ -359,7 +410,7 @@ fn heterogeneous_substitution_aborts_without_cascade() {
 
     // Hop 1 still honors the originally admitted terms after the abort.
     match taker
-        .resend_swap_details(&summary.makers[1].address, &downstream_details)
+        .test_send_swap_details(&summary.makers[1].address, &downstream_details)
         .expect("post-abort resend should get an answer")
     {
         MakerToTakerMessage::AckSwapDetails(ack) => assert!(

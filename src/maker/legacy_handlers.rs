@@ -448,8 +448,7 @@ fn process_proof_of_funding<M: Maker>(
         .map(|info| info.next_hashlock_nonce)
         .collect();
 
-    // Executes the plan frozen at admission; its inputs are already reserved
-    // under the swap id.
+    // Executes the plan frozen at admission; its coins are claimed only now.
     let (funding_txes, mut outgoing_swapcoins, _mining_fees) = maker.initialize_swap(
         &pof.id,
         forwardable,
@@ -488,7 +487,12 @@ fn process_proof_of_funding<M: Maker>(
                 osc.contract_redeemscript.clone().unwrap_or_default()
             };
 
-        let funding_tx = funding_txes[i].clone();
+        // Hand the tx out without its signatures: a segwit txid excludes them,
+        // so the taker can check it and sign against it but never broadcast it.
+        let mut funding_tx = funding_txes[i].clone();
+        for input in &mut funding_tx.input {
+            input.witness.clear();
+        }
         #[cfg(not(feature = "integration-test"))]
         let contract_tx = osc.contract_tx.clone();
         #[cfg(feature = "integration-test")]
@@ -620,8 +624,8 @@ fn process_resp_contract_sigs_for_recvr_and_sender<M: Maker>(
         maker.network_port(),
     ) {
         // Bad sigs kill the swap: drop the persisted state and free the
-        // admission reservation, or a failing taker holds our inputs by
-        // reconnecting and repeating the request.
+        // funding claim, or a failing taker holds our coins by reconnecting
+        // and repeating the request.
         if let Err(cleanup) = maker.remove_connection_state(&resp.id) {
             log::error!(
                 "[{}] failed to drop swap {} after bad signatures: {:?}",

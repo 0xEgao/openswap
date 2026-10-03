@@ -1317,6 +1317,9 @@ impl Taker {
         if !self.watch_service.is_alive() {
             return Err(TakerError::General("watchtower is down".into()));
         }
+        // A maker drops a swap left idle since admission; learn that before
+        // funding, while failing still costs nothing.
+        self.revalidate_admissions()?;
 
         let initial_utxos = self.read_wallet()?.list_all_utxo();
 
@@ -1981,27 +1984,7 @@ impl Taker {
         };
 
         #[cfg(feature = "integration-test")]
-        let mut swap_details = swap_details;
-        #[cfg(feature = "integration-test")]
-        if let TakerBehavior::ForgeBounds(amount) = self.behavior {
-            swap_details.amount = amount;
-        }
-        #[cfg(feature = "integration-test")]
-        if let TakerBehavior::ForgeIncomingCount(count) = self.behavior {
-            swap_details.incoming_count = count;
-        }
-        #[cfg(feature = "integration-test")]
-        if let TakerBehavior::ForgeFeerate(feerate) = self.behavior {
-            swap_details.feerate = feerate;
-        }
-        #[cfg(feature = "integration-test")]
-        if let TakerBehavior::ForgeTxCount(count) = self.behavior {
-            swap_details.tx_count = count;
-        }
-        #[cfg(feature = "integration-test")]
-        if let TakerBehavior::ForgeMaxInputBudget(budget) = self.behavior {
-            swap_details.max_input_budget = budget;
-        }
+        let mut swap_details = self.forge_swap_details(swap_details);
 
         send_message(
             &mut stream,
@@ -2102,9 +2085,8 @@ impl Taker {
     }
 
     /// Send `details` to `maker_address` on a fresh connection and return the
-    /// maker's raw response, accept or reject. Test hook for replaying admission.
-    #[cfg(feature = "integration-test")]
-    pub fn resend_swap_details(
+    /// maker's raw response, accept or reject.
+    pub(crate) fn resend_swap_details(
         &self,
         maker_address: &str,
         details: &SwapDetails,
@@ -2135,14 +2117,13 @@ impl Taker {
         Ok(serde_cbor::from_slice(&read_message(&mut stream)?)?)
     }
 
-    /// Rebuild the SwapDetails this swap negotiated with `maker_idx`, so test
-    /// hooks can resend them the way a reconnecting client would.
-    #[cfg(feature = "integration-test")]
-    pub fn current_swap_details(&self, maker_idx: usize) -> Result<SwapDetails, TakerError> {
+    /// Rebuild the SwapDetails this swap negotiated with `maker_idx`, so they can
+    /// be resent the way a reconnecting client would.
+    pub(crate) fn current_swap_details(&self, maker_idx: usize) -> Result<SwapDetails, TakerError> {
         let swap = self.swap_state()?;
         let refund_locktime_offset = REFUND_LOCKTIME_BASE
             + REFUND_LOCKTIME_STEP * (swap.makers.len() - maker_idx - 1) as u16;
-        Ok(SwapDetails {
+        let details = SwapDetails {
             id: swap.id.clone(),
             protocol_version: swap.params.protocol,
             amount: swap.makers[maker_idx].amount,
@@ -2152,7 +2133,62 @@ impl Taker {
             feerate: swap.params.swap_feerate() as u64,
             timelock: swap.makers[maker_idx].negotiated_timelock,
             refund_locktime_offset,
-        })
+        };
+        #[cfg(feature = "integration-test")]
+        let details = self.forge_swap_details(details);
+        Ok(details)
+    }
+
+    /// Apply the declaration-forging test hooks, so a resend repeats exactly
+    /// what admission sent.
+    #[cfg(feature = "integration-test")]
+    fn forge_swap_details(&self, mut details: SwapDetails) -> SwapDetails {
+        match self.behavior {
+            TakerBehavior::ForgeBounds(amount) => details.amount = amount,
+            TakerBehavior::ForgeIncomingCount(count) => details.incoming_count = count,
+            TakerBehavior::ForgeFeerate(feerate) => details.feerate = feerate,
+            TakerBehavior::ForgeTxCount(count) => details.tx_count = count,
+            TakerBehavior::ForgeMaxInputBudget(budget) => details.max_input_budget = budget,
+            _ => {}
+        }
+        details
+    }
+
+    /// Resend every hop's SwapDetails and require the same accepted plan shape.
+    /// A maker that dropped or re-planned the swap fails it here, before funding.
+    fn revalidate_admissions(&self) -> Result<(), TakerError> {
+        for maker_idx in 0..self.swap_state()?.makers.len() {
+            let details = self.current_swap_details(maker_idx)?;
+            let maker = &self.swap_state()?.makers[maker_idx];
+            match self.resend_swap_details(&maker.address.to_string(), &details)? {
+                MakerToTakerMessage::AckSwapDetails(ack)
+                    if ack.tweakable_point.is_some()
+                        && ack.tweakable_point == maker.tweakable_point
+                        && ack.funding_splits == maker.funding_splits => {}
+                _ => {
+                    return Err(TakerError::General(format!(
+                        "Maker {maker_idx} no longer holds this swap's plan; prepare a new swap"
+                    )))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Test hook: the SwapDetails this swap negotiated with `maker_idx`.
+    #[cfg(feature = "integration-test")]
+    pub fn test_current_swap_details(&self, maker_idx: usize) -> Result<SwapDetails, TakerError> {
+        self.current_swap_details(maker_idx)
+    }
+
+    /// Test hook: send `details` to `maker_address` and return the raw answer.
+    #[cfg(feature = "integration-test")]
+    pub fn test_send_swap_details(
+        &self,
+        maker_address: &str,
+        details: &SwapDetails,
+    ) -> Result<MakerToTakerMessage, TakerError> {
+        self.resend_swap_details(maker_address, details)
     }
 
     /// Resend the negotiated SwapDetails to `maker_idx` on a fresh connection
@@ -2169,7 +2205,7 @@ impl Taker {
 
     /// Send a bare `WaitingFundingConfirmation` keepalive for `swap_id` on a
     /// fresh connection, the way the route heartbeat does. Test hook for the
-    /// keepalive/lifetime tests; the maker answers with silence either way, so
+    /// keepalive tests; the maker answers with silence either way, so
     /// acceptance vs refusal is observable in its log only.
     #[cfg(feature = "integration-test")]
     pub fn test_send_keepalive(
@@ -3743,6 +3779,9 @@ pub enum TakerBehavior {
     /// Normal behavior.
     #[default]
     Normal,
+    /// Try to broadcast the funding txs a Legacy maker hands out with its
+    /// contract-sig request, then stop: the handout must not be broadcastable.
+    BroadcastHandedOutFunding,
     /// Stop the watcher immediately before the taker's funding gate.
     StopWatcherBeforeSwap,
     /// Stop the watcher after Legacy breach sentinels are armed.

@@ -20,6 +20,23 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// This swap's recovery must wait out the grace before discarding its
+/// never-broadcast funding. Lines are matched by swap id, since one log file
+/// can hold several swaps.
+fn assert_grace_then_discard(log_path: &str, swap_id: &str) {
+    let log = std::fs::read_to_string(log_path).unwrap();
+    let waited = log
+        .find(&format!("Swap {swap_id} shows no funding broadcast after"))
+        .expect("the maker must wait on the grace for this swap");
+    let dropped = log
+        .find(&format!("Funding was never broadcast for swap {swap_id}"))
+        .expect("the maker must discard this swap's never-broadcast funding");
+    assert!(
+        waited < dropped,
+        "the maker must wait out the grace before dropping the swapcoins"
+    );
+}
+
 /// Test: Timelock-only recovery when last maker skips funding broadcast.
 ///
 /// Route: Taker → Maker1 → Maker2 → Taker
@@ -103,10 +120,9 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
     taker.log_tracker_state();
 
-    // Maker2 planned a funding it never sent, but the taker already holds it
-    // fully signed: exposure came with the contract-sig request, one message
-    // before the skip. Recovery must keep the swapcoins — discarding them
-    // would strand the funds if the taker ever broadcasts.
+    // Maker2 planned a funding it never sent, and handed it out unsigned, so
+    // only it could broadcast. Its swapcoins must still be there: only the
+    // grace may release them, never the failure itself.
     let victim_held = makers[1]
         .wallet
         .read()
@@ -139,28 +155,22 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     info!("Waiting for makers to timeout and blocks to mature timelocks...");
     thread::sleep(Duration::from_secs(300));
 
-    // Exposed funding is never discarded: no grace wait, no drop. The taker's
-    // timelock recovery still resolves the on-chain side (checked below).
-    let log_path = test_framework.taker_log_path();
-    let log = std::fs::read_to_string(&log_path).unwrap();
-    assert!(
-        !log.contains("nothing to recover. Discarding swapcoins."),
-        "an exposed funding must never read as never-broadcast"
-    );
+    // Recovery waits out the grace before dropping the never-broadcast
+    // funding, then releases the swapcoins, exactly as for Taproot.
+    assert_grace_then_discard(&test_framework.taker_log_path(), &summary.swap_id);
     makers[1]
         .wallet
         .write()
         .unwrap()
         .sync_and_save(&openswap::utill::NO_SHUTDOWN)
         .unwrap();
-    let victim_outgoing = makers[1]
-        .wallet
-        .read()
-        .unwrap()
-        .get_outgoing_swapcoins_count();
+    let victim_after = {
+        let wallet = makers[1].wallet.read().unwrap();
+        wallet.get_outgoing_swapcoins_count() + wallet.get_incoming_swapcoins_count()
+    };
     assert_eq!(
-        victim_outgoing, 3,
-        "Maker2 must keep the swapcoins for its exposed funding"
+        victim_after, 0,
+        "Maker2 must release its swapcoins once the grace has run out"
     );
 
     // Verify maker balances after recovery
@@ -423,37 +433,17 @@ fn run_taproot_timelock_only_recovery<B: TestBackend>() {
     // Maker2 left its broadcast unrecorded, so recovery must wait out the
     // grace before dropping the swapcoins rather than trusting one backend
     // answer. Both lines must appear, in that order.
-    let log_path = test_framework.taker_log_path();
-    test_framework.assert_log("shows no funding broadcast after", &log_path);
-    test_framework.assert_log("nothing to recover. Discarding swapcoins.", &log_path);
-
-    // Order matters: the wait has to come before the drop, or the grace did
-    // nothing. And once it expires the swapcoins really are released.
-    let log = std::fs::read_to_string(&log_path).unwrap();
-    let waited = log.find("shows no funding broadcast after").unwrap();
-    let dropped = log
-        .find("nothing to recover. Discarding swapcoins.")
-        .unwrap();
-    assert!(
-        waited < dropped,
-        "the maker must wait out the grace before dropping the swapcoins"
-    );
+    assert_grace_then_discard(&test_framework.taker_log_path(), &summary.swap_id);
     makers[1]
         .wallet
         .write()
         .unwrap()
         .sync_and_save(&openswap::utill::NO_SHUTDOWN)
         .unwrap();
-    let victim_after = makers[1]
-        .wallet
-        .read()
-        .unwrap()
-        .get_outgoing_swapcoins_count()
-        + makers[1]
-            .wallet
-            .read()
-            .unwrap()
-            .get_incoming_swapcoins_count();
+    let victim_after = {
+        let wallet = makers[1].wallet.read().unwrap();
+        wallet.get_outgoing_swapcoins_count() + wallet.get_incoming_swapcoins_count()
+    };
     assert_eq!(
         victim_after, 0,
         "Maker2 must release its swapcoins once the grace has run out"
