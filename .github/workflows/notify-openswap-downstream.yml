@@ -27,6 +27,8 @@ jobs:
             repository: citadel-foss/openswap-ffi
           - downstream: portal
             repository: citadel-foss/portal
+          - downstream: btcpay-plugin
+            repository: citadel-foss/btcpay-plugin
     steps:
       - name: Dispatch compatibility check
         env:
