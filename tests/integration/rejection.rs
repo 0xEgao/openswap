@@ -1851,6 +1851,10 @@ fn run_maker_partial_broadcast<B: TestBackend>(protocol: ProtocolVersion, expect
         thread::sleep(Duration::from_secs(2));
     }
 
+    // Finished recovery stops the maker, and its exit rearms the wallet backend.
+    // Join without sending another stop, which would cancel our sync again.
+    maker_threads.into_iter().for_each(|t| t.join().unwrap());
+
     generate_blocks(bitcoind, 1);
     test_framework.wait_for_electrs_tip();
     let maker = &makers[0];
@@ -1874,9 +1878,6 @@ fn run_maker_partial_broadcast<B: TestBackend>(protocol: ProtocolVersion, expect
         "maker spendable after reclaiming the on-chain split"
     );
 
-    // The recovery loop keeps polling until shutdown; the maker does not exit
-    // on its own in this scenario.
-    shutdown_makers(&makers, maker_threads);
     test_framework.finish(takers, block_generation_handle);
 }
 
