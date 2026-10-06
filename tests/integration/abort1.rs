@@ -158,12 +158,12 @@ fn taker_abort_1_legacy_corerpc() {
 
     assert_eq!(
         taker_balances.regular.to_sat(),
-        14499538,
+        14500000,
         "Taker regular balance mismatch"
     );
     assert_eq!(
         taker_balances.swap.to_sat(),
-        495997,
+        495502,
         "Taker swap balance mismatch"
     );
     assert_eq!(
@@ -186,7 +186,7 @@ fn taker_abort_1_legacy_corerpc() {
 
     assert_eq!(
         balance_diff.to_sat(),
-        4465,
+        4498,
         "Taker spendable balance change mismatch"
     );
 
@@ -210,8 +210,8 @@ fn taker_abort_1_legacy_corerpc() {
             maker_balances.spendable,
         );
 
-        let expected_regular = [14500865u64, 14502398][i];
-        let expected_swap = [499100u64, 497530][i];
+        let expected_regular = [14501360u64, 14502893][i];
+        let expected_swap = [498605u64, 497035][i];
         assert_eq!(
             maker_balances.regular.to_sat(),
             expected_regular,

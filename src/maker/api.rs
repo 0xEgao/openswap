@@ -86,6 +86,7 @@ fn replan_funding(
             None,
             None,
             terms.protocol,
+            0,
         )
         .map_err(|e| match e {
             WalletError::InsufficientFund { .. } => out_of_coins(),
@@ -1740,6 +1741,7 @@ impl MakerServer {
                     None,
                     None,
                     state.protocol,
+                    0,
                 )
                 .map_err(|e| {
                     log::warn!(
@@ -3556,6 +3558,7 @@ impl MakerTrait for MakerServer {
                 // A Lightning HTLC is a script-path P2WSH contract, so it is
                 // priced like the Legacy protocol's, not Taproot's.
                 ProtocolVersion::Legacy,
+                0,
             )
             .map_err(MakerError::Wallet)?;
         // Claim the selected inputs under this swap before executing, so a

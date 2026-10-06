@@ -110,9 +110,14 @@ Two contracts: **224 sats**.
 
 **What you receive:** 500,000 − 523 − 330 − 224 = **498,923 sats**.
 
-The hop costs 1,077 sats in total, about 0.22%. You also pay the miner fee
-for your own funding transaction on top. Raising the feerate raises the two
-miner fees in step. The service fee stays the same.
+The hop costs 1,077 sats in total, about 0.22%. Raising the feerate raises
+the two miner fees in step. The service fee stays the same.
+
+Your own funding transactions follow the same price. Their miner fee comes
+out of the amount you swap, at 97 + 68 virtual bytes per input for each
+transaction, so your wallet spends exactly that amount and the first maker
+receives it less the fee. PaySwap is the exception: there the fee is paid
+on top of the route amount.
 
 ## Funding splits
 

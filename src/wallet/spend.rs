@@ -31,6 +31,17 @@ pub enum Destination {
         /// Address type for change output (defaults to P2WPKH if None)
         change_address_type: AddressType,
     },
+    /// Spend exactly `spend` of the inputs: `outputs` are paid, the miner gets
+    /// `spend` less the outputs, and the rest of the inputs returns as change.
+    /// The fee must still meet the feerate on the tx's real size.
+    ExactSpend {
+        /// List of outputs (address, amounts)
+        outputs: Vec<(Address, Amount)>,
+        /// What leaves the wallet: the outputs plus the miner fee.
+        spend: Amount,
+        /// Address type for the change output
+        change_address_type: AddressType,
+    },
 }
 
 impl Wallet {
@@ -274,6 +285,7 @@ impl Wallet {
             )));
         }
 
+        let exact_spend = matches!(destination, Destination::ExactSpend { .. });
         match destination {
             Destination::Sweep(addr) => {
                 // Send Max Amount case
@@ -387,6 +399,53 @@ impl Wallet {
                     );
                 }
             }
+            Destination::ExactSpend {
+                outputs,
+                spend,
+                change_address_type,
+            } => {
+                let mut total_output_value = Amount::ZERO;
+                for (address, amount) in outputs {
+                    total_output_value =
+                        total_output_value.checked_add(amount).ok_or_else(|| {
+                            WalletError::General("output amount overflow".to_string())
+                        })?;
+                    tx.output.push(TxOut {
+                        script_pubkey: address.script_pubkey(),
+                        value: amount,
+                    });
+                }
+                if total_output_value > spend {
+                    return Err(WalletError::General(format!(
+                        "outputs of {} sats exceed the exact spend of {} sats",
+                        total_output_value.to_sat(),
+                        spend.to_sat()
+                    )));
+                }
+                let change =
+                    total_input_value
+                        .checked_sub(spend)
+                        .ok_or(WalletError::InsufficientFund {
+                            available: total_input_value.to_sat(),
+                            required: spend.to_sat(),
+                        })?;
+                // Dust change cannot be dropped to the miner without spending
+                // more than `spend`, so the caller must plan around it.
+                if change > Amount::ZERO {
+                    let internal_spk = self.get_next_internal_addresses(1, change_address_type)?[0]
+                        .script_pubkey();
+                    if change < internal_spk.minimal_non_dust() {
+                        return Err(WalletError::General(format!(
+                            "exact spend leaves {} sats of change, below the dust limit",
+                            change.to_sat()
+                        )));
+                    }
+                    tx.output.push(TxOut {
+                        script_pubkey: internal_spk,
+                        value: change,
+                    });
+                }
+            }
         }
 
         self.sign_transaction(&mut tx, coins.iter().map(|(_, usi)| usi.clone()))?;
@@ -409,6 +468,22 @@ impl Wallet {
             actual_fee.to_sat(),
             actual_feerate
         );
+
+        // An exact spend fixes the fee up front, so a fee model below the
+        // real size would underpay; refuse it rather than broadcast it.
+        if exact_spend {
+            let required = fee_at_rate_sats(tx_size, feerate).ok_or_else(|| {
+                WalletError::General(format!(
+                    "fee at {feerate} sat/vB overflows for a {tx_size} vB transaction"
+                ))
+            })?;
+            if actual_fee.to_sat() < required {
+                return Err(WalletError::General(format!(
+                    "exact spend pays {} sats, below the {required} sats a {tx_size} vB tx needs at {feerate} sat/vB",
+                    actual_fee.to_sat()
+                )));
+            }
+        }
 
         if actual_feerate < feerate as f32 {
             log::warn!(
