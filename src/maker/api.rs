@@ -32,6 +32,7 @@ use crate::{
         sweep_fee_policy_sats, MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
     },
     wallet::{
+        blockchain::BackendConnector,
         funding::{fit_declared_shape, net_policy_fees, SplitPlan},
         min_contract_value_sats,
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
@@ -723,6 +724,8 @@ pub struct MakerServer {
     pub config: MakerServerConfig,
     /// Wallet.
     pub wallet: Arc<RwLock<Wallet>>,
+    /// Opens backend connections without taking the wallet lock.
+    pub(crate) backend: BackendConnector,
     /// Shutdown flag.
     pub shutdown: ShutdownSignal,
     /// Is setup complete flag.
@@ -822,6 +825,7 @@ impl MakerServer {
         let blockchain =
             AnyBlockchain::from_config_with_shutdown(&config.backend, backend_shutdown.clone())
                 .map_err(MakerError::Wallet)?;
+        let backend = BackendConnector::new(config.backend.clone(), backend_shutdown.clone());
         // Misconfiguration (no txindex, dead ZMQ) must fail here, not mid-swap.
         if let AnyBlockchain::CoreRPC(core) = &blockchain {
             core.check_node_requirements().map_err(MakerError::Wallet)?;
@@ -936,6 +940,7 @@ impl MakerServer {
         Ok(MakerServer {
             config: config.clone(),
             wallet: Arc::new(RwLock::new(wallet)),
+            backend,
             shutdown,
             is_setup_complete: AtomicBool::new(false),
             highest_fidelity_proof: RwLock::new(None),
@@ -1030,15 +1035,12 @@ impl MakerServer {
         !self.is_shutdown()
     }
 
-    /// A backend connection of its own for a bond wait, built from config so
-    /// no connect or poll holds the wallet guard. A failed connect is retried
+    /// A backend connection of its own for a bond wait, so no connect or poll
+    /// holds the wallet guard. A failed connect is retried
     /// like a failed poll.
     fn bond_chain(&self) -> Result<AnyBlockchain, MakerError> {
         loop {
-            match AnyBlockchain::from_config_with_shutdown(
-                &self.config.backend,
-                self.shutdown.backend_flag(),
-            ) {
+            match self.backend.connect() {
                 Ok(chain) => return Ok(chain),
                 Err(e) => log::warn!(
                     "[{}] Could not connect to the backend for the bond wait: {:?}",
@@ -2320,11 +2322,7 @@ impl MakerTrait for MakerServer {
             required_confirms,
             txids.len()
         );
-        let chain = lock_debug!(self.wallet.read())
-            .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .blockchain
-            .new_connection()
-            .map_err(MakerError::Wallet)?;
+        let chain = self.backend.connect().map_err(MakerError::Wallet)?;
         // The wait can outlast the idle-drain timeout, so the per-poll hook
         // refreshes this swap's stored activity: a live handler never drains.
         // If the swap is gone anyway, the wait stops.
@@ -2526,11 +2524,7 @@ impl MakerTrait for MakerServer {
     }
 
     fn get_raw_transaction(&self, txid: &bitcoin::Txid) -> Result<Transaction, MakerError> {
-        let chain = lock_debug!(self.wallet.read())
-            .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .blockchain
-            .new_connection()
-            .map_err(MakerError::Wallet)?;
+        let chain = self.backend.connect().map_err(MakerError::Wallet)?;
         let transaction = chain
             .get_raw_transaction(txid, None)
             .map_err(MakerError::Wallet)?;
@@ -2557,11 +2551,7 @@ impl MakerTrait for MakerServer {
 
         // Sweep all completed incoming swapcoins. The sweep takes the lock itself and
         // drops it across its waits, so a stuck tx cannot wedge the wallet.
-        let chain = lock_debug!(self.wallet.read())
-            .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .blockchain
-            .new_connection()
-            .map_err(MakerError::Wallet)?;
+        let chain = self.backend.connect().map_err(MakerError::Wallet)?;
         let contract_txids = incoming_swapcoins
             .iter()
             .map(|swapcoin| swapcoin.contract_tx.compute_txid())
@@ -3514,11 +3504,7 @@ impl MakerTrait for MakerServer {
         required_confirms: u32,
     ) -> Result<(), MakerError> {
         // Its own connection, so the wait does not pin the wallet lock.
-        let chain = lock_debug!(self.wallet.read())
-            .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .blockchain
-            .new_connection()
-            .map_err(MakerError::Wallet)?;
+        let chain = self.backend.connect().map_err(MakerError::Wallet)?;
         crate::wallet::wait_for_tx_confirmation(
             &chain,
             &[*txid],

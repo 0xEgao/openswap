@@ -372,6 +372,31 @@ pub enum AnyBlockchain {
     Electrum(Electrum),
 }
 
+/// Opens fresh connections to a role's backend without touching its wallet.
+///
+/// Connecting can wait through timeouts and retries (minutes over Tor), so it
+/// must never run under the wallet lock. Holds the exact config and shutdown
+/// flag the wallet's own backend was built from.
+#[derive(Clone)]
+pub(crate) struct BackendConnector {
+    config: BackendConfig,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl BackendConnector {
+    pub(crate) fn new(
+        config: BackendConfig,
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self { config, shutdown }
+    }
+
+    /// Open a fresh, independent connection.
+    pub(crate) fn connect(&self) -> Result<AnyBlockchain, WalletError> {
+        AnyBlockchain::from_config_with_shutdown(&self.config, self.shutdown.clone())
+    }
+}
+
 impl AnyBlockchain {
     /// Build the active backend from the resolved [`BackendConfig`]. Each
     /// consumer (wallet, watchtower watcher, discovery) builds its own instance.
@@ -392,19 +417,6 @@ impl AnyBlockchain {
             BackendConfig::Electrum(cfg) => Ok(AnyBlockchain::Electrum(
                 Electrum::with_shutdown_flag(cfg, shutdown)?,
             )),
-        }
-    }
-
-    /// Open a fresh, independent connection to the same backend.
-    ///
-    /// Lets a second consumer (e.g. the watchtower discovery thread) get its own
-    /// live connection by rebuilding from the backend's own stored config, so
-    /// neither the wallet nor the watchtower has to keep a separate
-    /// [`BackendConfig`] around.
-    pub fn new_connection(&self) -> Result<Self, WalletError> {
-        match self {
-            AnyBlockchain::CoreRPC(b) => Ok(AnyBlockchain::CoreRPC(b.reconnect()?)),
-            AnyBlockchain::Electrum(b) => Ok(AnyBlockchain::Electrum(b.reconnect()?)),
         }
     }
 

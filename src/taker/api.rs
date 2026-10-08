@@ -43,6 +43,7 @@ use crate::{
         sweep_fee_policy_sats, MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
     },
     wallet::{
+        blockchain::BackendConnector,
         funding::CreateFundingTxesResult,
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
         AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig,
@@ -526,6 +527,8 @@ pub struct Taker {
     pub(crate) config: TakerInitConfig,
     /// Wallet for managing funds.
     pub(crate) wallet: Arc<RwLock<Wallet>>,
+    /// Opens backend connections without taking the wallet lock.
+    pub(crate) backend: BackendConnector,
     /// Stops the role and every backend connection it owns.
     shutdown: Arc<AtomicBool>,
     /// Offer book for managing maker offers.
@@ -729,6 +732,7 @@ impl Taker {
         let mut taker = Taker {
             config,
             wallet: Arc::new(RwLock::new(wallet)),
+            backend: BackendConnector::new(backend, shutdown.clone()),
             shutdown,
             offerbook,
             watch_service,
@@ -786,14 +790,12 @@ impl Taker {
 
         // Recovery takes the wallet lock itself and drops it across its wait,
         // so a stuck counterparty tx cannot wedge taker startup.
-        let chain = match self.read_wallet().ok().filter(|_| scope.is_some()) {
-            Some(w) => match w.blockchain.new_connection() {
-                Ok(chain) => Some(chain),
-                Err(e) => {
-                    log::warn!("Startup recovery: no backend connection: {:?}", e);
-                    None
-                }
-            },
+        let chain = match scope.is_some().then(|| self.backend.connect()) {
+            Some(Ok(chain)) => Some(chain),
+            Some(Err(e)) => {
+                log::warn!("Startup recovery: no backend connection: {:?}", e);
+                None
+            }
             None => None,
         };
 
@@ -845,6 +847,7 @@ impl Taker {
         };
         match RecoveryLoop::start(
             self.wallet.clone(),
+            self.backend.clone(),
             self.swap_tracker.clone(),
             self.watch_service.clone(),
             data_dir,
@@ -1337,7 +1340,7 @@ impl Taker {
         // mid-swap — key-path needs both keys, the hashlock needs the
         // taker's preimage, timelocks are immature — so no detector starts.
         if self.swap_state()?.params.protocol == ProtocolVersion::Legacy {
-            let backend = self.read_wallet()?.blockchain.new_connection()?;
+            let backend = self.backend.connect()?;
             self.breach_detector = Some(super::background_services::BreachDetector::start(
                 self.watch_service.clone(),
                 backend,
@@ -1540,9 +1543,7 @@ impl Taker {
             .map(|swapcoin| swapcoin.contract_tx.compute_txid())
             .collect();
         let expected_incoming_swapcoins = incoming_contract_txids.len();
-        // Hoist connection creation so the read guard drops before sweep
-        // takes the write lock on the same wallet.
-        let chain = self.read_wallet()?.blockchain.new_connection()?;
+        let chain = self.backend.connect()?;
         let swept = Wallet::sweep_incoming_swapcoins(
             &self.wallet,
             &chain,
@@ -3499,6 +3500,7 @@ impl Taker {
             .unwrap_or_else(get_taker_dir)?;
         self.recovery_loop = Some(RecoveryLoop::start(
             self.wallet.clone(),
+            self.backend.clone(),
             self.swap_tracker.clone(),
             self.watch_service.clone(),
             data_dir,
