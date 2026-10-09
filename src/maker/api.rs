@@ -1036,8 +1036,7 @@ impl MakerServer {
     }
 
     /// A backend connection of its own for a bond wait, so no connect or poll
-    /// holds the wallet guard. A failed connect is retried
-    /// like a failed poll.
+    /// holds the wallet guard. A failed connect is retried like a failed poll.
     fn bond_chain(&self) -> Result<AnyBlockchain, MakerError> {
         loop {
             match self.backend.connect() {

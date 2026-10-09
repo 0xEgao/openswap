@@ -23,7 +23,10 @@ mod electrum;
 pub use corerpc::{CoreRPC, CoreRpcConfig};
 pub use electrum::{Electrum, ElectrumConfig, WATCHER_READ_TIMEOUT_DIRECT_SECS};
 
-use std::fmt::Debug;
+use std::{
+    fmt::Debug,
+    sync::{atomic::AtomicBool, Arc},
+};
 
 use bitcoin::{
     address::NetworkUnchecked, block::Header, Address, Block, BlockHash, OutPoint, Script,
@@ -372,22 +375,16 @@ pub enum AnyBlockchain {
     Electrum(Electrum),
 }
 
-/// Opens fresh connections to a role's backend without touching its wallet.
-///
-/// Connecting can wait through timeouts and retries (minutes over Tor), so it
-/// must never run under the wallet lock. Holds the exact config and shutdown
-/// flag the wallet's own backend was built from.
+/// Opens backend connections outside the wallet lock: a connect can retry for minutes.
+/// Holds the config and shutdown flag the wallet's own backend was built from.
 #[derive(Clone)]
 pub(crate) struct BackendConnector {
     config: BackendConfig,
-    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl BackendConnector {
-    pub(crate) fn new(
-        config: BackendConfig,
-        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> Self {
+    pub(crate) fn new(config: BackendConfig, shutdown: Arc<AtomicBool>) -> Self {
         Self { config, shutdown }
     }
 
@@ -417,6 +414,17 @@ impl AnyBlockchain {
             BackendConfig::Electrum(cfg) => Ok(AnyBlockchain::Electrum(
                 Electrum::with_shutdown_flag(cfg, shutdown)?,
             )),
+        }
+    }
+
+    /// Open a fresh, independent connection to the same backend.
+    #[deprecated(
+        note = "don't call this through a wallet guard: connecting can retry for minutes. call `AnyBlockchain::from_config` outside the wallet guard; it starts its own shutdown flag, so the owner's shutdown won't stop its retries"
+    )]
+    pub fn new_connection(&self) -> Result<Self, WalletError> {
+        match self {
+            AnyBlockchain::CoreRPC(b) => Ok(AnyBlockchain::CoreRPC(b.reconnect()?)),
+            AnyBlockchain::Electrum(b) => Ok(AnyBlockchain::Electrum(b.reconnect()?)),
         }
     }
 

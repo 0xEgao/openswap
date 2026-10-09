@@ -711,16 +711,15 @@ impl Taker {
 
         Self::init_taker_config(&config, &data_dir)?;
 
+        let connector = BackendConnector::new(backend, shutdown.clone());
+
         // Init OfferBook Sync
         let offerbook = OfferBookHandle::load_or_create(&data_dir)?;
         let offer_sync_handle = Self::init_offer_sync(
             &offerbook,
             registry,
             config.socks_port,
-            Arc::new(AnyBlockchain::from_config_with_shutdown(
-                &backend,
-                shutdown.clone(),
-            )?),
+            Arc::new(connector.connect()?),
             initial_sync_complete,
             shutdown.clone(),
         )?;
@@ -732,7 +731,7 @@ impl Taker {
         let mut taker = Taker {
             config,
             wallet: Arc::new(RwLock::new(wallet)),
-            backend: BackendConnector::new(backend, shutdown.clone()),
+            backend: connector,
             shutdown,
             offerbook,
             watch_service,
@@ -790,14 +789,13 @@ impl Taker {
 
         // Recovery takes the wallet lock itself and drops it across its wait,
         // so a stuck counterparty tx cannot wedge taker startup.
-        let chain = match scope.is_some().then(|| self.backend.connect()) {
-            Some(Ok(chain)) => Some(chain),
-            Some(Err(e)) => {
-                log::warn!("Startup recovery: no backend connection: {:?}", e);
-                None
-            }
-            None => None,
-        };
+        let chain = scope
+            .is_some()
+            .then(|| self.backend.connect())
+            .and_then(|r| {
+                r.inspect_err(|e| log::warn!("Startup recovery: no backend connection: {:?}", e))
+                    .ok()
+            });
 
         if let (Some(chain), Some((swap_ids, incoming_contract_txids))) = (&chain, scope) {
             match Wallet::recover_swapcoins(
