@@ -501,7 +501,6 @@ impl Taker {
                 None,
                 None,
                 crate::protocol::ProtocolVersion::Legacy,
-                0,
             )?;
             let result = wallet.execute_funding_plan(&plan, &[address], MIN_RELAY_FEE_RATE)?;
             let tx = result

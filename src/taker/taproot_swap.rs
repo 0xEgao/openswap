@@ -789,7 +789,8 @@ impl Taker {
 
             log::info!("Broadcast contract tx: {}", txid);
             // Its inputs are spent now, but the coin cache only learns that
-            // at the next sync; until then a new swap must not plan them.
+            // at the next sync; until then a new swap must not plan them. The
+            // lock is in memory only: once synced the coins are gone anyway.
             wallet.lock_utxos(&spent_inputs(&swapcoin.contract_tx));
 
             let vout = swapcoin

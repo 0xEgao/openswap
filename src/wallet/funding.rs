@@ -16,7 +16,7 @@ use crate::{
 
 use super::Wallet;
 
-use super::{error::WalletError, AddressType};
+use super::{error::WalletError, spend::SpendTarget, AddressType};
 
 #[derive(Debug)]
 pub struct CreateFundingTxesResult {
@@ -36,8 +36,8 @@ pub struct SplitPlan {
 /// `max_splits` down to 1 and taking the first that fits. Each split takes the
 /// fewest UTXOs, ties broken toward the smallest total so later splits keep
 /// coins they can combine. Each split's UTXOs cover its value plus the fee, or
-/// plus `min_change` where that is more. Empty only when the pool cannot cover
-/// the spend.
+/// with `exact_change`, plus that change margin alone: an exact spend already
+/// pays its fee from the value. Empty only when the pool cannot cover the spend.
 pub(crate) fn plan_funding_splits(
     pool_utxos: &[(OutPoint, Amount)],
     total: Amount,
@@ -45,7 +45,7 @@ pub(crate) fn plan_funding_splits(
     max_input_budget: u32,
     fee_rate: f64,
     min_split: u64,
-    min_change: u64,
+    exact_change: Option<u64>,
 ) -> Vec<SplitPlan> {
     let mut sorted = pool_utxos.to_vec();
     // Ties broken by outpoint so equal-value UTXOs plan identically every time.
@@ -59,7 +59,7 @@ pub(crate) fn plan_funding_splits(
             max_input_budget,
             fee_rate,
             min_split,
-            min_change,
+            exact_change,
         ) {
             return plan;
         }
@@ -74,7 +74,7 @@ fn plan_with_k(
     max_input_budget: u32,
     fee_rate: f64,
     min_split: u64,
-    min_change: u64,
+    exact_change: Option<u64>,
 ) -> Option<Vec<SplitPlan>> {
     // This also floors every split: `(total - assigned) / splits_left` stays at
     // or above `min_split` for the whole loop, so no per-split check runs.
@@ -90,11 +90,14 @@ fn plan_with_k(
         let target = (total - assigned) / u64::from(splits_left);
 
         // What the split's UTXOs must cover: value + the real fee, which the
-        // wallet pays on top regardless of any reimbursement policy, or
-        // `min_change` where that is more.
+        // wallet pays on top regardless of any reimbursement policy. An exact
+        // spend pays the fee from the value, so it needs only the change margin.
         let need = |inputs: usize| -> Option<u64> {
-            fee_at_rate_sats(funding_tx_vsize(inputs), fee_rate)
-                .and_then(|fee| target.checked_add(fee.max(min_change)))
+            match exact_change {
+                Some(change) => target.checked_add(change),
+                None => fee_at_rate_sats(funding_tx_vsize(inputs), fee_rate)
+                    .and_then(|fee| target.checked_add(fee)),
+            }
         };
 
         // Fewest inputs first, then the smallest covering total: grabbing a
@@ -370,7 +373,7 @@ fn plan_from_pools(
     fee_rate: f64,
     swap_fee_sats: Option<u64>,
     min_split: u64,
-    min_change: u64,
+    exact_change: Option<u64>,
 ) -> Result<Vec<SplitPlan>, WalletError> {
     let sum =
         |pool: &[(OutPoint, Amount)]| pool.iter().map(|(_, amount)| amount.to_sat()).sum::<u64>();
@@ -384,7 +387,7 @@ fn plan_from_pools(
                 max_input_budget,
                 fee_rate,
                 min_split,
-                min_change,
+                exact_change,
             );
             if plan.is_empty() {
                 continue;
@@ -447,10 +450,6 @@ impl Wallet {
     ///
     /// `swap_fee_sats` is `Some` only when a maker forwards a hop: it arms the
     /// over-budget guard. The taker's own hop passes `None`.
-    ///
-    /// `min_change` is the least each split's UTXOs must leave above its
-    /// value when that exceeds the fee: an exact spend needs room for
-    /// non-dust change. Zero keeps the fee as the only margin.
     #[allow(clippy::too_many_arguments)]
     pub fn plan_funding(
         &self,
@@ -462,7 +461,35 @@ impl Wallet {
         manually_selected_outpoints: Option<Vec<OutPoint>>,
         excluded_outpoints: Option<Vec<OutPoint>>,
         protocol: ProtocolVersion,
-        min_change: u64,
+    ) -> Result<Vec<SplitPlan>, WalletError> {
+        self.plan_funding_with_change(
+            total,
+            max_splits,
+            fee_rate,
+            max_input_budget,
+            swap_fee_sats,
+            manually_selected_outpoints,
+            excluded_outpoints,
+            protocol,
+            None,
+        )
+    }
+
+    /// [`Self::plan_funding`] for an exact spend when `exact_change` is set:
+    /// each split's fee comes from its value, so its UTXOs need cover only the
+    /// value plus that margin, which leaves room for non-dust change.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan_funding_with_change(
+        &self,
+        total: Amount,
+        max_splits: u32,
+        fee_rate: f64,
+        max_input_budget: u32,
+        swap_fee_sats: Option<u64>,
+        manually_selected_outpoints: Option<Vec<OutPoint>>,
+        excluded_outpoints: Option<Vec<OutPoint>>,
+        protocol: ProtocolVersion,
+        exact_change: Option<u64>,
     ) -> Result<Vec<SplitPlan>, WalletError> {
         let min_split = min_contract_value_sats(protocol, fee_rate)
             .ok_or_else(|| WalletError::General("contract floor cannot be priced".to_string()))?;
@@ -480,9 +507,13 @@ impl Wallet {
         regular_pool.retain(|(outpoint, _)| !excluded.contains(outpoint));
         swap_pool.retain(|(outpoint, _)| !excluded.contains(outpoint));
 
+        let margin = match exact_change {
+            Some(change) => change,
+            None => funding_fee(1, fee_rate)?,
+        };
         let required = total
             .to_sat()
-            .checked_add(funding_fee(1, fee_rate)?.max(min_change))
+            .checked_add(margin)
             .ok_or_else(|| WalletError::General("funding threshold overflow".to_string()))?;
 
         let manual = manually_selected_outpoints
@@ -499,7 +530,7 @@ impl Wallet {
                 fee_rate,
                 swap_fee_sats,
                 min_split,
-                min_change,
+                exact_change,
             )?
         } else {
             let manual_set: HashSet<OutPoint> = manual.iter().copied().collect();
@@ -533,7 +564,7 @@ impl Wallet {
                 max_input_budget,
                 fee_rate,
                 min_split,
-                min_change,
+                exact_change,
             );
             if plan.is_empty() {
                 return Err(WalletError::InsufficientFund {
@@ -659,21 +690,21 @@ impl Wallet {
                 .collect::<Result<Vec<_>, _>>()?;
 
             // Create destination with output - currently, destination is an array with a single address, i.e only a single transaction.
-            let destination = match spends {
-                Some(spends) => Destination::ExactSpend {
+            let target = match spends {
+                Some(spends) => SpendTarget::ExactSpend {
                     outputs: vec![(address.clone(), split.value)],
                     spend: spends[i],
                     change_address_type: AddressType::P2TR,
                 },
-                None => Destination::Multi {
+                None => SpendTarget::Destination(Destination::Multi {
                     outputs: vec![(address.clone(), split.value)],
                     op_return_data: None,
                     change_address_type: AddressType::P2TR,
-                },
+                }),
             };
 
             // Creates and Signs Transactions via the spend_coins API
-            let funding_tx = self.spend_coins(&coins_to_spend, destination, fee_rate)?;
+            let funding_tx = self.spend_coins_to(&coins_to_spend, target, fee_rate)?;
 
             // Record this transaction in our results.
             let payment_pos = 0; // assuming the payment output position is 0
@@ -731,11 +762,24 @@ mod tests {
         // At 1 sat/vB one input costs 165: 50_200 covers the fee but leaves
         // 200 sats of change, below the 330 margin, so the larger coin funds.
         let pool = pool(&[(1, 50_200), (2, 60_000)]);
-        let plan = plan_funding_splits(&pool, Amount::from_sat(50_000), 1, 3, 1.0, FLOOR, 0);
+        let plan = plan_funding_splits(&pool, Amount::from_sat(50_000), 1, 3, 1.0, FLOOR, None);
         assert_eq!(plan[0].utxos, vec![pool[0].0]);
-        let plan = plan_funding_splits(&pool, Amount::from_sat(50_000), 1, 3, 1.0, FLOOR, 330);
+        let plan =
+            plan_funding_splits(&pool, Amount::from_sat(50_000), 1, 3, 1.0, FLOOR, Some(330));
         assert_eq!(plan[0].utxos, vec![pool[1].0]);
         assert_eq!(plan[0].value.to_sat(), 50_000);
+    }
+
+    #[test]
+    fn exact_change_needs_no_fee_margin() {
+        // At 5 sat/vB one input costs 825, more than the 400 sats this coin
+        // leaves. An exact spend pays that fee from the value, so it fits.
+        let pool = pool(&[(1, 50_400)]);
+        let plan = plan_funding_splits(&pool, Amount::from_sat(50_000), 1, 3, 5.0, FLOOR, None);
+        assert!(plan.is_empty());
+        let plan =
+            plan_funding_splits(&pool, Amount::from_sat(50_000), 1, 3, 5.0, FLOOR, Some(330));
+        assert_eq!(plan[0].utxos, vec![pool[0].0]);
     }
 
     #[test]
@@ -747,7 +791,7 @@ mod tests {
             2,
             1.0,
             FLOOR,
-            0,
+            None,
         );
         assert_eq!(plan.len(), 3);
         assert!(plan.iter().all(|split| split.utxos.len() == 1));
@@ -763,7 +807,7 @@ mod tests {
             2,
             1.0,
             FLOOR,
-            0,
+            None,
         );
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].utxos.len(), 3);
@@ -782,7 +826,7 @@ mod tests {
             2,
             1.0,
             FLOOR,
-            0,
+            None,
         );
         assert_eq!(plan.len(), 2);
         for split in &plan {
@@ -806,7 +850,7 @@ mod tests {
             3,
             1.0,
             FLOOR,
-            0,
+            None,
         );
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].utxos.len(), 3);
@@ -822,7 +866,7 @@ mod tests {
         let pool = pool(&[(1, 3_000), (2, 3_000), (3, 3_000)]);
         assert!(smallest_cover(&pool, 1, 6_065).is_none());
         assert!(smallest_cover(&pool, 2, 6_133).is_none());
-        let plan = plan_funding_splits(&pool, Amount::from_sat(5_900), 1, 3, 1.0, FLOOR, 0);
+        let plan = plan_funding_splits(&pool, Amount::from_sat(5_900), 1, 3, 1.0, FLOOR, None);
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].utxos.len(), 3);
         assert_eq!(plan[0].value.to_sat(), 5_900);
@@ -839,7 +883,7 @@ mod tests {
             2,
             1.0,
             FLOOR,
-            0,
+            None,
         );
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].utxos.len(), 6);
@@ -865,7 +909,7 @@ mod tests {
             2,
             1.0,
             FLOOR,
-            0,
+            None,
         );
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].value.to_sat(), 9_000);
@@ -880,7 +924,7 @@ mod tests {
             2,
             1.0,
             FLOOR,
-            0,
+            None,
         );
         assert!(plan.is_empty());
     }
@@ -902,7 +946,7 @@ mod tests {
             10.0,
             None,
             FLOOR,
-            0,
+            None,
         )
         .unwrap();
         assert_eq!(plan.len(), 1);
@@ -925,7 +969,7 @@ mod tests {
             10.0,
             None,
             FLOOR,
-            0,
+            None,
         )
         .unwrap();
         assert_eq!(plan[0].utxos, vec![regular[0].0]);
@@ -948,7 +992,7 @@ mod tests {
             10.0,
             None,
             FLOOR,
-            0,
+            None,
         );
         assert!(matches!(
             result,
@@ -977,7 +1021,7 @@ mod tests {
             10.0,
             Some(501),
             FLOOR,
-            0,
+            None,
         )
         .unwrap();
         assert_eq!(plan.len(), 1);
@@ -1002,7 +1046,7 @@ mod tests {
             10.0,
             Some(501),
             FLOOR,
-            0,
+            None,
         );
         assert!(matches!(
             result,
@@ -1013,8 +1057,8 @@ mod tests {
     #[test]
     fn planner_is_deterministic() {
         let pool = pool(&[(1, 60_000), (2, 50_000), (3, 40_000), (4, 90_000)]);
-        let first = plan_funding_splits(&pool, Amount::from_sat(100_000), 3, 2, 1.0, FLOOR, 0);
-        let second = plan_funding_splits(&pool, Amount::from_sat(100_000), 3, 2, 1.0, FLOOR, 0);
+        let first = plan_funding_splits(&pool, Amount::from_sat(100_000), 3, 2, 1.0, FLOOR, None);
+        let second = plan_funding_splits(&pool, Amount::from_sat(100_000), 3, 2, 1.0, FLOOR, None);
         assert_eq!(first, second);
     }
 
@@ -1030,7 +1074,7 @@ mod tests {
             2,
             1.0,
             FLOOR,
-            0,
+            None,
         );
         assert!(plan.is_empty());
     }
@@ -1046,7 +1090,7 @@ mod tests {
             2,
             1.0,
             FLOOR,
-            0,
+            None,
         );
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].utxos.len(), 1);
@@ -1064,7 +1108,7 @@ mod tests {
             2,
             1.0,
             FLOOR,
-            0,
+            None,
         );
         assert!(plan.iter().all(|split| split.value.to_sat() == 40_000));
         let priced: Vec<usize> = plan.iter().map(|split| split.utxos.len()).collect();
@@ -1085,7 +1129,7 @@ mod tests {
             2,
             1.0,
             FLOOR,
-            0,
+            None,
         );
         assert_eq!(plan.len(), 1);
         let priced: Vec<usize> = plan.iter().map(|split| split.utxos.len()).collect();
@@ -1104,7 +1148,7 @@ mod tests {
             2,
             1.0,
             FLOOR,
-            0,
+            None,
         );
         assert_eq!(plan.len(), 1);
         let priced: Vec<usize> = plan.iter().map(|split| split.utxos.len()).collect();
@@ -1257,7 +1301,7 @@ mod tests {
             1,
             10.0,
             FLOOR,
-            0,
+            None,
         );
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].utxos.len(), 6);

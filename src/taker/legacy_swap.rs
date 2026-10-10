@@ -354,7 +354,8 @@ impl Taker {
                         })?;
                         // Its inputs are spent now, but the coin cache only learns
                         // that at the next sync; until then a new swap must not
-                        // plan them.
+                        // plan them. The lock is in memory only: once synced the
+                        // coins are gone anyway.
                         wallet.lock_utxos(&spent_inputs(funding_tx));
                     }
                     wallet.save_to_disk()?;

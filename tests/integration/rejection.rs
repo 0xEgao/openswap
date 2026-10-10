@@ -134,6 +134,29 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
     );
     info!("Above-maximum request rejected by the offerbook filter");
 
+    // ---- 2b. One sat over max, but maker 0 is declared it less our funding fee ----
+    // The filter must use that declared amount, so selection succeeds and
+    // CloseEarly is what stops the swap.
+    let smallest_max = makers
+        .iter()
+        .map(|maker| maker.wallet.read().unwrap().get_balances().unwrap().regular)
+        .min()
+        .unwrap();
+    taker.behavior = TakerBehavior::CloseEarly;
+    let err = taker
+        .prepare_swap(
+            SwapParams::new(ProtocolVersion::Taproot, smallest_max + Amount::ONE_SAT, 2)
+                .with_tx_count(1)
+                .with_required_confirms(1),
+        )
+        .expect_err("CloseEarly must abort prepare_swap");
+    assert!(
+        format!("{:?}", err).contains("Closing early after maker selection"),
+        "the offerbook filter must use the declared amount, got: {:?}",
+        err
+    );
+    taker.behavior = TakerBehavior::Normal;
+
     // ---- 3. Below minimum, past the filter: our own planner refuses the contract ----
     let err = taker
         .prepare_swap(
@@ -821,6 +844,36 @@ fn maker_degrades_split_count_when_netting_breaks_the_floor() {
         .prepare_swap(params)
         .expect("admission must fall back to one split");
     test_framework.assert_log("with 1 funding split(s)", &test_framework.taker_log_path());
+
+    shutdown_makers(&makers, maker_threads);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// The taker's own hop nets its funding fees too. 1,900 sats in three splits
+/// nets to 468/468/469, under the 485 sat taproot floor; two splits net to
+/// 785/785, so the taker must re-plan with two instead of failing.
+#[test]
+fn taker_degrades_split_count_when_netting_breaks_the_floor() {
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
+    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+
+    let params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(1_900), 1)
+        .with_tx_count(3)
+        .with_required_confirms(1);
+    taker
+        .prepare_swap(params)
+        .expect("the taker must fall back to two splits");
+    test_framework.assert_log("retrying with 2 split(s)", &test_framework.taker_log_path());
 
     shutdown_makers(&makers, maker_threads);
     test_framework.stop();
