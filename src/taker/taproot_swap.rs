@@ -880,7 +880,7 @@ impl Taker {
             return Ok(());
         }
 
-        let chain = self.read_wallet()?.blockchain.new_connection()?;
+        let chain = self.backend.connect()?;
         crate::wallet::wait_for_tx_confirmation(
             &chain,
             contract_txids,

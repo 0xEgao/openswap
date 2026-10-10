@@ -25,7 +25,7 @@ use crate::{
         error::TakerError,
     },
     utill::HEART_BEAT_INTERVAL,
-    wallet::{AnyBlockchain, Blockchain, RecoveryReport, Wallet},
+    wallet::{blockchain::BackendConnector, AnyBlockchain, Blockchain, RecoveryReport, Wallet},
     watch_tower::{service::WatchService, watcher::WatcherEvent},
 };
 
@@ -59,6 +59,7 @@ impl RecoveryLoop {
     /// because its swapcoins share the same wallet.
     pub(crate) fn start(
         wallet: Arc<RwLock<Wallet>>,
+        backend: BackendConnector,
         swap_tracker: Arc<Mutex<SwapTracker>>,
         watch_service: WatchService,
         data_dir: PathBuf,
@@ -111,18 +112,12 @@ impl RecoveryLoop {
 
                     // One connection per pass, shared by both steps below:
                     // on Tor Electrum each fresh connection costs a circuit handshake.
-                    let chain = match lock_debug!(wallet.read()) {
-                        Ok(w) => match w.blockchain.new_connection() {
-                            Ok(chain) => chain,
-                            Err(e) => {
-                                log::warn!("Recovery loop: no connection: {:?}", e);
-                                // A dropped circuit is passing; retry on the next interval.
-                                last_tip = None;
-                                thread::park_timeout(RECOVERY_LOOP_INTERVAL);
-                                continue;
-                            }
-                        },
-                        Err(_) => {
+                    let chain = match backend.connect() {
+                        Ok(chain) => chain,
+                        Err(e) => {
+                            log::warn!("Recovery loop: no connection: {:?}", e);
+                            // A dropped circuit is passing; retry on the next interval.
+                            last_tip = None;
                             thread::park_timeout(RECOVERY_LOOP_INTERVAL);
                             continue;
                         }

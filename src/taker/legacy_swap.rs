@@ -770,7 +770,7 @@ impl Taker {
             // now the fee is paid and every earlier hop has funded: a shortfall
             // costs the maker a ban, never the route, since aborting here would
             // only send every funded hop into timelock recovery.
-            let chain = self.read_wallet()?.blockchain.new_connection();
+            let chain = self.backend.connect();
             let confirmed_funding = chain.and_then(|chain| {
                 maker_funding_txids
                     .iter()
@@ -985,7 +985,7 @@ impl Taker {
             return Ok(0);
         }
 
-        let chain = self.read_wallet()?.blockchain.new_connection()?;
+        let chain = self.backend.connect()?;
         crate::wallet::wait_for_tx_confirmation(
             &chain,
             funding_txids,

@@ -1059,10 +1059,7 @@ fn refresh_fidelity_conf_heights(maker: &Arc<MakerServer>) -> Result<(), MakerEr
     }
 
     // A fresh connection keeps the wallet lock off the backend round trips.
-    let chain = lock_debug!(maker.wallet.read())
-        .map_err(|_| MakerError::General("Failed to lock wallet"))?
-        .blockchain
-        .new_connection()?;
+    let chain = maker.backend.connect()?;
 
     for (index, txid, stored) in bonds {
         // No height at all means a reorg deeper than this network allows, which
@@ -1114,13 +1111,10 @@ fn check_for_preimage(
 
     let mut seen_outpoints = HashSet::new();
     let mut preimages: Vec<[u8; 32]> = Vec::new();
-    let wallet = lock_debug!(maker.wallet.read())
-        .map_err(|_| MakerError::General("Failed to lock wallet"))?;
     let direct_chain = (!maker.watch_service.is_alive())
-        .then(|| wallet.blockchain.new_connection())
+        .then(|| maker.backend.connect())
         .transpose()
         .map_err(MakerError::Wallet)?;
-    drop(wallet);
 
     // Query the watch tower for spends on each outgoing contract output.
     for outgoing in outgoing_swapcoins {
@@ -1387,11 +1381,7 @@ fn recover_from_swap(
             return Ok(false);
         }
 
-        let chain = lock_debug!(maker.wallet.read())
-            .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .blockchain
-            .new_connection()
-            .map_err(MakerError::Wallet)?;
+        let chain = maker.backend.connect().map_err(MakerError::Wallet)?;
         for outgoing in &outgoing_swapcoins {
             let (outpoint, output) = match outgoing.protocol {
                 ProtocolVersion::Legacy => {
@@ -1795,13 +1785,8 @@ fn recover_from_swap(
         // Electrum each fresh connection costs a circuit handshake. Idle passes
         // that only poll the watchtower pay for none.
         let chain = if all_preimages_known || current_height >= timelock_expiry {
-            // Nothing respawns this thread, so a failed connection retries. Bind
-            // it first: the wallet guard must not outlive the retry wait.
-            let connection = lock_debug!(maker.wallet.read())
-                .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                .blockchain
-                .new_connection();
-            match connection {
+            // Nothing respawns this thread, so a failed connection retries.
+            match maker.backend.connect() {
                 Ok(chain) => Some(chain),
                 Err(e) => {
                     log::warn!(

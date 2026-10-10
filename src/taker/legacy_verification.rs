@@ -123,7 +123,7 @@ impl Taker {
         maker_idx: usize,
     ) -> Result<(), TakerError> {
         let feerate = self.swap_state()?.params.swap_feerate();
-        let chain = self.read_wallet()?.blockchain.new_connection()?;
+        let chain = self.backend.connect()?;
         let mut prev_txs: HashMap<Txid, Transaction> = HashMap::new();
         for (i, tx) in funding_txs.iter().enumerate() {
             let mut input_sum = Amount::ZERO;

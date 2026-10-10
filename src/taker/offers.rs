@@ -1100,7 +1100,7 @@ impl OfferSyncService {
                     // Electrum's client is fully synchronous: two workers calling
                     // it at once can wedge it and hang taker shutdown forever.
                     // Each worker gets its own connection.
-                    let backend = match blockchain.new_connection() {
+                    let backend = match blockchain.new_connection_with_shutdown(shutdown.clone()) {
                         Ok(b) => b,
                         Err(e) => {
                             log::warn!(
