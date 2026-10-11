@@ -1181,11 +1181,11 @@ impl Taker {
         let send_amount = swap.params.send_amount;
         let protocol = swap.params.protocol;
         let mut maker_fees = Vec::with_capacity(maker_count);
-        // Maker 0 prices its fee on what it was declared, not on the send
-        // amount: a regular swap's hop-0 funding fee comes out of the latter.
-        let mut amount_sats = swap.makers.first().map_or(0, |maker| maker.amount.to_sat()) as f64;
 
+        // Each maker prices its fee on the amount it was declared. That is
+        // below the previous hop's net: funding and sweep fees come out too.
         for (i, mc) in swap.makers.iter().enumerate() {
+            let amount_sats = mc.amount.to_sat() as f64;
             let locktime =
                 REFUND_LOCKTIME_BASE + REFUND_LOCKTIME_STEP * (maker_count - i - 1) as u16;
 
@@ -1212,8 +1212,6 @@ impl Taker {
                 locktime,
                 estimated_fee_sats: fee_sats,
             });
-
-            amount_sats = (amount_sats - fee).max(0.0);
         }
 
         let service_fee_sats: u64 = maker_fees.iter().map(|m| m.estimated_fee_sats).sum();
@@ -3289,10 +3287,8 @@ impl Taker {
             vec![]
         };
 
-        // Per-maker fee breakdown, from maker 0's declared amount: a regular
-        // swap's hop-0 funding fee comes out of the send amount first.
+        // Per-maker fee breakdown, each priced on that maker's declared amount.
         let mut maker_fee_info = Vec::new();
-        let mut temp_target_amount = swap.makers.first().map_or(0, |maker| maker.amount.to_sat());
         let completed_hops = swap.makers.len().min(maker_count);
 
         log::info!(
@@ -3305,6 +3301,7 @@ impl Taker {
             .map(|maker_index| {
                 let maker_refund_locktime = REFUND_LOCKTIME_BASE
                     + REFUND_LOCKTIME_STEP * (maker_count - maker_index - 1) as u16;
+                let temp_target_amount = swap.makers[maker_index].amount.to_sat();
 
                 let (base_fee, amount_rel_fee, time_rel_fee) = if let Some(offer) =
                     swap.makers[maker_index].offer.as_ref()
@@ -3333,7 +3330,6 @@ impl Taker {
                     total_fee: total_maker_fee as f64,
                 });
 
-                temp_target_amount = temp_target_amount.saturating_sub(total_maker_fee);
                 total_maker_fee
             })
             .sum();
