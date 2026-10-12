@@ -134,7 +134,7 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
     );
     info!("Above-maximum request rejected by the offerbook filter");
 
-    // ---- 2b. One sat over max, but maker 0 is declared it less our funding fee ----
+    // ---- 2b. One sat over max: maker 0 is declared the send amount less our funding fee, so it is still in range ----
     // The filter must use that declared amount, so selection succeeds and
     // CloseEarly is what stops the swap.
     let smallest_max = makers

@@ -419,8 +419,8 @@ pub(crate) struct Hop0Plan {
     /// One entry per funding tx, valued at what its contract receives.
     pub(crate) splits: Vec<SplitPlan>,
     /// What each funding tx takes from the wallet: its value plus the priced
-    /// funding fee, so the splits sum to the send amount. `None` for PaySwap,
-    /// which pays the fee on top at the swap feerate.
+    /// funding fee, so the spends sum to the send amount and the splits to
+    /// less. `None` for PaySwap, which pays the fee on top at the swap feerate.
     pub(crate) spends: Option<Vec<Amount>>,
 }
 
@@ -1780,7 +1780,9 @@ impl Taker {
 
         // Plan our own hop-0 funding before the first declaration: maker 0 is
         // declared the plan's count and value, and the funding build spends
-        // this same plan.
+        // this same plan. Planned again rather than reused from discovery: a
+        // PaySwap only knows its gross amount now, and a regular plan that
+        // changed with the wallet is refused before anything is signed.
         let hop0_plan = self.plan_hop0()?;
         let planned_hop0_count = hop0_plan.splits.len() as u32;
         let declared_amount = hop0_plan.declared_amount();
