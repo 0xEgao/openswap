@@ -96,12 +96,12 @@ impl RecoveryLoop {
                     }
 
                     // The chain only moves with a block, so a pass waits for one. The
-                    // watcher hears each block; asking the server is the fallback.
+                    // watcher hears each block; asking the server is the fallback. It
+                    // uses its own connection: a slow server must not hold the wallet lock.
                     let tip = watch_service.tip().or_else(|| {
-                        lock_debug!(wallet.read())
-                            .ok()?
-                            .blockchain
-                            .get_block_count()
+                        backend
+                            .connect()
+                            .and_then(|chain| chain.get_block_count())
                             .inspect_err(|e| log::warn!("Recovery loop: block height: {:?}", e))
                             .ok()
                     });

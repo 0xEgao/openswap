@@ -1294,14 +1294,21 @@ fn recover_from_swap(
     outgoing_swapcoins: Vec<crate::wallet::swapcoin::OutgoingSwapCoin>,
 ) -> Result<(), MakerError> {
     // The watcher hears each new block, so asking the server every pass is waste.
-    let tip = || match maker.watch_service.tip() {
-        Some(height) => Ok(height as u32),
-        None => lock_debug!(maker.wallet.read())
-            .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .blockchain
-            .get_block_count()
-            .map(|height| height as u32)
-            .map_err(MakerError::Wallet),
+    // The fallback uses its own connection, kept while the watcher is down and dropped on error:
+    // a slow server must not hold the wallet lock.
+    let mut fallback: Option<AnyBlockchain> = None;
+    let mut tip = || -> Result<u32, MakerError> {
+        if let Some(height) = maker.watch_service.tip() {
+            fallback = None;
+            return Ok(height as u32);
+        }
+        let chain = match fallback.take() {
+            Some(chain) => chain,
+            None => maker.backend.connect().map_err(MakerError::Wallet)?,
+        };
+        let height = chain.get_block_count().map_err(MakerError::Wallet)?;
+        fallback = Some(chain);
+        Ok(height as u32)
     };
 
     // Timelock recovery may already have removed every outgoing coin before a
