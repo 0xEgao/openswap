@@ -783,11 +783,13 @@ fn stale_hop0_plan_fails_safely_and_a_fresh_prepare_recovers() {
         .sync_and_save(&NO_SHUTDOWN)
         .unwrap();
 
+    // The funding claim checks the plan before anything is signed, so it is
+    // the one that refuses a coin that has left the wallet.
     let err = taker
         .start_swap(&stale.swap_id)
         .expect_err("a plan whose coin has left the wallet must not fund");
     assert!(
-        format!("{err:?}").contains("is no longer in the wallet"),
+        format!("{err:?}").contains("A planned funding input is no longer free"),
         "Expected the stale-plan refusal, got: {:?}",
         err
     );
@@ -2125,6 +2127,12 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker<B: TestBackend>(expecte
         2,
         "both splits' swapcoins must survive — no substitution cleanup"
     );
+    // Split 1 was accepted, so its inputs are free; split 2 failed and might
+    // still land, so its inputs stay claimed until recovery settles the swap.
+    assert!(
+        taker.reserved_inputs().unwrap() > 0,
+        "a failed broadcast must keep its inputs claimed"
+    );
 
     // Recovery reclaims the on-chain split once its timelock matures.
     let recovery_start = Instant::now();
@@ -2135,6 +2143,11 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker<B: TestBackend>(expecte
         );
         thread::sleep(Duration::from_secs(5));
     }
+    assert_eq!(
+        taker.reserved_inputs().unwrap(),
+        0,
+        "recovery must release the claim of the swap it settled"
+    );
 
     generate_blocks(bitcoind, 1);
     test_framework.wait_for_electrs_tip();

@@ -772,8 +772,42 @@ impl Taker {
             taker.lightning = super::lightning_swap::init_lightning_backend(&taker.config, network);
         }
 
+        // Freeing coins must never block recovery of funds already on-chain:
+        // a failed sweep leaves the claims for the next start.
+        if let Err(e) = taker.release_orphan_reservations() {
+            log::error!("Startup: could not release orphan funding claims: {:?}", e);
+        }
         taker.init_recover_wallet();
         Ok(taker)
+    }
+
+    /// After a restart nothing in memory owns a funding claim. A swap reaches
+    /// its broadcast loop only once its tracker record says `FundsBroadcast`,
+    /// so a claim without an incomplete record never sent a tx: release it.
+    /// Claims of swaps still in recovery stay until recovery cleans them up.
+    fn release_orphan_reservations(&self) -> Result<(), TakerError> {
+        let tracked: HashSet<String> = lock_debug!(self.swap_tracker.lock())
+            .map_err(|_| TakerError::General("swap tracker lock poisoned".into()))?
+            .incomplete_swaps()
+            .into_iter()
+            .map(|record| record.swap_id.clone())
+            .collect();
+        let mut wallet = self.write_wallet()?;
+        let orphans: Vec<String> = wallet
+            .store
+            .swap_locks
+            .keys()
+            .filter(|id| !tracked.contains(*id))
+            .cloned()
+            .collect();
+        for id in &orphans {
+            log::info!("Releasing the funding claim of swap {id}: no unfinished swap owns it");
+            wallet.release_swap_locks(id, None);
+        }
+        if !orphans.is_empty() {
+            wallet.save_to_disk()?;
+        }
+        Ok(())
     }
 
     /// Called on startup to recover funds from incomplete swaps.
@@ -1322,6 +1356,12 @@ impl Taker {
             {
                 swap.phase
             }
+            // Short of the broadcast loop nothing can land, so the funding
+            // claim goes with the failed start.
+            Some(swap) if swap.phase < SwapPhase::FundsBroadcast => {
+                let swap_id = swap.id.clone();
+                return self.release_funding_claim(&swap_id);
+            }
             _ => return Ok(()),
         };
 
@@ -1372,6 +1412,11 @@ impl Taker {
 
         // SP3: Persist after funding initialization (outgoing txids created).
         self.persist_swap(SwapPhase::FundingCreated)?;
+
+        #[cfg(feature = "integration-test")]
+        if self.behavior == TakerBehavior::PayFromPlannedCoinsBeforeBroadcast {
+            self.pay_from_planned_coins()?;
+        }
 
         // Protocol-specific execution with phase-aware recovery triggers.
         let protocol = self.swap_state()?.params.protocol;
@@ -1433,6 +1478,10 @@ impl Taker {
                             log::warn!("Funding txs were broadcast, triggering recovery");
                         } else {
                             log::info!("No funds on-chain — safe to abort");
+                            // A failed save leaves the claim on disk for the startup sweep.
+                            if let Err(err) = self.release_funding_claim(swap_id) {
+                                log::error!("Failed to release the funding claim: {:?}", err);
+                            }
                             let _ = lock_debug!(self.swap_tracker.lock())
                                 .map_err(|_| {
                                     TakerError::General("swap tracker lock poisoned".into())
@@ -1458,6 +1507,10 @@ impl Taker {
                         log::warn!("Funds were broadcast, triggering recovery");
                     } else {
                         log::info!("No funds on-chain — safe to abort");
+                        // A failed save leaves the claim on disk for the startup sweep.
+                        if let Err(err) = self.release_funding_claim(swap_id) {
+                            log::error!("Failed to release the funding claim: {:?}", err);
+                        }
                         let _ = lock_debug!(self.swap_tracker.lock())
                             .map_err(|_| TakerError::General("swap tracker lock poisoned".into()))?
                             .remove_record(
@@ -1594,6 +1647,8 @@ impl Taker {
                 wallet.remove_outgoing_swapcoin(key);
             }
             wallet.remove_watchonly_swapcoins(&swap_id_for_cleanup);
+            // Every broadcast was accepted by now; the swap is over either way.
+            wallet.release_swap_locks(&swap_id_for_cleanup, None);
             wallet.save_to_disk()?;
         }
 
@@ -2487,6 +2542,71 @@ impl Taker {
         Ok(())
     }
 
+    /// Test-only: pay a little from the signed hop-0 plan's coins through the
+    /// public wallet API, as a library caller could while the swap runs.
+    #[cfg(feature = "integration-test")]
+    fn pay_from_planned_coins(&self) -> Result<(), TakerError> {
+        let planned: Vec<OutPoint> = self
+            .swap_state()?
+            .hop0_plan
+            .splits
+            .iter()
+            .flat_map(|split| split.utxos.iter().copied())
+            .collect();
+        let swap_id = self.swap_state()?.id.clone();
+        let mut wallet = self.write_wallet()?;
+        // Manual selection reports a missing, locked or claimed coin with one
+        // error. With every planned coin still in the wallet, unlocked and
+        // held by this swap's claim, only the claim can have refused it.
+        let listed: HashSet<OutPoint> = wallet
+            .list_all_utxo()
+            .iter()
+            .map(|utxo| OutPoint::new(utxo.txid, utxo.vout))
+            .collect();
+        let locked = wallet.list_lock_unspent();
+        let only_the_claim_excludes = planned.iter().all(|outpoint| {
+            listed.contains(outpoint)
+                && !locked.contains(outpoint)
+                && wallet
+                    .store
+                    .swap_locks
+                    .get(&swap_id)
+                    .is_some_and(|locks| locks.outpoints.contains(outpoint))
+        });
+        let address = wallet.get_next_external_address(crate::wallet::AddressType::P2WPKH)?;
+        match wallet.send_to_address(10_000, address.to_string(), None, Some(planned)) {
+            Ok(txid) => {
+                log::warn!("Test behavior: payment from planned funding coins sent: {txid}")
+            }
+            Err(crate::wallet::WalletError::General(msg))
+                if only_the_claim_excludes
+                    && msg.starts_with("Some manually selected UTXOs are unavailable") =>
+            {
+                log::warn!("Test behavior: payment from planned funding coins refused by funding claim")
+            }
+            Err(e) => log::warn!(
+                "Test behavior: payment from planned funding coins refused for another reason: {e:?}"
+            ),
+        }
+        Ok(())
+    }
+
+    /// Outpoints this taker's wallet still holds claimed for a swap.
+    #[cfg(feature = "integration-test")]
+    pub fn reserved_inputs(&self) -> Result<usize, TakerError> {
+        Ok(self.read_wallet()?.reserved_inputs())
+    }
+
+    /// Drop the hop-0 funding claim of a swap that never entered its
+    /// broadcast loop. Never call it past that point: a sent tx may still land.
+    fn release_funding_claim(&self, swap_id: &str) -> Result<(), TakerError> {
+        let mut wallet = self.write_wallet()?;
+        if wallet.release_swap_locks(swap_id, None) {
+            wallet.save_to_disk()?;
+        }
+        Ok(())
+    }
+
     /// True only while the funding broadcast loop was never entered. The phase
     /// flips to FundsBroadcast before the first send, so past that point a
     /// partial batch is possible, substitution is off the table, and a failure
@@ -2598,9 +2718,23 @@ impl Taker {
 
         let mut wallet = self.write_wallet()?;
 
+        // Claim the planned coins before signing them: unclaimed, a payment
+        // made through the public wallet handle could spend them before the
+        // broadcast. The executor ignores claims, so ours does not block it.
+        let planned_inputs: Vec<OutPoint> = hop0_plan
+            .splits
+            .iter()
+            .flat_map(|split| split.utxos.iter().copied())
+            .collect();
+        if !wallet.claim_or_hold_swap_inputs(&swap_id, &planned_inputs) {
+            return Err(TakerError::General(
+                "A planned funding input is no longer free; prepare the swap again".to_string(),
+            ));
+        }
+
         let network = wallet.store.network;
 
-        let swapcoins = match protocol {
+        let built = match protocol {
             ProtocolVersion::Legacy => Self::funding_create_legacy(
                 &mut wallet,
                 &multisig_pubkeys,
@@ -2611,22 +2745,37 @@ impl Taker {
                 &swap_id,
                 network,
                 swap_feerate,
-            )?,
-            ProtocolVersion::Taproot => {
-                let hashlock_pubkey = taproot_hashlock_pubkey
-                    .ok_or_else(|| TakerError::General("taproot hashlock pubkey not set".into()))?;
-                Self::funding_create_taproot(
-                    &mut wallet,
-                    &vec![tweakable_point; hop0_tx_count],
-                    &vec![hashlock_pubkey; hop0_tx_count],
-                    preimage,
-                    refund_locktime_offset,
-                    &hop0_plan,
-                    &swap_id,
-                    network,
-                    reference_height,
-                    swap_feerate,
-                )?
+            ),
+            ProtocolVersion::Taproot => taproot_hashlock_pubkey
+                .ok_or_else(|| TakerError::General("taproot hashlock pubkey not set".into()))
+                .and_then(|hashlock_pubkey| {
+                    Self::funding_create_taproot(
+                        &mut wallet,
+                        &vec![tweakable_point; hop0_tx_count],
+                        &vec![hashlock_pubkey; hop0_tx_count],
+                        preimage,
+                        refund_locktime_offset,
+                        &hop0_plan,
+                        &swap_id,
+                        network,
+                        reference_height,
+                        swap_feerate,
+                    )
+                }),
+        };
+        // Nothing was signed for the network, so the claim must not outlive
+        // the failed build.
+        let swapcoins = match built {
+            Ok(swapcoins) => swapcoins,
+            Err(e) => {
+                // A failed save leaves the claim on disk for the startup sweep;
+                // the build error is the one the caller needs.
+                if wallet.release_swap_locks(&swap_id, None) {
+                    if let Err(err) = wallet.save_to_disk() {
+                        log::error!("Failed to persist the funding claim release: {:?}", err);
+                    }
+                }
+                return Err(e);
             }
         };
 
@@ -3979,6 +4128,10 @@ pub enum TakerBehavior {
     /// Announce a swap-in HTLC value one sat above the funded output, so the
     /// maker must refuse the funding message (Lightning swap-in mismatch test).
     ForgeSwapInFundedValue,
+    /// Once the hop-0 funding is signed and before it is broadcast, pay from
+    /// its planned coins through the public wallet API. The funding claim must
+    /// refuse the payment, and the swap must go on.
+    PayFromPlannedCoinsBeforeBroadcast,
 }
 
 #[cfg(test)]

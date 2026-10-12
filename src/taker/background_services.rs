@@ -222,6 +222,9 @@ impl RecoveryLoop {
                                     w.remove_outgoing_swapcoin(key);
                                 }
                                 w.remove_watchonly_swapcoins(swap_id);
+                                // A partly broadcast batch still holds its
+                                // unsent inputs; the swap is settled now.
+                                w.release_swap_locks(swap_id, None);
                             }
                             saved = w
                                 .save_to_disk()

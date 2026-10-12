@@ -773,6 +773,7 @@ impl Taker {
     fn funding_broadcast(&mut self) -> Result<(), TakerError> {
         log::info!("Broadcasting contract transactions...");
 
+        let swap_id = self.swap_state()?.id.clone();
         let mut wallet = self.write_wallet()?;
 
         for swapcoin in &self.swap_state()?.outgoing_swapcoins {
@@ -783,6 +784,8 @@ impl Taker {
                 log::warn!("Test behavior: withholding the contract tx broadcast");
                 continue;
             }
+            // A failed send keeps the claim: the tx may still land. Recovery
+            // releases it once it judges the tx absent from the backend.
             let txid = wallet.send_tx(&swapcoin.contract_tx).map_err(|e| {
                 TakerError::General(format!("Failed to broadcast contract tx: {:?}", e))
             })?;
@@ -792,6 +795,9 @@ impl Taker {
             // at the next sync; until then a new swap must not plan them. The
             // lock is in memory only: once synced the coins are gone anyway.
             wallet.lock_utxos(&spent_inputs(&swapcoin.contract_tx));
+            // Accepted, so this tx's inputs need no claim. The save after the
+            // loop persists the release.
+            wallet.release_swap_locks(&swap_id, Some(&spent_inputs(&swapcoin.contract_tx)));
 
             let vout = swapcoin
                 .contract_tx

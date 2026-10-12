@@ -349,6 +349,8 @@ impl Taker {
                         let funding_tx = swapcoin.funding_tx.as_ref().ok_or_else(|| {
                             TakerError::General("Outgoing swapcoin missing funding_tx".to_string())
                         })?;
+                        // A failed send keeps the claim: the tx may still land. Recovery
+                        // releases it once it judges the tx absent from the backend.
                         wallet.send_tx(funding_tx).map_err(|e| {
                             TakerError::General(format!("Failed to broadcast funding tx: {:?}", e))
                         })?;
@@ -357,6 +359,9 @@ impl Taker {
                         // plan them. The lock is in memory only: once synced the
                         // coins are gone anyway.
                         wallet.lock_utxos(&spent_inputs(funding_tx));
+                        // Accepted, so this tx's inputs need no claim. The save
+                        // after the loop persists the release.
+                        wallet.release_swap_locks(&swap_id, Some(&spent_inputs(funding_tx)));
                     }
                     wallet.save_to_disk()?;
                 }
