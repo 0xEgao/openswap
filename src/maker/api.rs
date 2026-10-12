@@ -873,9 +873,11 @@ impl MakerServer {
             }
             config.network = wallet_network;
             config.network_confirmed = true;
-            config
-                .write_to_file(&data_dir.join("config.toml"))
-                .map_err(MakerError::IO)?;
+            // Only a hint for readers that can't unlock the wallet, so a
+            // failed write shouldn't abort startup.
+            if let Err(e) = config.write_to_file(&data_dir.join("config.toml")) {
+                log::warn!("Couldn't record the wallet network in config.toml: {e}");
+            }
         }
         // Validate the blocklist on startup when screening is enabled.
         if config.check_blocklist {
