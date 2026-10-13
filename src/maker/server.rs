@@ -1296,19 +1296,32 @@ fn recover_from_swap(
     // The watcher hears each new block, so asking the server every pass is waste.
     // The fallback uses its own connection, kept while the watcher is down and dropped on error:
     // a slow server must not hold the wallet lock.
+    // After a failed fallback on Electrum, a live watcher is already retrying the same server
+    // and publishes a height once it answers; asking it every pass only extends a rate limit.
     let mut fallback: Option<AnyBlockchain> = None;
+    let mut deferring = false;
     let mut tip = || -> Result<u32, MakerError> {
         if let Some(height) = maker.watch_service.tip() {
             fallback = None;
+            deferring = false;
             return Ok(height as u32);
         }
-        let chain = match fallback.take() {
-            Some(chain) => chain,
-            None => maker.backend.connect().map_err(MakerError::Wallet)?,
-        };
-        let height = chain.get_block_count().map_err(MakerError::Wallet)?;
-        fallback = Some(chain);
-        Ok(height as u32)
+        if deferring && maker.watch_service.is_alive() {
+            return Err(MakerError::General(
+                "Block height unknown; waiting for the watcher to reach the server",
+            ));
+        }
+        let height = fallback
+            .take()
+            .map_or_else(|| maker.backend.connect(), Ok)
+            .and_then(|chain| {
+                let height = chain.get_block_count()?;
+                fallback = Some(chain);
+                Ok(height)
+            })
+            .map_err(MakerError::Wallet);
+        deferring = height.is_err() && maker.backend.is_electrum();
+        Ok(height? as u32)
     };
 
     // Timelock recovery may already have removed every outgoing coin before a

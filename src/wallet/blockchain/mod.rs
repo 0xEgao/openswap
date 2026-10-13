@@ -394,6 +394,10 @@ impl BackendConnector {
     pub(crate) fn connect(&self) -> Result<AnyBlockchain, WalletError> {
         AnyBlockchain::from_config_with_shutdown(&self.config, self.shutdown.clone())
     }
+
+    pub(crate) fn is_electrum(&self) -> bool {
+        matches!(self.config, BackendConfig::Electrum(_))
+    }
 }
 
 impl AnyBlockchain {

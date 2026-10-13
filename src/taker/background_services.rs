@@ -79,6 +79,8 @@ impl RecoveryLoop {
                 // and public servers rate-limit per connection. A dropped one is
                 // rebuilt inside the backend on its next call.
                 let mut held: Option<AnyBlockchain> = None;
+                // Set by a failed fallback height read on Electrum; see below.
+                let mut deferring = false;
                 while !shutdown_clone.load(Relaxed) {
                     let scope = lock_debug!(swap_tracker.lock())
                         .ok()
@@ -102,20 +104,34 @@ impl RecoveryLoop {
                     // The chain only moves with a block, so a pass waits for one. The
                     // watcher hears each block; asking the server is the fallback. It
                     // uses the loop's own connection: a slow server must not hold the
-                    // wallet lock.
+                    // wallet lock. After it fails on Electrum, a live watcher is already
+                    // retrying the same server and publishes a height once it answers, so
+                    // the fallback waits for that instead.
                     let mut tip_refreshed = false;
-                    let tip = watch_service.tip().or_else(|| {
-                        held.take()
-                            .map_or_else(|| backend.connect(), Ok)
-                            .and_then(|chain| {
-                                let height = chain.get_block_count()?;
-                                held = Some(chain);
-                                tip_refreshed = true;
-                                Ok(height)
-                            })
-                            .inspect_err(|e| log::warn!("Recovery loop: block height: {:?}", e))
-                            .ok()
-                    });
+                    let tip = match watch_service.tip() {
+                        Some(height) => {
+                            deferring = false;
+                            Some(height)
+                        }
+                        None if deferring && watch_service.is_alive() => None,
+                        None => {
+                            let height = held
+                                .take()
+                                .map_or_else(|| backend.connect(), Ok)
+                                .and_then(|chain| {
+                                    let height = chain.get_block_count()?;
+                                    held = Some(chain);
+                                    tip_refreshed = true;
+                                    Ok(height)
+                                })
+                                .inspect_err(|e| {
+                                    log::warn!("Recovery loop: block height: {:?}", e)
+                                })
+                                .ok();
+                            deferring = height.is_none() && backend.is_electrum();
+                            height
+                        }
+                    };
                     if tip.is_none_or(|tip| last_tip.replace(tip) == Some(tip)) {
                         thread::park_timeout(RECOVERY_LOOP_INTERVAL);
                         continue;
