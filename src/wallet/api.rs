@@ -1315,6 +1315,7 @@ impl Wallet {
             funding_shared_with_peer,
             &|_| false,
             &|_| false,
+            &mut false,
         )?;
         Ok(Self::finish_recoveries(wallet, chain, shutdown, Vec::new(), refunds, discarded)?.1)
     }
@@ -1335,6 +1336,10 @@ impl Wallet {
     /// are refunded only once that can provably never happen. `claim_proven`
     /// is the part of those with real evidence of a claim; only such a swap
     /// keeps its preimage when it is refunded.
+    ///
+    /// `synced` skips the wallet sync when the pass already ran one, and is set
+    /// once this call syncs.
+    #[allow(clippy::too_many_arguments)]
     fn broadcast_timelock_recoveries(
         wallet: &std::sync::RwLock<Wallet>,
         chain: &AnyBlockchain,
@@ -1343,6 +1348,7 @@ impl Wallet {
         funding_shared_with_peer: &dyn Fn(Option<&str>) -> bool,
         claimed_by_hashlock: &dyn Fn(&str) -> bool,
         claim_proven: &dyn Fn(&str) -> bool,
+        synced: &mut bool,
     ) -> Result<(Vec<SentSpend>, Vec<String>), WalletError> {
         // Snapshot everything the recovery needs, then drop the guard before any backend call.
         let candidates = {
@@ -1371,7 +1377,10 @@ impl Wallet {
                 return Ok((Vec::new(), Vec::new()));
             }
 
-            w.sync_and_save(shutdown)?;
+            if !*synced {
+                w.sync_and_save(shutdown)?;
+                *synced = true;
+            }
 
             candidates
         };
@@ -1765,16 +1774,23 @@ impl Wallet {
         funding_shared_with_peer: &dyn Fn(Option<&str>) -> bool,
         incoming_claimed: &dyn Fn(&str) -> bool,
     ) -> Result<(RecoveryOutcome, RecoveryOutcome), WalletError> {
+        // Both steps want a synced wallet; the pass syncs it once.
+        let mut synced = false;
         // A failed sweep step must still let the refunds go out, but with no
         // word on which coins are claimable, each refund must prove it dangles.
-        let (sweeps, claiming, sweep_failed) =
-            match Self::broadcast_incoming_sweeps(wallet, chain, shutdown, Some(contract_txids)) {
-                Ok((sweeps, claiming)) => (sweeps, claiming, false),
-                Err(e) => {
-                    log::warn!("Incoming sweep failed: {:?}", e);
-                    (Vec::new(), HashSet::new(), true)
-                }
-            };
+        let (sweeps, claiming, sweep_failed) = match Self::broadcast_incoming_sweeps(
+            wallet,
+            chain,
+            shutdown,
+            Some(contract_txids),
+            &mut synced,
+        ) {
+            Ok((sweeps, claiming)) => (sweeps, claiming, false),
+            Err(e) => {
+                log::warn!("Incoming sweep failed: {:?}", e);
+                (Vec::new(), HashSet::new(), true)
+            }
+        };
         let (refunds, discarded) = Self::broadcast_timelock_recoveries(
             wallet,
             chain,
@@ -1784,6 +1800,7 @@ impl Wallet {
             &|swap_id| sweep_failed || claiming.contains(swap_id) || incoming_claimed(swap_id),
             // A failed sweep step holds every refund, but proves no claim.
             &|swap_id| claiming.contains(swap_id) || incoming_claimed(swap_id),
+            &mut synced,
         )?;
         Self::finish_recoveries(wallet, chain, shutdown, sweeps, refunds, discarded)
     }
@@ -3568,7 +3585,8 @@ impl Wallet {
         shutdown: &std::sync::atomic::AtomicBool,
         contract_txids: Option<&HashSet<Txid>>,
     ) -> Result<RecoveryOutcome, WalletError> {
-        let (sweeps, _) = Self::broadcast_incoming_sweeps(wallet, chain, shutdown, contract_txids)?;
+        let (sweeps, _) =
+            Self::broadcast_incoming_sweeps(wallet, chain, shutdown, contract_txids, &mut false)?;
         Ok(Self::finish_recoveries(wallet, chain, shutdown, sweeps, Vec::new(), Vec::new())?.0)
     }
 
@@ -3578,11 +3596,13 @@ impl Wallet {
     /// chain, whether or not their sweep went out in this pass.
     /// A PaySwap coin pays the receiver an exact amount, so its fee is whatever
     /// the input leaves over; every other coin sweeps at its negotiated feerate.
+    /// `synced` works as in [`Self::broadcast_timelock_recoveries`].
     fn broadcast_incoming_sweeps(
         wallet: &std::sync::RwLock<Wallet>,
         chain: &AnyBlockchain,
         shutdown: &std::sync::atomic::AtomicBool,
         contract_txids: Option<&HashSet<Txid>>,
+        synced: &mut bool,
     ) -> Result<(Vec<SentSpend>, HashSet<String>), WalletError> {
         let mut sweeps = Vec::new();
         let mut claiming = HashSet::new();
@@ -3610,7 +3630,10 @@ impl Wallet {
                 return Ok((sweeps, claiming));
             }
 
-            w.sync_and_save(shutdown)?;
+            if !*synced {
+                w.sync_and_save(shutdown)?;
+                *synced = true;
+            }
 
             completed_swapcoins
         };
@@ -4023,10 +4046,15 @@ pub(crate) fn wait_for_tx_confirmation(
     );
 
     const SYNC_INTERVAL_SECS: u64 = 10;
+    /// Longest gap between reads of seen txs while the tip stands still, so an
+    /// eviction from the mempool is still noticed.
+    const MEMPOOL_RECHECK: Duration = Duration::from_secs(60);
 
     let started = Instant::now();
     let mut unseen: HashSet<Txid> = txids.iter().copied().collect();
     let mut vanished_at: HashMap<Txid, Instant> = HashMap::new();
+    let mut last_tip = None;
+    let mut last_read: Option<Instant> = None;
 
     loop {
         if shutdown.is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed)) {
@@ -4044,6 +4072,22 @@ pub(crate) fn wait_for_tx_confirmation(
                 "Tx did not confirm before the confirmation deadline".to_string(),
             ));
         }
+
+        // Confirmations only move with a block, so a seen tx is read again on a
+        // new tip, or after `MEMPOOL_RECHECK` to catch an eviction. The tip is
+        // one request; reading each tx costs several on Electrum.
+        let tip = blockchain.get_block_count().ok();
+        let due = !unseen.is_empty()
+            || !vanished_at.is_empty()
+            || tip.is_none()
+            || tip != last_tip
+            || last_read.is_none_or(|at| at.elapsed() >= MEMPOOL_RECHECK);
+        if !due {
+            pause_between_polls(SYNC_INTERVAL_SECS, shutdown, abort_check)?;
+            continue;
+        }
+        last_tip = tip;
+        last_read = Some(Instant::now());
 
         let mut all_confirmed = true;
         let mut max_confirm_height: u32 = 0;
@@ -4145,18 +4189,26 @@ pub(crate) fn wait_for_tx_confirmation(
         }
 
         log::info!("Next sync in {} secs", SYNC_INTERVAL_SECS);
-
-        // Sleep in 1-second increments so we can check shutdown/abort.
-        for _ in 0..SYNC_INTERVAL_SECS {
-            if shutdown.is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed)) {
-                return Err(WalletError::Interrupted("Shutdown requested"));
-            }
-            if abort_check.is_some_and(|f| f()) {
-                return Err(WalletError::Interrupted("Abort requested"));
-            }
-            thread::sleep(Duration::from_secs(1));
-        }
+        pause_between_polls(SYNC_INTERVAL_SECS, shutdown, abort_check)?;
     }
+}
+
+/// Sleep `secs` in 1-second increments so shutdown and abort are seen.
+fn pause_between_polls(
+    secs: u64,
+    shutdown: Option<&std::sync::atomic::AtomicBool>,
+    abort_check: Option<&dyn Fn() -> bool>,
+) -> Result<(), WalletError> {
+    for _ in 0..secs {
+        if shutdown.is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err(WalletError::Interrupted("Shutdown requested"));
+        }
+        if abort_check.is_some_and(|f| f()) {
+            return Err(WalletError::Interrupted("Abort requested"));
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    Ok(())
 }
 
 /// True when `tx` is the transaction `utxo` names (txid recomputed, not
@@ -5862,7 +5914,10 @@ mod mempool_deferral_tests {
     };
     use crate::{
         protocol::contract::{create_contract_redeemscript, Hash160},
-        wallet::swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
+        wallet::{
+            blockchain::SCRIPT_CACHE_TTL,
+            swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
+        },
     };
     use bitcoin::{
         consensus::encode::{deserialize_hex, serialize_hex},
@@ -6103,12 +6158,16 @@ mod mempool_deferral_tests {
         let shutdown = shutdown_after(60);
 
         let (sweeps, claiming) =
-            Wallet::broadcast_incoming_sweeps(&wallet, &backend, &shutdown, None).unwrap();
+            Wallet::broadcast_incoming_sweeps(&wallet, &backend, &shutdown, None, &mut false)
+                .unwrap();
         assert!(sweeps.is_empty());
         assert_eq!(claiming, HashSet::from([SWAP.to_string()]));
         assert!(chain.lock().unwrap().broadcast.is_empty());
 
         chain.lock().unwrap().txs.get_mut(&contract_txid).unwrap().1 = TIP;
+        // Passes run a block apart, long after the backend stops reusing its
+        // answers about the contract.
+        thread::sleep(SCRIPT_CACHE_TTL);
         let outcome = Wallet::sweep_incoming_swapcoins(&wallet, &backend, &shutdown, None).unwrap();
         let chain = chain.lock().unwrap();
         let [sweep] = chain.broadcast[..] else {
@@ -6289,6 +6348,7 @@ mod mempool_deferral_tests {
                 &|_| true,
                 &|swap_id| claimed && swap_id == SWAP,
                 &|_| false,
+                &mut false,
             )
             .unwrap();
             assert!(discarded.is_empty());

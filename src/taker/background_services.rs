@@ -75,6 +75,10 @@ impl RecoveryLoop {
             .spawn(move || {
                 log::info!("Recovery loop started");
                 let mut last_tip = None;
+                // Kept across passes: every fresh connection costs a handshake,
+                // and public servers rate-limit per connection. A dropped one is
+                // rebuilt inside the backend on its next call.
+                let mut held: Option<AnyBlockchain> = None;
                 while !shutdown_clone.load(Relaxed) {
                     let scope = lock_debug!(swap_tracker.lock())
                         .ok()
@@ -97,15 +101,14 @@ impl RecoveryLoop {
 
                     // The chain only moves with a block, so a pass waits for one. The
                     // watcher hears each block; asking the server is the fallback. It
-                    // uses its own connection: a slow server must not hold the wallet lock.
-                    // The pass below reuses that connection.
-                    let mut fallback = None;
+                    // uses the loop's own connection: a slow server must not hold the
+                    // wallet lock.
                     let tip = watch_service.tip().or_else(|| {
-                        backend
-                            .connect()
+                        held.take()
+                            .map_or_else(|| backend.connect(), Ok)
                             .and_then(|chain| {
                                 let height = chain.get_block_count()?;
-                                fallback = Some(chain);
+                                held = Some(chain);
                                 Ok(height)
                             })
                             .inspect_err(|e| log::warn!("Recovery loop: block height: {:?}", e))
@@ -116,10 +119,10 @@ impl RecoveryLoop {
                         continue;
                     }
 
-                    // One connection per pass, shared by both steps below:
+                    // One connection shared by both steps below and by later passes:
                     // on Tor Electrum each fresh connection costs a circuit handshake.
-                    let chain = match fallback.map_or_else(|| backend.connect(), Ok) {
-                        Ok(chain) => chain,
+                    let chain: &AnyBlockchain = match held.take().map_or_else(|| backend.connect(), Ok) {
+                        Ok(chain) => held.insert(chain),
                         Err(e) => {
                             log::warn!("Recovery loop: no connection: {:?}", e);
                             // A dropped circuit is passing; retry on the next interval.
@@ -128,12 +131,21 @@ impl RecoveryLoop {
                             continue;
                         }
                     };
+                    // The watcher may have observed the new block on a
+                    // different connection. Refresh this backend's tip before
+                    // consulting its script and header caches.
+                    if let Err(e) = chain.get_block_count() {
+                        log::warn!("Recovery loop: block height: {:?}", e);
+                        last_tip = None;
+                        thread::park_timeout(RECOVERY_LOOP_INTERVAL);
+                        continue;
+                    }
 
                     // Sweeps and timelock refunds in one pass. It takes the lock itself
                     // and drops it across its wait, so a stuck tx cannot wedge the wallet.
                     match Wallet::recover_swapcoins(
                         &wallet,
-                        &chain,
+                        chain,
                         &shutdown_clone,
                         &incoming_contract_txids,
                         &swap_ids,

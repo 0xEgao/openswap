@@ -21,6 +21,8 @@ mod corerpc;
 mod electrum;
 
 pub use corerpc::{CoreRPC, CoreRpcConfig};
+#[cfg(test)]
+pub(crate) use electrum::SCRIPT_CACHE_TTL;
 pub use electrum::{Electrum, ElectrumConfig, WATCHER_READ_TIMEOUT_DIRECT_SECS};
 
 use std::{

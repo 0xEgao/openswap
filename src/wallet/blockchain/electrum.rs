@@ -13,7 +13,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bitcoin::{
@@ -32,8 +32,8 @@ use bitcoind::bitcoincore_rpc::json::{
     ListTransactionResult, ListUnspentResultEntry, WalletTxInfo,
 };
 use electrum_client::{
-    Batch, Client as ElectrumClient, Config as ClientConfig, ConfigBuilder, ElectrumApi, Param,
-    Socks5Config, ToElectrumScriptHash,
+    Batch, Client as ElectrumClient, Config as ClientConfig, ConfigBuilder, ElectrumApi,
+    GetHistoryRes, Param, Socks5Config, ToElectrumScriptHash,
 };
 use serde_json::{json, Value};
 
@@ -95,6 +95,34 @@ pub const READ_TIMEOUT_PROXIED_SECS: u8 = 120;
 /// answers, and the watcher retries a failed call on its own tick.
 pub const WATCHER_READ_TIMEOUT_DIRECT_SECS: u8 = 5;
 
+/// Wait before reconnecting after the server says we are over its rate limit.
+/// The ordinary 1s/2s/4s backoff would only feed the limit it tripped.
+const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(30);
+/// How long a script's history or unspent list is reused. Covers one recovery
+/// pass asking about the same contract several times, while a mempool change
+/// still shows on the next poll.
+pub(crate) const SCRIPT_CACHE_TTL: Duration = Duration::from_secs(3);
+/// How long a tip read serves confirmation counts without asking again.
+const TIP_CACHE_TTL: Duration = Duration::from_secs(3);
+/// Headers at least this far below the tip are cached for the current tip.
+const HEADER_CACHE_DEPTH: u64 = 6;
+/// Cached transactions kept before the cache is emptied and refilled.
+const TX_CACHE_CAP: usize = 1000;
+
+/// Request labels for the per-method counters, named after the protocol method.
+const TX_GET: &str = "blockchain.transaction.get";
+const GET_HISTORY: &str = "blockchain.scripthash.get_history";
+const SUBSCRIBE: &str = "blockchain.scripthash.subscribe";
+const HEADERS_SUBSCRIBE: &str = "blockchain.headers.subscribe";
+const BLOCK_HEADER: &str = "blockchain.block.header";
+const LIST_UNSPENT: &str = "blockchain.scripthash.listunspent";
+const BROADCAST: &str = "blockchain.transaction.broadcast";
+const ESTIMATE_FEE: &str = "blockchain.estimatefee";
+const PING: &str = "server.ping";
+/// Reads of already-received notifications. They never touch the socket, so
+/// they are not counted.
+const LOCAL: &str = "local";
+
 /// Host portion of an Electrum URL, without scheme or port.
 fn url_host(url: &str) -> &str {
     let no_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
@@ -153,12 +181,39 @@ fn retry_backoff(attempt: u8) -> Duration {
 /// failed. Reconnecting cannot help these. `NotSubscribed` is included because
 /// it is local client state, and after a rebuild it means "re-arm", not "retry".
 fn is_terminal(e: &electrum_client::Error) -> bool {
-    matches!(
-        e,
-        electrum_client::Error::Protocol(_)
-            | electrum_client::Error::AlreadySubscribed(_)
-            | electrum_client::Error::NotSubscribed(_)
-    )
+    !is_rate_limited(e)
+        && matches!(
+            e,
+            electrum_client::Error::Protocol(_)
+                | electrum_client::Error::AlreadySubscribed(_)
+                | electrum_client::Error::NotSubscribed(_)
+        )
+}
+
+/// True for a protocol error saying we sent too much. ElectrumX-family servers
+/// report "excessive resource usage"; others word it as a rate limit. Waiting
+/// helps these, so they are retried after [`RATE_LIMIT_BACKOFF`].
+fn is_rate_limited(e: &electrum_client::Error) -> bool {
+    matches!(e, electrum_client::Error::Protocol(v) if {
+        let message = v
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| v.as_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        message.contains("excessive resource usage")
+            || message.contains("rate limit")
+            || message.contains("too many requests")
+    })
+}
+
+/// Wait before retry `attempt` after error `last`.
+fn backoff_after(attempt: u8, last: &electrum_client::Error) -> Duration {
+    if is_rate_limited(last) {
+        RATE_LIMIT_BACKOFF
+    } else {
+        retry_backoff(attempt)
+    }
 }
 
 /// True only for protocol errors that explicitly say the transaction is
@@ -180,7 +235,7 @@ fn is_unknown_txid(e: &electrum_client::Error) -> bool {
 /// `scripthash.listunspent` entry with a signed height. The crate's own type
 /// uses `usize`, which fails to parse the `-1` ElectrumX-family servers report
 /// for a mempool UTXO with unconfirmed parents. `<= 0` means unconfirmed.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 struct UnspentRes {
     height: i64,
     tx_hash: Txid,
@@ -258,6 +313,62 @@ struct NotifierState {
     wallet_connection: u64,
 }
 
+/// Answers kept so the same question is not sent twice. Public servers
+/// rate-limit hard, and one recovery pass asks about the same contract script
+/// and transactions several times over.
+///
+/// Transactions are immutable under their txid. Headers are kept only while
+/// the tip is unchanged. Script answers can change with any mempool update,
+/// so they last [`SCRIPT_CACHE_TTL`], and are dropped on a new tip and after
+/// our own broadcast. The watcher's reads bypass this: a
+/// subscription replay must see the server's current answer.
+#[derive(Debug, Default)]
+struct Cache {
+    txs: HashMap<Txid, Transaction>,
+    headers: HashMap<u64, Header>,
+    /// Last tip read from the server, and when.
+    tip: Option<(u64, BlockHash, Instant)>,
+    /// Prevent a read started before a tip change or broadcast from putting
+    /// its old answer back after the script cache was cleared.
+    script_generation: u64,
+    histories: HashMap<ScriptBuf, (Instant, Vec<GetHistoryRes>)>,
+    unspents: HashMap<ScriptBuf, (Instant, Vec<UnspentRes>)>,
+}
+
+impl Cache {
+    /// A changed tip drops chain-dependent answers, including same-height
+    /// replacements and deep reorgs.
+    fn note_tip(&mut self, height: u64, hash: BlockHash) {
+        if let Some((last_height, last_hash, _)) = self.tip {
+            if height != last_height || hash != last_hash {
+                self.forget_scripts();
+                self.headers.clear();
+            }
+        }
+        self.tip = Some((height, hash, Instant::now()));
+    }
+
+    fn forget_scripts(&mut self) {
+        self.script_generation = self.script_generation.wrapping_add(1);
+        self.histories.clear();
+        self.unspents.clear();
+    }
+
+    fn insert_tx(&mut self, txid: Txid, tx: Transaction) {
+        if self.txs.len() >= TX_CACHE_CAP {
+            self.txs.clear();
+        }
+        self.txs.insert(txid, tx);
+    }
+}
+
+/// A cached script answer, if still within [`SCRIPT_CACHE_TTL`].
+fn fresh<T: Clone>(entry: Option<&(Instant, T)>) -> Option<T> {
+    entry
+        .filter(|(at, _)| at.elapsed() < SCRIPT_CACHE_TTL)
+        .map(|(_, v)| v.clone())
+}
+
 /// Electrum-protocol backend. One owned connection serves both the wallet's
 /// queries and the watchtower's notifications for a given consumer.
 pub struct Electrum {
@@ -292,6 +403,26 @@ pub struct Electrum {
     /// Set by the owner on shutdown so a retry loop stuck in backoff aborts
     /// instead of stalling the join.
     shutdown: Arc<AtomicBool>,
+    /// Answers reused instead of asked again; see [`Cache`].
+    cache: Mutex<Cache>,
+    /// Requests sent per protocol method, logged when the connection drops.
+    requests: Mutex<HashMap<&'static str, u64>>,
+}
+
+impl Drop for Electrum {
+    fn drop(&mut self) {
+        let requests = self.requests.get_mut().unwrap_or_else(|e| e.into_inner());
+        if requests.is_empty() {
+            return;
+        }
+        let mut counts: Vec<_> = requests.iter().collect();
+        counts.sort();
+        let total: u64 = counts.iter().map(|(_, n)| **n).sum();
+        log::debug!(
+            "electrum connection to {} sent {total} request(s): {counts:?}",
+            self.config.url
+        );
+    }
 }
 
 impl std::fmt::Debug for Electrum {
@@ -303,21 +434,121 @@ impl std::fmt::Debug for Electrum {
 }
 
 impl Electrum {
+    /// The transaction under `txid`, from the cache when we have fetched it
+    /// before. Only a tx that hashes to the txid asked for is returned or kept.
     pub(crate) fn transaction_get_validating(
         &self,
         txid: &Txid,
     ) -> Result<Transaction, WalletError> {
-        let tx = self.call(|c| c.transaction_get(txid))?;
-        if tx.compute_txid() != *txid {
-            return Err(WalletError::Electrum(electrum_client::Error::Protocol(
-                serde_json::Value::String(format!(
-                    "Server returned transaction {} for requested {}",
-                    tx.compute_txid(),
-                    txid
-                )),
-            )));
+        if let Some(tx) = self.cache().txs.get(txid) {
+            return Ok(tx.clone());
         }
+        self.transaction_get_live(txid)
+    }
+
+    /// Presence-sensitive callers must ask the server even if we still have
+    /// the bytes: a mempool transaction can be evicted while its txid stays
+    /// cached locally.
+    fn transaction_get_live(&self, txid: &Txid) -> Result<Transaction, WalletError> {
+        let tx = self.call(TX_GET, |c| c.transaction_get(txid))?;
+        check_txid(&tx, txid)?;
+        self.cache().insert_tx(*txid, tx.clone());
         Ok(tx)
+    }
+
+    /// Fetch every txid not yet cached in batched round-trips, so the
+    /// per-tx reads that follow are answered locally.
+    fn prefetch_transactions(&self, txids: &[Txid]) -> Result<(), WalletError> {
+        const TX_BATCH: usize = 100;
+        let missing: Vec<Txid> = {
+            let cache = self.cache();
+            let mut seen = HashSet::new();
+            txids
+                .iter()
+                .filter(|txid| !cache.txs.contains_key(*txid) && seen.insert(**txid))
+                .copied()
+                .collect()
+        };
+        for chunk in missing.chunks(TX_BATCH) {
+            let txs = self.call(TX_GET, |c| c.batch_transaction_get(chunk.iter()))?;
+            if txs.len() != chunk.len() {
+                return Err(electrum_err(format!(
+                    "electrum: asked for {} transactions, got {}",
+                    chunk.len(),
+                    txs.len()
+                )));
+            }
+            for (txid, tx) in chunk.iter().zip(&txs) {
+                check_txid(tx, txid)?;
+            }
+            let mut cache = self.cache();
+            for (txid, tx) in chunk.iter().zip(txs) {
+                cache.insert_tx(*txid, tx);
+            }
+        }
+        Ok(())
+    }
+
+    /// `scripthash.get_history`, reused for [`SCRIPT_CACHE_TTL`]. Not for the
+    /// watcher, whose replays must see the server's current answer.
+    fn history(&self, script: &Script) -> Result<Vec<GetHistoryRes>, WalletError> {
+        let generation = {
+            let cache = self.cache();
+            if let Some(hist) = fresh(cache.histories.get(script)) {
+                return Ok(hist);
+            }
+            cache.script_generation
+        };
+        let hist = self.call(GET_HISTORY, |c| c.script_get_history(script))?;
+        let mut cache = self.cache();
+        if cache.script_generation == generation {
+            cache
+                .histories
+                .insert(script.to_owned(), (Instant::now(), hist.clone()));
+        }
+        Ok(hist)
+    }
+
+    /// `scripthash.listunspent`, reused for [`SCRIPT_CACHE_TTL`].
+    fn unspent(&self, script: &Script) -> Result<Vec<UnspentRes>, WalletError> {
+        let generation = {
+            let cache = self.cache();
+            if let Some(entries) = fresh(cache.unspents.get(script)) {
+                return Ok(entries);
+            }
+            cache.script_generation
+        };
+        let entries = self.call(LIST_UNSPENT, |c| script_list_unspent_signed(c, script))?;
+        let mut cache = self.cache();
+        if cache.script_generation == generation {
+            cache
+                .unspents
+                .insert(script.to_owned(), (Instant::now(), entries.clone()));
+        }
+        Ok(entries)
+    }
+
+    /// The server's tip, asked fresh.
+    fn tip(&self) -> Result<electrum_client::HeaderNotification, WalletError> {
+        let tip = self.call(HEADERS_SUBSCRIBE, |c| c.block_headers_subscribe())?;
+        self.cache()
+            .note_tip(tip.height as u64, tip.header.block_hash());
+        Ok(tip)
+    }
+
+    /// The tip height, reusing a read from the last [`TIP_CACHE_TTL`]. Only
+    /// for confirmation counts; `get_block_count` always asks.
+    fn recent_tip_height(&self) -> Result<u64, WalletError> {
+        if let Some((height, _, at)) = self.cache().tip {
+            if at.elapsed() < TIP_CACHE_TTL {
+                return Ok(height);
+            }
+        }
+        Ok(self.tip()?.height as u64)
+    }
+
+    fn cache(&self) -> std::sync::MutexGuard<'_, Cache> {
+        lock_debug!(self.cache.lock()).unwrap_or_else(|e| e.into_inner())
     }
 
     pub(crate) fn spending_transaction(
@@ -338,7 +569,7 @@ impl Electrum {
                 .any(|input| input.previous_output == *outpoint)
                 .then_some(tx));
         }
-        for entry in self.call(|c| c.script_get_history(script))? {
+        for entry in self.history(script)? {
             let tx = self.transaction_get_validating(&entry.tx_hash)?;
             if tx.input.iter().any(|i| i.previous_output == *outpoint) {
                 return Ok(Some(tx));
@@ -358,7 +589,7 @@ impl Electrum {
         outpoint: &OutPoint,
         script: &Script,
     ) -> Result<Option<Transaction>, WalletError> {
-        for entry in self.call(|c| c.script_get_history(script))? {
+        for entry in self.history(script)? {
             if entry.tx_hash == outpoint.txid || entry.height <= 0 {
                 continue;
             }
@@ -417,6 +648,8 @@ impl Electrum {
                 ..Default::default()
             }),
             shutdown,
+            cache: Mutex::new(Cache::default()),
+            requests: Mutex::new(HashMap::new()),
         })
     }
 
@@ -466,7 +699,7 @@ impl Electrum {
         };
 
         for attempt in 1..=cfg.max_retries {
-            let backoff = retry_backoff(attempt);
+            let backoff = backoff_after(attempt, &last);
             log::warn!(
                 "electrum connect to {} failed ({last:?}); retrying in {}s (attempt {attempt}/{})",
                 cfg.url,
@@ -556,19 +789,20 @@ impl Electrum {
     /// call never reconnects.
     fn call<T>(
         &self,
+        method: &'static str,
         f: impl Fn(&ElectrumClient) -> Result<T, electrum_client::Error>,
     ) -> Result<T, WalletError> {
         if self.shutdown.load(Ordering::Relaxed) {
             return Err(WalletError::Interrupted("Shutdown requested"));
         }
-        let mut last = match self.try_call(&f) {
+        let mut last = match self.try_call(method, &f) {
             Ok(v) => return Ok(v),
             Err(e) if is_terminal(&e) => return Err(e.into()),
             Err(e) => e,
         };
 
         for attempt in 1..=self.config.max_retries {
-            let backoff = retry_backoff(attempt);
+            let backoff = backoff_after(attempt, &last);
             // An idle server dropping the session is routine, so only the first
             // attempt is a warning; the rest are noise until we actually fail.
             let msg = format!(
@@ -601,7 +835,7 @@ impl Electrum {
                 last = e;
                 continue;
             }
-            match self.try_call(&f) {
+            match self.try_call(method, &f) {
                 Ok(v) => return Ok(v),
                 Err(e) if is_terminal(&e) => return Err(e.into()),
                 Err(e) => last = e,
@@ -623,8 +857,15 @@ impl Electrum {
     /// process lifetime with no way for `reconnect_client` to heal it.
     fn try_call<T>(
         &self,
+        method: &'static str,
         f: &impl Fn(&ElectrumClient) -> Result<T, electrum_client::Error>,
     ) -> Result<T, electrum_client::Error> {
+        if method != LOCAL {
+            *lock_debug!(self.requests.lock())
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(method)
+                .or_default() += 1;
+        }
         let client = lock_debug!(self.inner.lock()).unwrap_or_else(|e| e.into_inner());
         f(&client)
     }
@@ -644,7 +885,7 @@ impl Electrum {
     /// Arm the server-side scripthash subscription, treating an existing one as
     /// success. Shared by the initial subscribe and the post-reconnect re-arm.
     fn arm_subscription(&self, spk: &Script) -> Result<(), WalletError> {
-        match self.call(|c| c.script_subscribe(spk).map(|_| ())) {
+        match self.call(SUBSCRIBE, |c| c.script_subscribe(spk).map(|_| ())) {
             Ok(()) => Ok(()),
             Err(WalletError::Electrum(electrum_client::Error::AlreadySubscribed(_))) => Ok(()),
             Err(e) => Err(e),
@@ -675,7 +916,7 @@ impl Electrum {
             }
             // A missing entry is a legitimate "not mined"; a failed read is a
             // server problem and must not be collapsed into that answer.
-            let history = self.call(|c| c.script_get_history(txout.script_pubkey.as_script()))?;
+            let history = self.history(txout.script_pubkey.as_script())?;
             if let Some(entry) = history.iter().find(|e| e.tx_hash == txid) {
                 // `height` is 0 for a mempool tx and -1 for one with unconfirmed
                 // parents; both mean "not mined yet".
@@ -689,7 +930,7 @@ impl Electrum {
     /// for an unconfirmed transaction.
     fn confirmations_at(&self, height: Option<u64>) -> Result<u32, WalletError> {
         let Some(height) = height else { return Ok(0) };
-        let tip = self.get_block_count()?;
+        let tip = self.recent_tip_height()?;
         checked_confirmations(tip, height)
     }
 
@@ -765,6 +1006,20 @@ fn electrum_err(msg: String) -> WalletError {
     WalletError::Electrum(electrum_client::Error::Message(msg))
 }
 
+/// Reject a transaction the server handed back for a txid it does not hash to.
+fn check_txid(tx: &Transaction, txid: &Txid) -> Result<(), WalletError> {
+    if tx.compute_txid() != *txid {
+        return Err(WalletError::Electrum(electrum_client::Error::Protocol(
+            serde_json::Value::String(format!(
+                "Server returned transaction {} for requested {}",
+                tx.compute_txid(),
+                txid
+            )),
+        )));
+    }
+    Ok(())
+}
+
 /// Map a poisoned mutex into a [`WalletError`].
 fn poisoned<T>(_e: T) -> WalletError {
     electrum_err("Electrum: mutex poisoned".into())
@@ -808,7 +1063,7 @@ impl Blockchain for Electrum {
     }
 
     fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResult, WalletError> {
-        let tip = self.call(|c| c.block_headers_subscribe())?;
+        let tip = self.tip()?;
         let best = tip.header.block_hash();
         // Build via serde so we don't have to enumerate every field (some are
         // private or non-`Default` upstream).
@@ -831,16 +1086,27 @@ impl Blockchain for Electrum {
     }
 
     fn get_block_count(&self) -> Result<u64, WalletError> {
-        let tip = self.call(|c| c.block_headers_subscribe())?;
-        Ok(tip.height as u64)
+        Ok(self.tip()?.height as u64)
     }
 
     fn get_block_hash(&self, height: u64) -> Result<BlockHash, WalletError> {
-        Ok(self.call(|c| c.block_header(height as usize))?.block_hash())
+        Ok(self.header_at_height(height)?.block_hash())
     }
 
     fn header_at_height(&self, height: u64) -> Result<Header, WalletError> {
-        self.call(|c| c.block_header(height as usize))
+        if let Some(header) = self.cache().headers.get(&height) {
+            return Ok(*header);
+        }
+        let header = self.call(BLOCK_HEADER, |c| c.block_header(height as usize))?;
+        // Cache deep headers only for the current known tip.
+        let mut cache = self.cache();
+        if cache
+            .tip
+            .is_some_and(|(tip, _, _)| height.saturating_add(HEADER_CACHE_DEPTH) <= tip)
+        {
+            cache.headers.insert(height, header);
+        }
+        Ok(header)
     }
 
     fn tx_block_height(&self, txid: &Txid) -> Result<Option<u64>, WalletError> {
@@ -863,7 +1129,7 @@ impl Blockchain for Electrum {
         // listunspent folds mempool spends in, so a missing output alone is
         // ambiguous. And anyone can deposit to a public contract script, so a
         // confirmed tx only counts if one of its inputs consumes our outpoint.
-        let history = self.call(|c| c.script_get_history(script))?;
+        let history = self.history(script)?;
         for entry in &history {
             if entry.tx_hash == outpoint.txid || entry.height <= 0 {
                 continue;
@@ -879,7 +1145,7 @@ impl Blockchain for Electrum {
     fn script_has_history(&self, script: &Script) -> Result<bool, WalletError> {
         // History keeps spent outputs, so an emptied address still answers here
         // while `listunspent` reports nothing.
-        Ok(!self.call(|c| c.script_get_history(script))?.is_empty())
+        Ok(!self.history(script)?.is_empty())
     }
 
     fn get_raw_transaction(
@@ -899,7 +1165,7 @@ impl Blockchain for Electrum {
         // info, but plenty of servers refuse it. Fetch the plain tx every server
         // serves and derive the rest from its mined height.
         // Only the few fields the wallet actually reads are populated.
-        let tx = self.transaction_get_validating(txid)?;
+        let tx = self.transaction_get_live(txid)?;
         let hex = serialize(&tx).to_lower_hex_string();
         let height = self.mined_height(&tx)?;
         let confirmations = self.confirmations_at(height)?;
@@ -980,7 +1246,7 @@ impl Blockchain for Electrum {
     }
 
     fn is_tx_unknown(&self, txid: &Txid) -> Result<bool, WalletError> {
-        match self.transaction_get_validating(txid) {
+        match self.transaction_get_live(txid) {
             Ok(_) => Ok(false),
             Err(WalletError::Electrum(ref e)) if is_unknown_txid(e) => Ok(true),
             Err(e) => Err(e),
@@ -1011,8 +1277,7 @@ impl Blockchain for Electrum {
         };
 
         // Is this specific outpoint still unspent at its scriptPubKey?
-        let entries =
-            self.call(|c| script_list_unspent_signed(c, txout.script_pubkey.as_script()))?;
+        let entries = self.unspent(txout.script_pubkey.as_script())?;
         let Some(entry) = entries
             .iter()
             .find(|e| e.tx_hash == *txid && e.tx_pos == vout)
@@ -1081,7 +1346,7 @@ impl Blockchain for Electrum {
             };
             // Any queued alert means this script's coins changed.
             loop {
-                match self.try_call(&|c| c.script_pop(spk)) {
+                match self.try_call(LOCAL, &|c| c.script_pop(spk)) {
                     Ok(None) => break,
                     Ok(Some(_)) => *answer = None,
                     // The socket was rebuilt after `connection` was read.
@@ -1095,9 +1360,9 @@ impl Blockchain for Electrum {
         for chunk in unarmed.chunks(LIST_UNSPENT_BATCH) {
             // No hidden retry: a reconnect inside `call` would arm these on a socket
             // newer than `wallet_connection`, and the next sync would be refused them.
-            let statuses = match self
-                .try_call(&|c| c.batch_script_subscribe(chunk.iter().map(ScriptBuf::as_script)))
-            {
+            let statuses = match self.try_call(SUBSCRIBE, &|c| {
+                c.batch_script_subscribe(chunk.iter().map(ScriptBuf::as_script))
+            }) {
                 Ok(statuses) => statuses,
                 Err(e) => {
                     // The client records a subscription before the server confirms it and
@@ -1123,7 +1388,7 @@ impl Blockchain for Electrum {
             .collect();
         let mut watcher_answers = HashMap::new();
         for chunk in stale.chunks(LIST_UNSPENT_BATCH) {
-            let results = self.call(|c| batch_list_unspent_signed(c, chunk))?;
+            let results = self.call(LIST_UNSPENT, |c| batch_list_unspent_signed(c, chunk))?;
             for (spk, entries) in chunk.iter().zip(results) {
                 match state.wallet_scripts.get_mut(spk) {
                     Some(answer) => *answer = Some(entries),
@@ -1194,7 +1459,17 @@ impl Blockchain for Electrum {
     }
 
     fn send_raw_transaction(&self, tx: &Transaction) -> Result<Txid, WalletError> {
-        self.call(|c| c.transaction_broadcast(tx))
+        let sent = self.call(BROADCAST, |c| c.transaction_broadcast(tx));
+        // The spend changes the history of every script it touches, so no
+        // script answer from before it can be reused.
+        let mut cache = self.cache();
+        cache.forget_scripts();
+        if let Ok(txid) = &sent {
+            if *txid == tx.compute_txid() {
+                cache.insert_tx(*txid, tx.clone());
+            }
+        }
+        sent
     }
 
     fn derive_addresses(
@@ -1212,7 +1487,7 @@ impl Blockchain for Electrum {
 
     fn estimate_feerate(&self, priority: FeePriority) -> Result<f64, WalletError> {
         // BTC/kvB. Servers that forward to Core answer -1 when it has no estimate.
-        let per_kvb = self.call(|c| c.estimate_fee(priority as usize))?;
+        let per_kvb = self.call(ESTIMATE_FEE, |c| c.estimate_fee(priority as usize))?;
         if per_kvb <= 0.0 {
             return Err(WalletError::General(format!("no estimate: {per_kvb}")));
         }
@@ -1239,7 +1514,9 @@ impl Blockchain for Electrum {
         let mut heights: HashMap<Txid, i32> = HashMap::new();
         for chunk in watched.chunks(HISTORY_BATCH) {
             let refs: Vec<&Script> = chunk.iter().map(|s| s.as_script()).collect();
-            for entries in self.call(|c| c.batch_script_get_history(refs.iter().copied()))? {
+            for entries in self.call(GET_HISTORY, |c| {
+                c.batch_script_get_history(refs.iter().copied())
+            })? {
                 for e in entries {
                     heights.insert(e.tx_hash, e.height);
                 }
@@ -1258,6 +1535,21 @@ impl Blockchain for Electrum {
             .collect();
         // Core hands back the requested window oldest-first.
         page.reverse();
+
+        // The page's txs, then the txs their inputs spend, each in batched
+        // round-trips; the per-tx reads below are then answered from the cache.
+        let page_txids: Vec<Txid> = page.iter().map(|(txid, _)| *txid).collect();
+        self.prefetch_transactions(&page_txids)?;
+        let prev_txids: Vec<Txid> = {
+            let cache = self.cache();
+            page_txids
+                .iter()
+                .filter_map(|txid| cache.txs.get(txid))
+                .filter(|tx| !tx.is_coinbase())
+                .flat_map(|tx| tx.input.iter().map(|i| i.previous_output.txid))
+                .collect()
+        };
+        self.prefetch_transactions(&prev_txids)?;
 
         let tip = self.get_block_count()?;
         let mut headers: HashMap<u64, Header> = HashMap::new();
@@ -1414,7 +1706,7 @@ impl Blockchain for Electrum {
         }
         // Read the history before the entry exists. An entry left behind by a failed
         // read would make `retry_subscribes` skip the replay this script still needs.
-        let hist = self.call(|c| c.script_get_history(spk))?;
+        let hist = self.call(GET_HISTORY, |c| c.script_get_history(spk))?;
 
         // Backend subscription works. Now record it as seen.
         let sub = state.subscriptions.entry(spk.to_owned()).or_default();
@@ -1513,7 +1805,7 @@ impl Blockchain for Electrum {
             // The rebuilt socket lost the header subscription too; without it
             // `block_headers_pop` stays empty and tip updates silently stop. The
             // reply is the tip, which covers blocks mined while we were deaf.
-            match self.call(|c| c.block_headers_subscribe()) {
+            match self.call(HEADERS_SUBSCRIBE, |c| c.block_headers_subscribe()) {
                 Ok(tip) => state
                     .pending
                     .push_back(WatchEvent::BlockConnected(BlockRef {
@@ -1538,7 +1830,7 @@ impl Blockchain for Electrum {
                 .is_none_or(|at| at.elapsed() >= self.ping_interval);
         if ping_due {
             state.last_ping = Some(std::time::Instant::now());
-            if let Err(e) = self.call(|c| c.ping()) {
+            if let Err(e) = self.call(PING, |c| c.ping()) {
                 // Without the ping the socket is never read and the watcher
                 // goes deaf while looking alive — loud, not a warning.
                 log::error!("electrum notification ping failed: {e:?}");
@@ -1555,7 +1847,7 @@ impl Blockchain for Electrum {
             // ping tick so a broken server isn't hammered.
             let flagged = ping_due && state.dirty.remove(&spk);
             if !flagged {
-                match self.call(|c| c.script_pop(&spk)) {
+                match self.call(LOCAL, |c| c.script_pop(&spk)) {
                     Ok(Some(_)) => {}
                     Ok(None) => continue,
                     // The client has no record of this subscription, so it was
@@ -1570,7 +1862,7 @@ impl Blockchain for Electrum {
                     }
                 }
             }
-            let Ok(hist) = self.call(|c| c.script_get_history(&spk)) else {
+            let Ok(hist) = self.call(GET_HISTORY, |c| c.script_get_history(&spk)) else {
                 state.dirty.insert(spk.clone());
                 continue;
             };
@@ -1609,7 +1901,7 @@ impl Blockchain for Electrum {
         }
 
         // Header tip update.
-        let n = self.call(|c| c.block_headers_pop()).ok().flatten()?;
+        let n = self.call(LOCAL, |c| c.block_headers_pop()).ok().flatten()?;
         let height = n.height as i64;
         let hash = n.header.block_hash();
         if height == state.last_height && state.last_hash == Some(hash) {
@@ -2050,6 +2342,155 @@ mod tests {
         assert!(is_terminal(&Error::NotSubscribed([0u8; 32].into())));
         // A transport-shaped error must stay retryable.
         assert!(!is_terminal(&Error::Message("socket closed".into())));
+    }
+
+    #[test]
+    fn rate_limit_errors_are_retried_after_a_long_wait() {
+        // ElectrumX's wording, and the generic one.
+        let excessive = Error::Protocol(json!({
+            "code": -101,
+            "message": "excessive resource usage"
+        }));
+        let generic = Error::Protocol(json!("Rate limit exceeded"));
+        for e in [&excessive, &generic] {
+            assert!(is_rate_limited(e));
+            assert!(!is_terminal(e));
+            assert_eq!(backoff_after(1, e), RATE_LIMIT_BACKOFF);
+        }
+        // Any other protocol error is still an answer, not a reason to wait.
+        let other = Error::Protocol(json!({ "code": -32600, "message": "bad request" }));
+        assert!(!is_rate_limited(&other));
+        assert!(is_terminal(&other));
+        let transport = Error::Message("socket closed".into());
+        assert_eq!(backoff_after(1, &transport), retry_backoff(1));
+    }
+
+    #[test]
+    fn a_changed_tip_drops_script_answers_and_headers() {
+        let header = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header;
+        let hash = header.block_hash();
+        let replacement = BlockHash::all_zeros();
+        let script = ScriptBuf::new();
+        let mut cache = Cache::default();
+        let fill = |cache: &mut Cache| {
+            cache
+                .histories
+                .insert(script.clone(), (Instant::now(), Vec::new()));
+            cache
+                .unspents
+                .insert(script.clone(), (Instant::now(), Vec::new()));
+            cache.headers.insert(1, header);
+        };
+
+        cache.note_tip(100, hash);
+        fill(&mut cache);
+        // The same tip again leaves every answer in place.
+        cache.note_tip(100, hash);
+        assert!(fresh(cache.histories.get(&script)).is_some());
+        assert!(fresh(cache.unspents.get(&script)).is_some());
+        assert!(cache.headers.contains_key(&1));
+
+        // A same-height replacement is a reorg even though the height held.
+        cache.note_tip(100, replacement);
+        assert!(cache.histories.is_empty() && cache.unspents.is_empty());
+        assert!(cache.headers.is_empty());
+
+        // A new block can also be part of a deeper reorg.
+        fill(&mut cache);
+        cache.note_tip(101, hash);
+        assert!(cache.histories.is_empty() && cache.headers.is_empty());
+
+        fill(&mut cache);
+        cache.note_tip(99, replacement);
+        assert!(cache.histories.is_empty() && cache.headers.is_empty());
+    }
+
+    #[test]
+    fn script_answers_expire() {
+        let stale = (Instant::now() - SCRIPT_CACHE_TTL, vec![1u8]);
+        assert_eq!(fresh(Some(&stale)), None);
+        let recent = (Instant::now(), vec![1u8]);
+        assert_eq!(fresh(Some(&recent)), Some(vec![1u8]));
+    }
+
+    #[test]
+    fn a_full_tx_cache_starts_over() {
+        let mut cache = Cache::default();
+        let tx = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).txdata[0].clone();
+        for i in 0..TX_CACHE_CAP as u64 {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&i.to_le_bytes());
+            cache.insert_tx(Txid::from_byte_array(bytes), tx.clone());
+        }
+        assert_eq!(cache.txs.len(), TX_CACHE_CAP);
+        cache.insert_tx(tx.compute_txid(), tx.clone());
+        assert_eq!(cache.txs.len(), 1);
+    }
+
+    #[test]
+    fn cached_transaction_does_not_hide_server_eviction() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock electrum");
+        let addr = listener.local_addr().unwrap();
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+        let header_hex = serialize_hex(&genesis.header);
+        let tx = genesis.txdata[0].clone();
+        let tx_hex = serialize_hex(&tx);
+        let txid = tx.compute_txid();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept electrum client");
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+
+            let features = read_request(&mut reader);
+            serde_json::to_writer(
+                &mut writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": features["id"],
+                    "error": { "code": -32601, "message": "method not found" }
+                }),
+            )
+            .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer.flush().unwrap();
+            let header = read_request(&mut reader);
+            write_result(&mut writer, &header, json!(header_hex));
+            let subscribe = read_request(&mut reader);
+            write_result(
+                &mut writer,
+                &subscribe,
+                json!({ "height": 0, "hex": header_hex }),
+            );
+
+            let first = read_request(&mut reader);
+            assert_eq!(first["method"], TX_GET);
+            write_result(&mut writer, &first, json!(tx_hex));
+            for _ in 0..2 {
+                let missing = read_request(&mut reader);
+                assert_eq!(missing["method"], TX_GET);
+                serde_json::to_writer(
+                    &mut writer,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": missing["id"],
+                        "error": { "code": -32603, "message": "missing transaction" }
+                    }),
+                )
+                .unwrap();
+                writer.write_all(b"\n").unwrap();
+                writer.flush().unwrap();
+            }
+        });
+
+        let mut config = cfg(&format!("tcp://{addr}"), None);
+        config.max_retries = 0;
+        let backend = Electrum::new(&config).expect("connect to mock electrum");
+        assert_eq!(backend.transaction_get_validating(&txid).unwrap(), tx);
+        assert!(backend.cache().txs.contains_key(&txid));
+        assert!(backend.is_tx_unknown(&txid).unwrap());
+        assert!(backend.get_raw_transaction_info(&txid, None).is_err());
+        server.join().unwrap();
     }
 
     #[test]

@@ -1383,12 +1383,11 @@ fn recover_from_swap(
         }
         Ok(false)
     };
-    let all_outgoing_confirmed_settled = || -> Result<bool, MakerError> {
+    let all_outgoing_confirmed_settled = |chain: &AnyBlockchain| -> Result<bool, MakerError> {
         if outgoing_swapcoins.is_empty() {
             return Ok(false);
         }
 
-        let chain = maker.backend.connect().map_err(MakerError::Wallet)?;
         for outgoing in &outgoing_swapcoins {
             let (outpoint, output) = match outgoing.protocol {
                 ProtocolVersion::Legacy => {
@@ -1511,6 +1510,8 @@ fn recover_from_swap(
     let mut discard_deferred_logged = false;
     let mut last_block = None;
     let mut last_preimages_known = None;
+    // Kept across passes, so each new block does not cost a fresh handshake.
+    let mut held: Option<AnyBlockchain> = None;
     while !maker.is_shutdown() {
         let current_height = match tip() {
             Ok(height) => height,
@@ -1536,9 +1537,23 @@ fn recover_from_swap(
         let completed_candidate = incoming_swapcoins.is_empty() || handover_persisted;
         // A confirmed cooperative or hashlock spend proves the taker claimed the
         // contract. A timelock refund is recovery, not successful settlement.
-        let outgoing_spent = completed_candidate
-            && new_block
-            && match all_outgoing_confirmed_settled() {
+        let outgoing_spent = if completed_candidate && new_block {
+            let result = held
+                .take()
+                .map_or_else(|| maker.backend.connect(), Ok)
+                .map_err(MakerError::Wallet)
+                .and_then(|chain| {
+                    // The watcher reported a new block on a different
+                    // connection. Refresh this backend's tip so its
+                    // script and header caches cannot answer for the old one.
+                    let spent = chain
+                        .get_block_count()
+                        .map_err(MakerError::Wallet)
+                        .and_then(|_| all_outgoing_confirmed_settled(&chain));
+                    held = Some(chain);
+                    spent
+                });
+            match result {
                 Ok(spent) => spent,
                 Err(error) => {
                     log::warn!(
@@ -1549,7 +1564,10 @@ fn recover_from_swap(
                     );
                     false
                 }
-            };
+            }
+        } else {
+            false
+        };
         if outgoing_spent {
             if handover_persisted {
                 if let Err(e) = maker.sweep_incoming_swapcoins(&incoming_swapcoins) {
@@ -1788,28 +1806,29 @@ fn recover_from_swap(
             continue;
         }
 
-        // One connection per pass, shared by both recovery paths below: on Tor
-        // Electrum each fresh connection costs a circuit handshake. Idle passes
-        // that only poll the watchtower pay for none.
-        let chain = if all_preimages_known || current_height >= timelock_expiry {
-            // Nothing respawns this thread, so a failed connection retries.
-            match maker.backend.connect() {
-                Ok(chain) => Some(chain),
-                Err(e) => {
-                    log::warn!(
-                        "[{}] Could not connect for recovery: {:?}; retrying recovery",
-                        maker.config.network_port,
-                        e
-                    );
-                    if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
-                        break;
+        // One connection, shared by both recovery paths below and kept for later
+        // passes: on Tor Electrum each fresh connection costs a circuit handshake.
+        // Idle passes that only poll the watchtower open none.
+        let chain: Option<&AnyBlockchain> =
+            if all_preimages_known || current_height >= timelock_expiry {
+                // Nothing respawns this thread, so a failed connection retries.
+                match held.take().map_or_else(|| maker.backend.connect(), Ok) {
+                    Ok(chain) => Some(held.insert(chain)),
+                    Err(e) => {
+                        log::warn!(
+                            "[{}] Could not connect for recovery: {:?}; retrying recovery",
+                            maker.config.network_port,
+                            e
+                        );
+                        if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
+                            break;
+                        }
+                        continue;
                     }
-                    continue;
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         // A crash between the hashlock sweep and its cleanup leaves no incoming
         // coin to show the preimage, but the next hop's claim on chain still does.
