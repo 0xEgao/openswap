@@ -1535,6 +1535,8 @@ fn recover_from_swap(
                 .iter()
                 .all(|incoming| incoming.other_privkey.is_some());
         let completed_candidate = incoming_swapcoins.is_empty() || handover_persisted;
+        // Whether `held` has read this block's tip, so its caches answer for it.
+        let mut tip_refreshed = false;
         // A confirmed cooperative or hashlock spend proves the taker claimed the
         // contract. A timelock refund is recovery, not successful settlement.
         let outgoing_spent = if completed_candidate && new_block {
@@ -1549,7 +1551,10 @@ fn recover_from_swap(
                     let spent = chain
                         .get_block_count()
                         .map_err(MakerError::Wallet)
-                        .and_then(|_| all_outgoing_confirmed_settled(&chain));
+                        .and_then(|_| {
+                            tip_refreshed = true;
+                            all_outgoing_confirmed_settled(&chain)
+                        });
                     held = Some(chain);
                     spent
                 });
@@ -1812,8 +1817,22 @@ fn recover_from_swap(
         let chain: Option<&AnyBlockchain> =
             if all_preimages_known || current_height >= timelock_expiry {
                 // Nothing respawns this thread, so a failed connection retries.
-                match held.take().map_or_else(|| maker.backend.connect(), Ok) {
-                    Ok(chain) => Some(held.insert(chain)),
+                // A held connection may not have seen this block yet. Read its
+                // tip once so its script and header caches answer for it.
+                let connected = held
+                    .take()
+                    .map_or_else(|| maker.backend.connect(), Ok)
+                    .and_then(|chain| {
+                        let refresh = if new_block && !tip_refreshed {
+                            chain.get_block_count().map(|_| ())
+                        } else {
+                            Ok(())
+                        };
+                        held = Some(chain);
+                        refresh
+                    });
+                match connected {
+                    Ok(()) => held.as_ref(),
                     Err(e) => {
                         log::warn!(
                             "[{}] Could not connect for recovery: {:?}; retrying recovery",

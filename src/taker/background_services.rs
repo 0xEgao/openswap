@@ -103,12 +103,14 @@ impl RecoveryLoop {
                     // watcher hears each block; asking the server is the fallback. It
                     // uses the loop's own connection: a slow server must not hold the
                     // wallet lock.
+                    let mut tip_refreshed = false;
                     let tip = watch_service.tip().or_else(|| {
                         held.take()
                             .map_or_else(|| backend.connect(), Ok)
                             .and_then(|chain| {
                                 let height = chain.get_block_count()?;
                                 held = Some(chain);
+                                tip_refreshed = true;
                                 Ok(height)
                             })
                             .inspect_err(|e| log::warn!("Recovery loop: block height: {:?}", e))
@@ -133,8 +135,12 @@ impl RecoveryLoop {
                     };
                     // The watcher may have observed the new block on a
                     // different connection. Refresh this backend's tip before
-                    // consulting its script and header caches.
-                    if let Err(e) = chain.get_block_count() {
+                    // consulting its script and header caches, unless the
+                    // fallback above just read it on this connection.
+                    if let Err(e) = (!tip_refreshed)
+                        .then(|| chain.get_block_count())
+                        .transpose()
+                    {
                         log::warn!("Recovery loop: block height: {:?}", e);
                         last_tip = None;
                         thread::park_timeout(RECOVERY_LOOP_INTERVAL);

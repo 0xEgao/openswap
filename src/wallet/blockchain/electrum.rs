@@ -536,11 +536,13 @@ impl Electrum {
         Ok(tip)
     }
 
-    /// The tip height, reusing a read from the last [`TIP_CACHE_TTL`]. Only
-    /// for confirmation counts; `get_block_count` always asks.
-    fn recent_tip_height(&self) -> Result<u64, WalletError> {
+    /// The tip height, reusing a read from the last [`TIP_CACHE_TTL`] that
+    /// already reaches `mined`. Only for confirmation counts; `get_block_count`
+    /// always asks. A script answer read after the cached tip can name a newer
+    /// block, so a tip below it is read again.
+    fn recent_tip_height(&self, mined: u64) -> Result<u64, WalletError> {
         if let Some((height, _, at)) = self.cache().tip {
-            if at.elapsed() < TIP_CACHE_TTL {
+            if at.elapsed() < TIP_CACHE_TTL && height >= mined {
                 return Ok(height);
             }
         }
@@ -930,7 +932,7 @@ impl Electrum {
     /// for an unconfirmed transaction.
     fn confirmations_at(&self, height: Option<u64>) -> Result<u32, WalletError> {
         let Some(height) = height else { return Ok(0) };
-        let tip = self.recent_tip_height()?;
+        let tip = self.recent_tip_height(height)?;
         checked_confirmations(tip, height)
     }
 
@@ -1094,15 +1096,21 @@ impl Blockchain for Electrum {
     }
 
     fn header_at_height(&self, height: u64) -> Result<Header, WalletError> {
-        if let Some(header) = self.cache().headers.get(&height) {
-            return Ok(*header);
-        }
+        let generation = {
+            let cache = self.cache();
+            if let Some(header) = cache.headers.get(&height) {
+                return Ok(*header);
+            }
+            cache.script_generation
+        };
         let header = self.call(BLOCK_HEADER, |c| c.block_header(height as usize))?;
-        // Cache deep headers only for the current known tip.
+        // Cache deep headers only for the current known tip. A tip change
+        // during the fetch bumps the generation, and may have been a reorg.
         let mut cache = self.cache();
-        if cache
-            .tip
-            .is_some_and(|(tip, _, _)| height.saturating_add(HEADER_CACHE_DEPTH) <= tip)
+        if cache.script_generation == generation
+            && cache
+                .tip
+                .is_some_and(|(tip, _, _)| height.saturating_add(HEADER_CACHE_DEPTH) <= tip)
         {
             cache.headers.insert(height, header);
         }
@@ -2490,6 +2498,69 @@ mod tests {
         assert!(backend.cache().txs.contains_key(&txid));
         assert!(backend.is_tx_unknown(&txid).unwrap());
         assert!(backend.get_raw_transaction_info(&txid, None).is_err());
+        server.join().unwrap();
+    }
+
+    /// A history read after the cached tip can name the next block. The
+    /// count must then read the tip again, not compare against the old one.
+    #[test]
+    fn a_cached_tip_below_the_mined_height_is_read_again() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock electrum");
+        let addr = listener.local_addr().unwrap();
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+        let header_hex = serialize_hex(&genesis.header);
+        let tx = genesis.txdata[0].clone();
+        let tx_hex = serialize_hex(&tx);
+        let txid = tx.compute_txid();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept electrum client");
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+
+            let features = read_request(&mut reader);
+            serde_json::to_writer(
+                &mut writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": features["id"],
+                    "error": { "code": -32601, "message": "method not found" }
+                }),
+            )
+            .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer.flush().unwrap();
+            let header = read_request(&mut reader);
+            write_result(&mut writer, &header, json!(header_hex));
+            let subscribe = read_request(&mut reader);
+            write_result(
+                &mut writer,
+                &subscribe,
+                json!({ "height": 0, "hex": header_hex }),
+            );
+
+            // Tip H, then a history that already has the tx at H+1.
+            let mut answer = |method: &str, result: Value| {
+                let request = read_request(&mut reader);
+                assert_eq!(request["method"], method);
+                write_result(&mut writer, &request, result);
+            };
+            answer(HEADERS_SUBSCRIBE, json!({ "height": 0, "hex": header_hex }));
+            answer(TX_GET, json!(tx_hex));
+            answer(
+                GET_HISTORY,
+                json!([{ "tx_hash": txid.to_string(), "height": 1 }]),
+            );
+            answer(HEADERS_SUBSCRIBE, json!({ "height": 1, "hex": header_hex }));
+            answer(BLOCK_HEADER, json!(header_hex));
+        });
+
+        let mut config = cfg(&format!("tcp://{addr}"), None);
+        config.max_retries = 0;
+        let backend = Electrum::new(&config).expect("connect to mock electrum");
+        assert_eq!(backend.get_block_count().unwrap(), 0);
+        let info = backend.get_raw_transaction_info(&txid, None).unwrap();
+        assert_eq!(info.confirmations, Some(1));
         server.join().unwrap();
     }
 
