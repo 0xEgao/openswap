@@ -364,7 +364,7 @@ fn discards_only_on_confirmed_spend(world: &mut World, params: SwapParams) {
     // pass while the sweep stays unconfirmed.
     let mark = log_mark(&world);
     let miner = world.bitcoind().client.get_new_address(None, None).unwrap();
-    let _: serde_json::Value = world
+    let block: serde_json::Value = world
         .bitcoind()
         .client
         .call(
@@ -376,6 +376,16 @@ fn discards_only_on_confirmed_spend(world: &mut World, params: SwapParams) {
         )
         .unwrap();
     world.framework().wait_for_electrs_tip();
+    // A pass for the previous tip can still be finishing after `mark`; only
+    // the one at the empty block's height counts.
+    let block_hash: bitcoin::BlockHash = block["hash"].as_str().unwrap().parse().unwrap();
+    let height = world
+        .bitcoind()
+        .client
+        .get_block_header_info(&block_hash)
+        .unwrap()
+        .height;
+    let pass = format!("Recovery loop: contracts still unresolved at height {height},");
     wait_until!(
         Duration::from_secs(60),
         every Duration::from_secs(1),
@@ -383,7 +393,7 @@ fn discards_only_on_confirmed_spend(world: &mut World, params: SwapParams) {
         fs::read_to_string(world.taker_log_path())
             .unwrap_or_default()
             .get(mark as usize..)
-            .is_some_and(|new| new.contains("Recovery loop: contracts still unresolved"))
+            .is_some_and(|new| new.contains(&pass))
     );
     assert!(
         contracts

@@ -12,8 +12,8 @@ use bitcoin::{Amount, OutPoint, ScriptBuf, Witness};
 use bitcoind::bitcoincore_rpc::RpcApi;
 
 use openswap::lightning::{
-    HtlcFunded, LightningBackend, LnEvent, MockLightningBackend, SwapError, SwapOutMaker,
-    SwapOutParams, SwapOutTaker,
+    HtlcFunded, LightningBackend, LnEvent, MockLightningBackend, PaymentOutcome, SwapError,
+    SwapOutMaker, SwapOutParams, SwapOutTaker,
 };
 
 use crate::test_framework::*;
@@ -118,7 +118,7 @@ fn swap_out_refund_path(node: &mut Node) {
 
     let params = test_params();
     let mut taker = SwapOutTaker::new(ln.clone(), params);
-    let mut maker = SwapOutMaker::new(ln);
+    let mut maker = SwapOutMaker::new(ln.clone());
 
     let accept = maker.accept(taker.make_request()).unwrap();
     let spk = taker.on_accept(&accept).unwrap().script_pubkey().unwrap();
@@ -162,14 +162,13 @@ fn swap_out_refund_path(node: &mut Node) {
         err
     );
 
-    // The rejection left the held payment untouched: a real claim still
-    // settles it.
-    let claim_tx = taker
-        .claim_tx(outpoint, funding_output.value, miner_spk(bitcoind))
-        .unwrap();
-    assert_eq!(
-        maker.settle_from_spend(&claim_tx).unwrap(),
-        taker.preimage()
+    // The rejection left the held payment untouched: still pending, neither
+    // settled nor failed back.
+    let outcome = ln.payment_outcome(taker.payment_hash()).unwrap();
+    assert!(
+        matches!(outcome, PaymentOutcome::Pending),
+        "the held payment must stay pending after the refund, got: {:?}",
+        outcome
     );
 }
 

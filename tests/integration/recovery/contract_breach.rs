@@ -53,10 +53,14 @@ enum Ending {
 ///
 /// The last maker completes the contract exchange, then broadcasts its outgoing
 /// contract transactions and closes the connection; each case's ending decides
-/// how the swap settles from there. This is the only scenario driving the
-/// taker's breach detector, so `tor_maker_broadcasts_contract` runs it over Tor too.
-/// Rows with `expect_breach_detection` wait for the detector to flag the
-/// contract tx, so a dead detector fails them.
+/// how the swap settles from there. `tor_maker_broadcasts_contract` runs it over
+/// Tor and asserts the same balances.
+///
+/// The taker's breach detector cannot see this breach: it watches only the
+/// taker's own funding, and the faulty maker is the last hop. It fires on the
+/// taker's own recovery broadcast instead, so only
+/// `breach_detected_after_watcher_exit` waits for it, to show the direct-query
+/// fallback still runs once the watcher is gone.
 #[world_test(
     makers = behaviors.len(),
     maker_behaviors = behaviors,
@@ -69,7 +73,7 @@ enum Ending {
                 MakerBehavior::BroadcastContractAfterSetup,
             ],
             taker_behavior = TakerBehavior::Normal,
-            expect_breach_detection = true,
+            expect_direct_breach_detection = false,
             ending = Ending::FaultyReturns,
         ),
         breach_detected_after_watcher_exit(
@@ -79,7 +83,7 @@ enum Ending {
                 MakerBehavior::BroadcastContractAfterSetup,
             ],
             taker_behavior = TakerBehavior::StopWatcherAfterSentinels,
-            expect_breach_detection = true,
+            expect_direct_breach_detection = true,
             ending = Ending::FaultyReturns,
         ),
         /// Maker[1] never returns. The taker refunds its outgoing only after proving
@@ -91,7 +95,7 @@ enum Ending {
                 MakerBehavior::BroadcastContractAfterSetup,
             ],
             taker_behavior = TakerBehavior::Normal,
-            expect_breach_detection = false,
+            expect_direct_breach_detection = false,
             ending = Ending::FaultyGone,
         ),
         /// Maker[0] sleeps past the taker's timelock. The taker holds its refund, so
@@ -103,7 +107,7 @@ enum Ending {
                 MakerBehavior::BroadcastContractAfterSetup,
             ],
             taker_behavior = TakerBehavior::Normal,
-            expect_breach_detection = false,
+            expect_direct_breach_detection = false,
             ending = Ending::FirstMakerLate,
         ),
         /// Three makers, and the middle one dies after the last one claims from it.
@@ -116,10 +120,10 @@ enum Ending {
                 MakerBehavior::BroadcastContractAfterSetup,
             ],
             taker_behavior = TakerBehavior::Normal,
-            expect_breach_detection = false,
+            expect_direct_breach_detection = false,
             ending = Ending::MiddleMakerDies,
         ),
-        /// Malicious contract broadcast over Tor, exercising the taker's breach detector.
+        /// Malicious contract broadcast over Tor.
         #[ignore = "requires a bootstrapped tor and OPENSWAP_TOR_IT=1"]
         tor_maker_broadcasts_contract(
             backend = TorElectrumBackend,
@@ -129,14 +133,14 @@ enum Ending {
                 MakerBehavior::BroadcastContractAfterSetup,
             ],
             taker_behavior = TakerBehavior::Normal,
-            expect_breach_detection = true,
+            expect_direct_breach_detection = false,
             ending = Ending::FaultyReturns,
         ),
     ],
 )]
 fn run_contract_breach<B: TestBackend>(
     world: &mut World,
-    expect_breach_detection: bool,
+    expect_direct_breach_detection: bool,
     ending: Ending,
 ) {
     let maker_count = world.makers().len();
@@ -184,7 +188,7 @@ fn run_contract_breach<B: TestBackend>(
         "Swap should fail due to maker BroadcastContractAfterSetup behavior"
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    if expect_breach_detection {
+    if expect_direct_breach_detection {
         wait_for_log(
             &world.taker_log_path(),
             "Breach detector: contract tx",

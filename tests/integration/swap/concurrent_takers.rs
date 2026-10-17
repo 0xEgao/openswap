@@ -185,7 +185,8 @@ fn concurrent_takers(
     );
 
     // With limited liquidity, we expect one to succeed and one to fail.
-    // Both are admitted; the loser's maker runs out of coins at funding.
+    // Usually both are admitted and the loser's maker runs out of coins at
+    // funding; under load the loser can instead be refused at prepare.
     assert_eq!(success_count, 1, "Exactly one taker should succeed");
     assert_log!(world; { has "InsufficientLiquidity" });
     assert_eq!(
