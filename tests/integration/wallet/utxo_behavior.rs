@@ -746,6 +746,9 @@ fn run_degraded_split_swap(world: &mut World, protocol: ProtocolVersion, params:
     let taker_balance = world.taker().balances();
     info!("Degraded-split taker balance: {:?}", taker_balance);
 
+    // The makers sweep their incoming coins after the taker returns; shutting
+    // down first could abort those sweeps and starve the wait below.
+    world.wait_makers_settled(Duration::from_secs(120));
     world.shutdown_makers();
     if protocol == ProtocolVersion::Legacy {
         // Legacy also reports the message shape: 3 incoming, 1 outgoing.
