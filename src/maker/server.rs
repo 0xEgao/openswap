@@ -47,6 +47,13 @@ const MAX_PENDING_CONNECTIONS: usize = MAX_CONCURRENT_SWAPS;
 /// A burst lets all 30 swaps reconnect together; sustained churn stays bounded.
 const CONNECTIONS_PER_SECOND: f64 = 4.0;
 const CONNECTION_BURST: f64 = MAX_CONCURRENT_SWAPS as f64;
+// Keeping the unfunded cap full must cost a peer the whole connection rate
+// budget; below that, it refuses every taker more cheaply than a flood.
+#[cfg(not(feature = "integration-test"))]
+const _: () = assert!(
+    super::handlers::MAX_UNFUNDED_ADMISSIONS as f64
+        >= IDLE_CONNECTION_TIMEOUT.as_secs() as f64 * CONNECTIONS_PER_SECOND
+);
 /// Tor has already established the TCP stream, so protocol identification
 /// should finish well inside this deadline.
 const PENDING_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
@@ -2207,17 +2214,7 @@ pub fn bind_port_retry(port: u16) -> Result<(TcpListener, u16), MakerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::maker::handlers::MAX_UNFUNDED_ADMISSIONS;
     use std::io::Write;
-
-    /// Keeping the unfunded cap full must cost a peer the whole connection
-    /// rate budget. Below that, it refuses every taker more cheaply than a
-    /// connection flood.
-    #[test]
-    fn unfunded_cap_costs_the_connection_rate_budget() {
-        let admissions_kept_alive = IDLE_CONNECTION_TIMEOUT.as_secs_f64() * CONNECTIONS_PER_SECOND;
-        assert!(MAX_UNFUNDED_ADMISSIONS as f64 >= admissions_kept_alive);
-    }
 
     /// A fresh maker must get the default port when it is free.
     #[test]

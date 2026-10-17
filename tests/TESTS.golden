@@ -2,6 +2,10 @@ openswap blocklist::tests::add_rejects_all_entries_when_any_address_is_invalid
 openswap blocklist::tests::add_update_remove_round_trip
 openswap blocklist::tests::concurrent_adds_preserve_every_entry
 openswap blocklist::tests::malformed_file_returns_error_instead_of_empty_blocklist
+openswap maker::api::admission_cap_tests::claimed_txids_stay_unfunded_and_completed_swaps_are_not_counted
+openswap maker::api::admission_cap_tests::funded_swaps_fill_the_funded_cap
+openswap maker::api::admission_cap_tests::unfunded_admissions_do_not_fill_the_funded_cap
+openswap maker::api::admission_cap_tests::unfunded_admissions_have_their_own_cap
 openswap maker::api::lightning_config_tests::lightning_settings_absent_by_default
 openswap maker::api::lightning_config_tests::lightning_settings_round_trip_through_the_config_file
 openswap maker::api::tests::advertised_min_swap_is_the_smallest_passing_round_amount
@@ -416,9 +420,9 @@ openswap::integration rejection::admission::maker_rejects_wrong_taproot_incoming
 openswap::integration rejection::admission::one_utxo_taker_completes_degraded_swap
 openswap::integration rejection::admission::readmission_with_a_new_shape_fails_before_funding
 openswap::integration rejection::admission::stale_hop0_plan_fails_safely_and_a_fresh_prepare_recovers
-openswap::integration rejection::admission::swap_cap_rejects_before_planning
 openswap::integration rejection::admission::taker_degrades_split_count_when_netting_breaks_the_floor
 openswap::integration rejection::admission::taker_rejects_out_of_bounds_params_at_prepare
+openswap::integration rejection::admission::unfunded_cap_rejects_before_planning
 openswap::integration rejection::bans::an_unpriceable_offer_sidelines_without_banning
 openswap::integration rejection::bans::wrong_handover_key_bans_the_last_maker
 openswap::integration rejection::bans::wrong_hashlock_key_bans_its_builder
