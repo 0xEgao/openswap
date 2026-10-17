@@ -2207,7 +2207,17 @@ pub fn bind_port_retry(port: u16) -> Result<(TcpListener, u16), MakerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::maker::handlers::MAX_UNFUNDED_ADMISSIONS;
     use std::io::Write;
+
+    /// Keeping the unfunded cap full must cost a peer the whole connection
+    /// rate budget. Below that, it refuses every taker more cheaply than a
+    /// connection flood.
+    #[test]
+    fn unfunded_cap_costs_the_connection_rate_budget() {
+        let admissions_kept_alive = IDLE_CONNECTION_TIMEOUT.as_secs_f64() * CONNECTIONS_PER_SECOND;
+        assert!(MAX_UNFUNDED_ADMISSIONS as f64 >= admissions_kept_alive);
+    }
 
     /// A fresh maker must get the default port when it is free.
     #[test]

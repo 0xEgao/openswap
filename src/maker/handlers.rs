@@ -162,10 +162,20 @@ pub enum MakerBehavior {
 /// Minimum time required to react to contract broadcasts (in blocks).
 pub const MIN_CONTRACT_REACTION_TIME: u16 = 10;
 
-/// Each admitted swap pins a connection thread and liquidity until it settles
-/// or times out. Past this cap, reject new SwapDetails instead of stacking
-/// unfunded admissions.
+/// A swap that holds funding pins liquidity and connection threads until it
+/// settles or times out. Past this cap, reject new SwapDetails. Swaps already
+/// admitted still fund past it: refusing them then would strand a taker that
+/// has funded the route.
 pub(crate) const MAX_CONCURRENT_SWAPS: usize = 30;
+
+/// Admissions without funding, counted apart from funded swaps. They reserve
+/// nothing and cannot be told apart from a later hop waiting on upstream
+/// funding, so a small cap would let a peer refuse every taker for free by
+/// keeping unfunded admissions alive. Holding this many needs about one
+/// keepalive connection per admission per idle timeout, so filling it uses
+/// the whole connection rate budget (900s at 4/s). A peer can do that
+/// already by flooding connections.
+pub(crate) const MAX_UNFUNDED_ADMISSIONS: usize = 3600;
 
 /// The taker's declared offset is also its claimed reaction window. Too small a
 /// value means neither side can act on the contract.
