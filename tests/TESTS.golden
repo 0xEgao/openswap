@@ -22,6 +22,7 @@ openswap maker::handlers::tests::legacy_refund_deadline_counts_from_funding_conf
 openswap maker::handlers::tests::legacy_without_funding_confirmation_has_no_deadline
 openswap maker::handlers::tests::mismatched_swap_id_is_rejected
 openswap maker::handlers::tests::offset_below_reaction_time_is_rejected
+openswap maker::handlers::tests::swap_id_must_be_16_hex_characters
 openswap maker::handlers::tests::taproot_refund_deadline_is_exact_at_the_boundary
 openswap maker::legacy_verification::tests::locktime_that_overflows_the_refund_step_is_rejected
 openswap maker::legacy_verification::tests::normal_locktime_is_accepted
@@ -417,6 +418,7 @@ openswap::integration rejection::admission::maker_rejects_out_of_bounds_swap_det
 openswap::integration rejection::admission::maker_rejects_taproot_contract_below_floor
 openswap::integration rejection::admission::maker_rejects_underdelivered_taproot_amount
 openswap::integration rejection::admission::maker_rejects_wrong_taproot_incoming_count
+openswap::integration rejection::admission::malformed_swap_id_is_refused_and_not_held
 openswap::integration rejection::admission::one_utxo_taker_completes_degraded_swap
 openswap::integration rejection::admission::readmission_with_a_new_shape_fails_before_funding
 openswap::integration rejection::admission::stale_hop0_plan_fails_safely_and_a_fresh_prepare_recovers

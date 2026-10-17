@@ -1722,6 +1722,14 @@ impl MakerServer {
             .is_empty())
     }
 
+    /// Whether `swap_id` is held in this maker's live swaps.
+    #[cfg(feature = "integration-test")]
+    pub fn has_ongoing_swap(&self, swap_id: &str) -> Result<bool, MakerError> {
+        Ok(lock_debug!(self.ongoing_swaps.lock())
+            .map_err(|_| MakerError::MutexPossion)?
+            .contains_key(swap_id))
+    }
+
     /// Outpoints this maker still holds reserved for in-flight swaps.
     #[cfg(feature = "integration-test")]
     pub fn reserved_inputs(&self) -> Result<usize, MakerError> {
