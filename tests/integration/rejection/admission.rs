@@ -743,22 +743,22 @@ fn run_maker_rejects_forged_swap_details_at_admission(world: &mut World) {
     });
 }
 
-/// The concurrency cap rejects before any admission planning runs: the
-/// 31st admission is refused at the cap, and the absence of a planner
-/// "cannot fund" log proves the order.
+/// Unfunded admissions are capped apart from funded swaps: they run past the
+/// funded cap of 30, and the unfunded cap rejects before any planning runs,
+/// which the absence of a planner "cannot fund" log proves.
 #[world_test(
     backend = BitcoindBackend,
     maker_behaviors = [Normal],
     takers = [Normal],
     setup = [
         fund_taker_default(1),
-        // 31 UTXOs: the fidelity bond consumes one net (two inputs, one change
-        // back), leaving exactly 30 — one per admission's single-input plan.
-        fund_makers(31, Amount::from_btc(0.05).unwrap(), AddressType::P2TR),
+        // 33 UTXOs: the fidelity bond consumes one net (two inputs, one change
+        // back), leaving exactly 32 — one per admission's single-input plan.
+        fund_makers(33, Amount::from_btc(0.05).unwrap(), AddressType::P2TR),
         spawn_ready_makers_and_mine(),
     ],
 )]
-fn swap_cap_rejects_before_planning(world: &mut World) {
+fn unfunded_cap_rejects_before_planning(world: &mut World) {
     let maker_addr = world.makers()[0].address();
 
     let _summary = world
@@ -777,8 +777,10 @@ fn swap_cap_rejects_before_planning(world: &mut World) {
         .test_current_swap_details(0)
         .expect("the negotiated SwapDetails rebuild");
 
-    // Admissions 2..=30: the negotiated terms under fresh ids.
-    for n in 1..30u64 {
+    // Admissions 2..=32: the negotiated terms under fresh ids. Those past the
+    // 30th prove unfunded admissions do not fill the funded cap, at both the
+    // early check and the re-check under the inserting guard.
+    for n in 1..32u64 {
         let mut details = template.clone();
         details.id = format!("{:016x}", n);
         match world
@@ -790,7 +792,7 @@ fn swap_cap_rejects_before_planning(world: &mut World) {
             openswap::protocol::common_messages::MakerToTakerMessage::AckSwapDetails(ack) => {
                 assert!(
                     ack.tweakable_point.is_some(),
-                    "admission {} must be accepted below the cap",
+                    "admission {} must be accepted below the unfunded cap",
                     n + 1
                 );
             }
@@ -798,9 +800,9 @@ fn swap_cap_rejects_before_planning(world: &mut World) {
         }
     }
 
-    // The 31st swap is refused at the cap.
+    // The 33rd admission is refused at the unfunded cap.
     let mut details = template.clone();
-    details.id = format!("{:016x}", 30u64);
+    details.id = format!("{:016x}", 32u64);
     match world
         .taker()
         .inner()
@@ -810,17 +812,91 @@ fn swap_cap_rejects_before_planning(world: &mut World) {
         openswap::protocol::common_messages::MakerToTakerMessage::AckSwapDetails(ack) => {
             assert!(
                 ack.tweakable_point.is_none(),
-                "the 31st admission must be rejected at the cap"
+                "the 33rd admission must be rejected at the unfunded cap"
             );
         }
         other => panic!("the capped admission got unexpected response: {:?}", other),
     }
 
     assert_log!(world; {
-        has "30 active swaps at the 30 cap",
+        has "0 funded (cap 30), 32 unfunded (cap 32)",
         // The cap must fire before the planner runs.
         lacks "Rejecting swap at admission",
     });
+}
+
+/// A swap id that is not 16 hex characters is refused at admission and never
+/// held: each live id stays resident for the idle window, so an oversized one
+/// would pin memory without funding anything.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    setup = [fund_taker_default(1), fund_makers_default(), spawn_ready_makers_and_mine()],
+)]
+fn malformed_swap_id_is_refused_and_not_held(world: &mut World) {
+    let maker_addr = world.makers()[0].address();
+
+    world
+        .taker_mut()
+        .prepare(
+            SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
+                .with_tx_count(1)
+                .with_required_confirms(1)
+                .with_preferred_makers(vec![maker_addr.clone()]),
+        )
+        .expect("an honest admission must succeed");
+    let template = world
+        .taker()
+        .inner()
+        .test_current_swap_details(0)
+        .expect("the negotiated SwapDetails rebuild");
+    assert!(world.makers()[0]
+        .inner()
+        .has_ongoing_swap(&template.id)
+        .unwrap());
+
+    let log_path = world.taker_log_path();
+    for id in [
+        "a".repeat(64 * 1024),
+        "0123456789abcdef0".to_string(),
+        "0123456789abcde".to_string(),
+        "0123456789abcdeg".to_string(),
+    ] {
+        let offset = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+        let mut details = template.clone();
+        details.id = id.clone();
+        match world
+            .taker()
+            .inner()
+            .test_send_swap_details(&maker_addr, &details)
+            .expect("the malformed admission must still get an answer")
+        {
+            openswap::protocol::common_messages::MakerToTakerMessage::AckSwapDetails(ack) => {
+                assert!(
+                    ack.tweakable_point.is_none(),
+                    "a {}-byte swap id must be rejected",
+                    id.len()
+                );
+            }
+            other => panic!(
+                "the malformed admission got unexpected response: {:?}",
+                other
+            ),
+        }
+        wait_for_log_after(
+            &log_path,
+            offset,
+            &format!("swap id is not 16 hex characters ({} bytes)", id.len()),
+            1,
+            Duration::from_secs(60),
+        );
+        assert!(
+            !world.makers()[0].inner().has_ongoing_swap(&id).unwrap(),
+            "a rejected {}-byte swap id must not be held",
+            id.len()
+        );
+    }
 }
 
 /// A maker that re-admits a drained swap with a different plan shape fails

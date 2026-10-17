@@ -51,7 +51,7 @@ use super::{
     error::MakerError,
     handlers::{
         past_refund_deadline, ConnectionState, FundingGuard, Maker as MakerTrait, MakerConfig,
-        SwapPhase, MAX_CONCURRENT_SWAPS, MIN_CONTRACT_REACTION_TIME,
+        SwapPhase, MAX_CONCURRENT_SWAPS, MAX_UNFUNDED_ADMISSIONS, MIN_CONTRACT_REACTION_TIME,
     },
     rpc::server::MakerRpc,
     swap_tracker::{now_secs, MakerRecoveryPhase, MakerSwapPhase, MakerSwapTracker},
@@ -252,6 +252,19 @@ impl Default for SwapState {
             swap_start_time: Instant::now(),
             funding_confirmation_height: None,
         }
+    }
+}
+
+impl SwapState {
+    /// No funding exists on either side yet, so the swap holds no coins and
+    /// nothing on-chain. Claimed incoming txids are not funding: they are
+    /// named before the confirmation wait and may never confirm.
+    fn is_unfunded(&self) -> bool {
+        self.phase == SwapPhase::AwaitingContractData
+            && self.incoming_swapcoins.is_empty()
+            && self.outgoing_swapcoins.is_empty()
+            && self.pending_funding_txes.is_empty()
+            && self.funding_broadcast_txids.is_empty()
     }
 }
 
@@ -1597,17 +1610,8 @@ impl MakerServer {
         // is dropped without recovery.
         let unfunded_ids: Vec<String> = swaps
             .iter()
-            .filter_map(|(id, state)| {
-                let unfunded = state.phase == SwapPhase::AwaitingContractData
-                    && state.incoming_swapcoins.is_empty()
-                    && state.outgoing_swapcoins.is_empty()
-                    && state.pending_funding_txes.is_empty()
-                    && state.funding_broadcast_txids.is_empty();
-                if !unfunded {
-                    return None;
-                }
-                (state.last_activity.elapsed() > timeout).then(|| id.clone())
-            })
+            .filter(|(_, state)| state.is_unfunded() && state.last_activity.elapsed() > timeout)
+            .map(|(id, _)| id.clone())
             .collect();
         for id in &unfunded_ids {
             swaps.remove(id);
@@ -1736,6 +1740,14 @@ impl MakerServer {
         Ok(!lock_debug!(self.ongoing_swaps.lock())
             .map_err(|_| MakerError::MutexPossion)?
             .is_empty())
+    }
+
+    /// Whether `swap_id` is held in this maker's live swaps.
+    #[cfg(feature = "integration-test")]
+    pub fn has_ongoing_swap(&self, swap_id: &str) -> Result<bool, MakerError> {
+        Ok(lock_debug!(self.ongoing_swaps.lock())
+            .map_err(|_| MakerError::MutexPossion)?
+            .contains_key(swap_id))
     }
 
     /// Outpoints this maker still holds reserved for in-flight swaps.
@@ -2153,6 +2165,40 @@ impl MakerServer {
             max_swap_in: capacity.max_swap_in,
             max_swap_out: capacity.max_swap_out,
         })
+    }
+}
+
+/// Live swaps split by whether they hold funding, each with its own cap.
+/// Funded swaps cost a peer coins on-chain; unfunded admissions cost nothing,
+/// so they must not be able to fill the funded swaps' cap.
+struct LiveSwapCounts {
+    funded: usize,
+    unfunded: usize,
+}
+
+impl LiveSwapCounts {
+    fn of(swaps: &HashMap<String, SwapState>) -> Self {
+        let mut counts = LiveSwapCounts {
+            funded: 0,
+            unfunded: 0,
+        };
+        for state in swaps.values() {
+            if state.phase == SwapPhase::Completed {
+                continue;
+            }
+            if state.is_unfunded() {
+                counts.unfunded += 1;
+            } else {
+                counts.funded += 1;
+            }
+        }
+        counts
+    }
+
+    /// A new admission starts unfunded and will fund later, so it needs room
+    /// under both caps.
+    fn at_cap(&self) -> bool {
+        self.funded >= MAX_CONCURRENT_SWAPS || self.unfunded >= MAX_UNFUNDED_ADMISSIONS
     }
 }
 
@@ -2777,17 +2823,16 @@ impl MakerTrait for MakerServer {
                     );
                     return Err(MakerError::General("Swap id belongs to an unfinished swap"));
                 }
-                let active_swaps = lock_debug!(self.ongoing_swaps.lock())?
-                    .values()
-                    .filter(|state| state.phase != SwapPhase::Completed)
-                    .count();
-                if active_swaps >= MAX_CONCURRENT_SWAPS {
+                let counts = LiveSwapCounts::of(&*lock_debug!(self.ongoing_swaps.lock())?);
+                if counts.at_cap() {
                     log::warn!(
-                        "[{}] Rejecting swap {}: {} active swaps at the {} cap",
+                        "[{}] Rejecting swap {}: {} funded (cap {}), {} unfunded (cap {})",
                         self.config.network_port,
                         swap_id,
-                        active_swaps,
-                        MAX_CONCURRENT_SWAPS
+                        counts.funded,
+                        MAX_CONCURRENT_SWAPS,
+                        counts.unfunded,
+                        MAX_UNFUNDED_ADMISSIONS,
                     );
                     return Err(MakerError::TooManySwaps);
                 }
@@ -2832,19 +2877,12 @@ impl MakerTrait for MakerServer {
         // The cap read before planning is only a cheap early reject: planning
         // runs unlocked, so racing admissions with distinct ids can all clear
         // it. Only a re-check under the guard that inserts actually binds.
-        if planned.is_some()
-            && swaps
-                .values()
-                .filter(|state| state.phase != SwapPhase::Completed)
-                .count()
-                >= MAX_CONCURRENT_SWAPS
-        {
+        if planned.is_some() && LiveSwapCounts::of(&swaps).at_cap() {
             drop(swaps);
             log::warn!(
-                "[{}] Rejecting swap {}: the {} cap filled while we planned",
+                "[{}] Rejecting swap {}: a swap cap filled while we planned",
                 self.config.network_port,
                 swap_id,
-                MAX_CONCURRENT_SWAPS,
             );
             return Err(MakerError::TooManySwaps);
         }
@@ -4241,6 +4279,79 @@ mod tests {
             .unwrap()
             .unwrap();
         joiner.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod admission_cap_tests {
+    use super::{
+        LiveSwapCounts, SwapPhase, SwapState, MAX_CONCURRENT_SWAPS, MAX_UNFUNDED_ADMISSIONS,
+    };
+    use bitcoin::{hashes::Hash, Txid};
+    use std::collections::HashMap;
+
+    fn admitted() -> SwapState {
+        SwapState {
+            phase: SwapPhase::AwaitingContractData,
+            ..Default::default()
+        }
+    }
+
+    fn funded() -> SwapState {
+        SwapState {
+            funding_broadcast_txids: vec![Txid::all_zeros()],
+            ..admitted()
+        }
+    }
+
+    fn swaps(states: impl IntoIterator<Item = SwapState>) -> HashMap<String, SwapState> {
+        states
+            .into_iter()
+            .enumerate()
+            .map(|(i, state)| (i.to_string(), state))
+            .collect()
+    }
+
+    /// The attack: a peer keeps unfunded admissions alive with keepalives.
+    /// Filling the funded cap that way must leave room for a real taker.
+    #[test]
+    fn unfunded_admissions_do_not_fill_the_funded_cap() {
+        let counts = LiveSwapCounts::of(&swaps((0..MAX_CONCURRENT_SWAPS).map(|_| admitted())));
+        assert_eq!(counts.unfunded, MAX_CONCURRENT_SWAPS);
+        assert_eq!(counts.funded, 0);
+        assert!(!counts.at_cap());
+    }
+
+    #[test]
+    fn funded_swaps_fill_the_funded_cap() {
+        let counts = LiveSwapCounts::of(&swaps((0..MAX_CONCURRENT_SWAPS).map(|_| funded())));
+        assert!(counts.at_cap());
+        let counts = LiveSwapCounts::of(&swaps((0..MAX_CONCURRENT_SWAPS - 1).map(|_| funded())));
+        assert!(!counts.at_cap());
+    }
+
+    #[test]
+    fn unfunded_admissions_have_their_own_cap() {
+        let counts = LiveSwapCounts::of(&swaps((0..MAX_UNFUNDED_ADMISSIONS).map(|_| admitted())));
+        assert!(counts.at_cap());
+    }
+
+    /// Claimed txids are named before the confirmation wait and cost nothing
+    /// until they confirm, so they must not move a swap into the funded count.
+    /// A completed swap counts toward neither cap.
+    #[test]
+    fn claimed_txids_stay_unfunded_and_completed_swaps_are_not_counted() {
+        let claimed = SwapState {
+            claimed_incoming_txids: vec![Txid::all_zeros()],
+            ..admitted()
+        };
+        let completed = SwapState {
+            phase: SwapPhase::Completed,
+            ..funded()
+        };
+        let counts = LiveSwapCounts::of(&swaps([claimed, completed]));
+        assert_eq!(counts.unfunded, 1);
+        assert_eq!(counts.funded, 0);
     }
 }
 

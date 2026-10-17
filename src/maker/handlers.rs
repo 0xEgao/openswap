@@ -162,10 +162,26 @@ pub enum MakerBehavior {
 /// Minimum time required to react to contract broadcasts (in blocks).
 pub const MIN_CONTRACT_REACTION_TIME: u16 = 10;
 
-/// Each admitted swap pins a connection thread and liquidity until it settles
-/// or times out. Past this cap, reject new SwapDetails instead of stacking
-/// unfunded admissions.
+/// A funded swap pins liquidity and connection threads until it settles or
+/// times out. Past this cap, reject new SwapDetails; admitted swaps still fund
+/// past it, so a taker that funded the route is never stranded.
 pub(crate) const MAX_CONCURRENT_SWAPS: usize = 30;
+
+/// Unfunded admissions reserve nothing, so they get their own cap. Keeping it
+/// full takes the whole connection rate budget (900s at 4/s), which a peer
+/// could spend on a connection flood anyway.
+#[cfg(not(feature = "integration-test"))]
+pub(crate) const MAX_UNFUNDED_ADMISSIONS: usize = 3600;
+/// Lowered so a test can reach it, while staying above the funded cap.
+#[cfg(feature = "integration-test")]
+pub(crate) const MAX_UNFUNDED_ADMISSIONS: usize = MAX_CONCURRENT_SWAPS + 2;
+
+/// Swap ids are 8 random bytes in hex, as the taker generates them. Any other
+/// id is refused before it is logged or stored: each resident id is held for
+/// the idle window, and the frame limit alone would allow megabytes per id.
+pub(crate) fn is_valid_swap_id(id: &str) -> bool {
+    id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
 
 /// The taker's declared offset is also its claimed reaction window. Too small a
 /// value means neither side can act on the contract.
@@ -1157,6 +1173,17 @@ fn handle_swap_details<M: Maker>(
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
     state.expect_phase(&[SwapPhase::AwaitingSwapDetails])?;
 
+    if !is_valid_swap_id(&details.id) {
+        log::warn!(
+            "[{}] Rejecting SwapDetails: swap id is not 16 hex characters ({} bytes)",
+            Maker::network_port(maker.as_ref()),
+            details.id.len()
+        );
+        return Ok(Some(MakerToTakerMessage::AckSwapDetails(
+            AckSwapDetails::reject(),
+        )));
+    }
+
     #[cfg(feature = "integration-test")]
     if maker.behavior() == MakerBehavior::RefuseSwapDetails {
         log::warn!(
@@ -1446,6 +1473,19 @@ mod tests {
         assert!(!offset_meets_reaction_time(MIN_CONTRACT_REACTION_TIME - 1));
         assert!(offset_meets_reaction_time(MIN_CONTRACT_REACTION_TIME));
         assert!(offset_meets_reaction_time(500));
+    }
+
+    #[test]
+    fn swap_id_must_be_16_hex_characters() {
+        assert!(is_valid_swap_id(&format!("{:016x}", u64::MAX)));
+        assert!(is_valid_swap_id("00000000000000ab"));
+        assert!(!is_valid_swap_id(""));
+        assert!(!is_valid_swap_id("0123456789abcde"));
+        assert!(!is_valid_swap_id("0123456789abcdef0"));
+        assert!(!is_valid_swap_id("0123456789abcdeg"));
+        assert!(!is_valid_swap_id(&"a".repeat(1 << 20)));
+        // Sixteen bytes, but not sixteen hex characters.
+        assert!(!is_valid_swap_id("0123456789abcdé"));
     }
 
     #[test]

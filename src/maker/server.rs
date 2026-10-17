@@ -47,6 +47,13 @@ const MAX_PENDING_CONNECTIONS: usize = MAX_CONCURRENT_SWAPS;
 /// A burst lets all 30 swaps reconnect together; sustained churn stays bounded.
 const CONNECTIONS_PER_SECOND: f64 = 4.0;
 const CONNECTION_BURST: f64 = MAX_CONCURRENT_SWAPS as f64;
+// Keeping the unfunded cap full must cost a peer the whole connection rate
+// budget; below that, it refuses every taker more cheaply than a flood.
+#[cfg(not(feature = "integration-test"))]
+const _: () = assert!(
+    super::handlers::MAX_UNFUNDED_ADMISSIONS as f64
+        >= IDLE_CONNECTION_TIMEOUT.as_secs() as f64 * CONNECTIONS_PER_SECOND
+);
 /// Tor has already established the TCP stream, so protocol identification
 /// should finish well inside this deadline.
 const PENDING_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
