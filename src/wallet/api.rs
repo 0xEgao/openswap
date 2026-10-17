@@ -6,6 +6,7 @@
 use std::{
     cmp::max,
     fmt::Display,
+    io::{self, IsTerminal},
     path::PathBuf,
     str::FromStr,
     thread,
@@ -34,16 +35,16 @@ use bitcoind::bitcoincore_rpc::bitcoincore_rpc_json::{ListUnspentResultEntry, Sc
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::{
     lock_debug,
     protocol::{contract::create_multisig_redeemscript, ProtocolVersion},
     utill::{
         capped_fee, compute_checksum, fee_at_rate_sats, generate_keypair,
-        get_hd_path_from_descriptor, now_secs, redeemscript_to_scriptpubkey, HEART_BEAT_INTERVAL,
-        LEGACY_CONTRACT_SPEND_VSIZE, MIN_RELAY_FEE_RATE, TAPROOT_KEYPATH_VSIZE,
-        TX_BROADCAST_TIMEOUT, TX_CONFIRMATION_TIMEOUT,
+        get_hd_path_from_descriptor, now_secs, print_new_wallet_seed, redeemscript_to_scriptpubkey,
+        HEART_BEAT_INTERVAL, LEGACY_CONTRACT_SPEND_VSIZE, MIN_RELAY_FEE_RATE,
+        TAPROOT_KEYPATH_VSIZE, TX_BROADCAST_TIMEOUT, TX_CONFIRMATION_TIMEOUT,
     },
 };
 
@@ -55,9 +56,9 @@ use rust_coinselect::{
 
 use super::{
     backup::RestoreOptions,
-    blockchain::{AnyBlockchain, Blockchain, HdOrigin},
+    blockchain::{AnyBlockchain, BackendConfig, Blockchain, HdOrigin},
     error::WalletError,
-    storage::{AddressType, WalletStore},
+    storage::{AddressType, SecretXpriv, WalletStore},
     swapcoin::{contract_timelock, WatchOnlySwapCoin},
 };
 
@@ -93,8 +94,17 @@ pub struct SecretMnemonic(Mnemonic);
 
 impl SecretMnemonic {
     /// Callers must not log or persist the result.
-    pub fn words(&self) -> String {
-        self.0.to_string()
+    pub fn words(&self) -> Zeroizing<String> {
+        // Sized up front: a growing string frees unwiped copies of the words.
+        let size = self.0.words().map(|word| word.len() + 1).sum();
+        let mut phrase = Zeroizing::new(String::with_capacity(size));
+        for word in self.0.words() {
+            if !phrase.is_empty() {
+                phrase.push(' ');
+            }
+            phrase.push_str(word);
+        }
+        phrase
     }
 }
 
@@ -150,21 +160,9 @@ impl PartialEq for Wallet {
         //self.store == other.store
         //avoided filename
         self.store.network == other.store.network &&
-        // Compare master keys by plaintext (each unsealed with its own
-        // passphrase), not by sealed bytes, so wallets sealed under
-        // different passphrases/nonces still compare equal. Both sides must
-        // unseal: `plaintext_with` maps a decryption failure to `None`, and
-        // `None == None` would report a false match.
-        matches!(
-            (
-                self.store.master_key.plaintext_with(&self.store_enc_material),
-                other
-                    .store
-                    .master_key
-                    .plaintext_with(&other.store_enc_material),
-            ),
-            (Some(a), Some(b)) if a == b
-        ) &&
+        // Compare the unsealed keys inside their wipe-on-return scopes.
+        self.with_master_key(|a| other.with_master_key(|b| Ok(a == b)))
+            .unwrap_or(false) &&
         self.store.external_index == other.store.external_index &&
         self.store.internal_index == other.store.internal_index &&
         self.store.offer_maxsize == other.store.offer_maxsize &&
@@ -453,6 +451,48 @@ pub struct Balances {
     pub spendable: Amount,
 }
 
+fn require_seed_terminal(docker: bool, terminal: bool, log_free: bool) -> Result<(), WalletError> {
+    if docker && !(terminal && log_free) {
+        return Err(WalletError::General(
+            "New Docker wallets need an interactive terminal with Docker logging disabled; \
+             run once with `docker run -it --log-driver none -e OPENSWAP_SEED_LOG_FREE=1`"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Shows a new wallet's seed phrase with `show`. If that fails, nobody saw
+/// the phrase, so the wallet file just written is removed and a rerun creates
+/// a fresh wallet with a new phrase. A loaded wallet has no phrase to show.
+fn show_new_seed_or_remove(
+    wallet: &mut Wallet,
+    show: impl FnOnce(&SecretMnemonic) -> io::Result<()>,
+) -> Result<(), WalletError> {
+    let Some(mnemonic) = wallet.take_new_mnemonic() else {
+        return Ok(());
+    };
+    let Err(e) = show(&mnemonic) else {
+        return Ok(());
+    };
+    drop(mnemonic);
+    let path = &wallet.wallet_file_path;
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            log::error!(
+                "Failed to display the new wallet seed phrase: {e}. \
+                 Removed the new wallet at {path:?}; run again to create a new one."
+            );
+            Err(WalletError::IO(e))
+        }
+        Err(remove_error) => Err(WalletError::General(format!(
+            "failed to display the new wallet seed phrase: {e}; could not remove \
+             the new wallet at {path:?} ({remove_error}); delete it and run again \
+             to get a new phrase"
+        ))),
+    }
+}
+
 impl Wallet {
     /// Initialize the wallet at a given path.
     ///
@@ -464,10 +504,11 @@ impl Wallet {
         store_enc_material: KeyMaterial,
     ) -> Result<Self, WalletError> {
         let network = blockchain.get_blockchain_info()?.chain;
-
-        // Generate Master key
-        let mnemonic = Mnemonic::generate(12)?;
-        let master_key = Self::master_key_from_mnemonic(&mnemonic, network)?;
+        // Refuse old Core before a seed is generated or a wallet file is
+        // written, whichever caller creates the wallet.
+        if let AnyBlockchain::CoreRPC(core) = &blockchain {
+            core.require_v22()?;
+        }
 
         // Initialise wallet
         let file_name = path
@@ -479,17 +520,20 @@ impl Wallet {
             .to_string();
 
         let wallet_birthday = blockchain.get_block_count()?;
+        let mnemonic = Mnemonic::generate(12)?;
+        let master_key = SecretXpriv(Self::master_key_from_mnemonic(&mnemonic, network)?);
         // WalletStore::init seals the master key before the first write, so
         // the plaintext key never reaches disk.
         let store = WalletStore::init(
             file_name,
             path,
             network,
-            master_key,
+            master_key.0,
             Some(wallet_birthday),
             None,
             &store_enc_material,
         )?;
+        drop(master_key);
         log::info!(
             "Wallet birth_height = {wallet_birthday}, last_synced_height = {:?}",
             store.last_synced_height
@@ -548,33 +592,35 @@ impl Wallet {
         blockchain: AnyBlockchain,
         password: Option<String>,
     ) -> Result<Self, WalletError> {
-        let password = password.filter(|p| !p.is_empty());
-
-        let (mut store, store_enc_material) =
-            match WalletStore::read_from_disk(path, password.clone()) {
-                Ok((store, Some(material))) => (store, material),
-                // Cleartext wallet files are not supported at all.
-                Ok((_, None)) => {
-                    return Err(WalletError::General(format!(
-                        "wallet file {path:?} is unencrypted; \
-                         cleartext wallet files are not supported"
-                    )))
-                }
-                // Encrypted file, no passphrase supplied. Report how to supply
-                // one instead of failing decryption with an empty passphrase.
-                Err(WalletError::Security(SecurityError::PasswordRequired)) => {
-                    return Err(WalletError::General(format!(
-                        "wallet file {path:?} is encrypted; \
-                         provide the wallet passphrase via -p/--PASSWORD"
-                    )))
-                }
-                Err(e) => return Err(e),
-            };
-        // Wipe the cleartext passphrase; only the derived key material is kept.
-        if let Some(mut p) = password {
-            p.zeroize();
+        let mut password = password.map(Zeroizing::new);
+        if password.as_ref().is_some_and(|p| p.is_empty()) {
+            password = None;
         }
 
+        let (mut store, store_enc_material) = match WalletStore::read_from_disk(
+            path,
+            password.as_mut().map(|p| std::mem::take(&mut **p)),
+        ) {
+            Ok((store, Some(material))) => (store, material),
+            // Cleartext wallet files are not supported at all.
+            Ok((_, None)) => {
+                return Err(WalletError::General(format!(
+                    "wallet file {path:?} is unencrypted; \
+                         cleartext wallet files are not supported"
+                )))
+            }
+            // Encrypted file, no passphrase supplied. Report how to supply
+            // one instead of failing decryption with an empty passphrase.
+            Err(WalletError::Security(SecurityError::PasswordRequired)) => {
+                return Err(WalletError::General(format!(
+                    "wallet file {path:?} is encrypted; \
+                         provide the wallet passphrase via -p/--PASSWORD"
+                )))
+            }
+            Err(e) => return Err(e),
+        };
+        // An older file may hold the key in plaintext; seal it before any backend call.
+        store.master_key.seal(&store_enc_material)?;
         if let AnyBlockchain::CoreRPC(core) = &blockchain {
             if core.wallet_name() != store.file_name {
                 return Err(WalletError::General(format!(
@@ -609,16 +655,14 @@ impl Wallet {
                 .pending_restore
                 .get_or_insert_with(RestoreOptions::default);
         }
-        let mut wallet = Self {
+        Ok(Self {
             blockchain,
             wallet_file_path: path.to_path_buf(),
             store,
             store_enc_material,
             new_mnemonic: None,
             locked_utxos: HashSet::new(),
-        };
-        wallet.seal_master_key()?;
-        Ok(wallet)
+        })
     }
 
     /// Loads an existing wallet from the given path or initializes a new one if none exists.
@@ -631,7 +675,12 @@ impl Wallet {
         password: Option<String>,
     ) -> Result<Wallet, WalletError> {
         let wallet = if path.exists() {
-            // wallet already exists, load the wallet
+            // wallet already exists, load the wallet. Refuse old Core first,
+            // as `Wallet::init` does for a new wallet, so callers that start
+            // without syncing get the minimum-version error up front.
+            if let AnyBlockchain::CoreRPC(core) = &blockchain {
+                core.require_v22()?;
+            }
             let mut wallet = Wallet::load(path, blockchain, password)?;
             if wallet.store.pending_restore.is_some() {
                 log::warn!("Wallet at {path:?} has an unfinished first scan; resuming it");
@@ -641,15 +690,16 @@ impl Wallet {
             wallet
         } else {
             // wallet doesn't exists at the given path, create a new one
-            let Some(password) = password.filter(|p| !p.is_empty()) else {
+            let Some(mut password) = password.map(Zeroizing::new).filter(|p| !p.is_empty()) else {
                 return Err(WalletError::General(
                     "a passphrase is required to create a wallet; \
                      cleartext wallet files are not supported"
                         .to_string(),
                 ));
             };
-            let store_enc_material = KeyMaterial::new_from_password(Some(password))
-                .expect("a non-empty passphrase always yields key material");
+            let store_enc_material =
+                KeyMaterial::new_from_password(Some(std::mem::take(&mut *password)))
+                    .expect("a non-empty passphrase always yields key material");
 
             let wallet = Wallet::init(path, blockchain, store_enc_material)?;
 
@@ -660,19 +710,37 @@ impl Wallet {
         Ok(wallet)
     }
 
+    /// Creates a missing wallet for the CLI and shows its seed phrase at once,
+    /// so no later startup failure can drop a phrase the user never saw.
+    pub fn init_interactive(
+        path: &Path,
+        backend: &BackendConfig,
+        password: Option<String>,
+    ) -> Result<(), WalletError> {
+        let mut password = password.map(Zeroizing::new);
+        if path.exists() {
+            return Ok(());
+        }
+        require_seed_terminal(
+            std::env::var_os("OPENSWAP_DOCKER").is_some(),
+            io::stdout().is_terminal(),
+            std::env::var_os("OPENSWAP_SEED_LOG_FREE").is_some(),
+        )?;
+        // `Wallet::init` refuses old Core before a wallet file and seed are written.
+        let mut wallet = Self::load_or_init(
+            path,
+            AnyBlockchain::from_config(backend)?,
+            password.as_mut().map(|p| std::mem::take(&mut **p)),
+        )?;
+        show_new_seed_or_remove(&mut wallet, print_new_wallet_seed)?;
+        // Save a tip, or the next load resumes this wallet as an unfinished restore.
+        wallet.sync_and_save(&crate::utill::NO_SHUTDOWN)
+    }
+
     /// Persist wallet data to disk, creating missing parent directories and file as needed.
     pub(crate) fn save_to_disk(&self) -> Result<(), WalletError> {
         self.store
             .write_to_disk(&self.wallet_file_path, &self.store_enc_material)
-    }
-
-    /// Seals the master key in memory under the wallet's encryption material
-    /// and erases the plaintext copy. Called once at wallet construction
-    /// (load/restore; `WalletStore::init` seals before its first write);
-    /// afterwards the plaintext key only exists transiently inside
-    /// [`Wallet::with_master_key`].
-    pub(crate) fn seal_master_key(&mut self) -> Result<(), WalletError> {
-        self.store.master_key.seal(&self.store_enc_material)
     }
 
     /// Runs `f` with the plaintext master key, unsealing the in-memory key
@@ -699,13 +767,11 @@ impl Wallet {
     ) -> Result<T, WalletError> {
         let secp = crate::utill::global_secp();
         self.with_master_key(|master_key| {
-            let mut account = master_key.derive_priv(
+            let account = SecretXpriv(master_key.derive_priv(
                 secp,
                 &Self::get_derivation_path(address_type, self.store.network),
-            )?;
-            let result = f(&account);
-            account.private_key.non_secure_erase();
-            result
+            )?);
+            f(&account.0)
         })
     }
 
@@ -2946,11 +3012,13 @@ impl Wallet {
                     address_type,
                     ..
                 } => {
-                    let mut privkey = self.with_account_key(address_type, |account| {
-                        Ok(account
-                            .derive_priv(&secp, &DerivationPath::from_str(&path)?)?
-                            .private_key)
+                    // Wiped on drop, so an early `?` below cannot skip it.
+                    let child = self.with_account_key(address_type, |account| {
+                        Ok(SecretXpriv(
+                            account.derive_priv(&secp, &DerivationPath::from_str(&path)?)?,
+                        ))
                     })?;
+                    let privkey = &child.0.private_key;
 
                     match address_type {
                         AddressType::P2WPKH => {
@@ -2970,7 +3038,7 @@ impl Wallet {
                             //https://en.bitcoin.it/wiki/Privacy#Wallet_fingerprinting
                             let signature = secp.sign_ecdsa_low_r(
                                 &secp256k1::Message::from_digest_slice(&sighash[..])?,
-                                &privkey,
+                                privkey,
                             );
                             let mut sig_serialised = signature.serialize_der().to_vec();
                             sig_serialised.push(EcdsaSighashType::All as u8);
@@ -2978,8 +3046,6 @@ impl Wallet {
                             input.witness.push(pubkey.to_bytes());
                         }
                         AddressType::P2TR => {
-                            let mut keypair = Keypair::from_secret_key(&secp, &privkey);
-
                             // Calculate taproot key-spend sighash using all prevouts
                             let sighash = SighashCache::new(&tx_clone)
                                 .taproot_key_spend_signature_hash(
@@ -2988,15 +3054,17 @@ impl Wallet {
                                     TapSighashType::Default,
                                 )?;
 
-                            let tweaked_keypair = keypair.tap_tweak(&secp, None);
+                            // Nothing between building and erasing the key pairs can fail.
+                            let mut keypair = Keypair::from_secret_key(&secp, privkey);
+                            let mut tweaked = keypair.tap_tweak(&secp, None).to_keypair();
                             let msg = secp256k1::Message::from(sighash);
-                            let signature = secp.sign_schnorr(&msg, &tweaked_keypair.to_keypair());
+                            let signature = secp.sign_schnorr(&msg, &tweaked);
 
                             input.witness.push(signature.as_ref());
                             keypair.non_secure_erase();
+                            tweaked.non_secure_erase();
                         }
                     }
-                    privkey.non_secure_erase();
                 }
                 UTXOSpendInfo::TimelockContract {
                     swapcoin_multisig_redeemscript,
@@ -3031,7 +3099,6 @@ impl Wallet {
                     input.witness = spend_tx.input[0].witness.clone();
                 }
                 UTXOSpendInfo::FidelityBondCoin { index, input_value } => {
-                    let privkey = self.get_fidelity_keypair(index)?.secret_key();
                     let redeemscript = self.get_fidelity_reedemscript(index)?;
                     let sighash = SighashCache::new(&tx_clone).p2wsh_signature_hash(
                         ix,
@@ -3039,10 +3106,10 @@ impl Wallet {
                         input_value,
                         EcdsaSighashType::All,
                     )?;
-                    let sig = secp.sign_ecdsa_low_r(
-                        &secp256k1::Message::from_digest_slice(&sighash[..])?,
-                        &privkey,
-                    );
+                    let msg = secp256k1::Message::from_digest_slice(&sighash[..])?;
+                    let sig = self.with_fidelity_keypair(index, |keypair| {
+                        Ok(secp.sign_ecdsa_low_r(&msg, &keypair.secret_key()))
+                    })?;
 
                     let mut sig_serialised = sig.serialize_der().to_vec();
                     sig_serialised.push(EcdsaSighashType::All as u8);
@@ -4421,7 +4488,7 @@ impl Wallet {
             self.max_watch_index(KeychainKind::External)?,
             self.max_watch_index(KeychainKind::Internal)?,
         );
-        // A resumed restore never passed `restore_with`'s check; a plain wallet
+        // A resumed restore never passed `restore_prepared`'s check; a plain wallet
         // keeps syncing as it did before the cap existed.
         if self.store.pending_restore.is_some() {
             Self::check_watch_window(prev_window)?;
@@ -4588,12 +4655,14 @@ impl Wallet {
         }
     }
 
-    /// Errors a retry cannot fix: shutdown, or a watch window past the cap,
-    /// which is fixed by the wallet's counters and gap.
+    /// Errors a retry cannot fix: shutdown, a watch window past the cap
+    /// (fixed by the wallet's counters and gap), or a too-old Bitcoin Core.
     fn sync_error_is_final(e: &WalletError) -> bool {
         matches!(
             e,
-            WalletError::Interrupted(_) | WalletError::WatchWindowCap { .. }
+            WalletError::Interrupted(_)
+                | WalletError::WatchWindowCap { .. }
+                | WalletError::CoreTooOld
         )
     }
 
@@ -4975,14 +5044,58 @@ mod prevout_contract_tests {
         let mut wallet = test_wallet(&temp_dir.path().join("wallet.cbor"));
         wallet.new_mnemonic = Some(SecretMnemonic(Mnemonic::parse(TEST_PHRASE).unwrap()));
 
-        assert_eq!(
-            wallet.take_new_mnemonic().map(|m| m.words()).as_deref(),
-            Some(TEST_PHRASE)
-        );
+        let words: Zeroizing<String> = wallet.take_new_mnemonic().unwrap().words();
+        assert_eq!(words.as_str(), TEST_PHRASE);
+        // Sized to one byte over the phrase, so the buffer never had to grow.
+        assert_eq!(words.capacity(), TEST_PHRASE.len() + 1);
         assert!(
             wallet.take_new_mnemonic().is_none(),
             "the phrase must be dropped from the wallet after the first take"
         );
+    }
+
+    /// A seed phrase nobody saw must not stay behind in a wallet file.
+    #[test]
+    fn failed_seed_display_removes_the_new_wallet() {
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("wallet.cbor");
+        let mut wallet = test_wallet(&path);
+        wallet.new_mnemonic = Some(SecretMnemonic(Mnemonic::generate(12).unwrap()));
+        assert!(path.exists());
+
+        let err = show_new_seed_or_remove(&mut wallet, |_| Err(io::Error::other("closed")))
+            .expect_err("a failed display must be reported");
+        assert!(matches!(err, WalletError::IO(_)), "{}", err);
+        assert!(!path.exists(), "the unseen wallet must be removed");
+    }
+
+    /// A shown phrase, or a loaded wallet without one, keeps the wallet file.
+    #[test]
+    fn shown_seed_or_loaded_wallet_keeps_the_wallet_file() {
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("wallet.cbor");
+        let mut wallet = test_wallet(&path);
+        wallet.new_mnemonic = Some(SecretMnemonic(Mnemonic::generate(12).unwrap()));
+        let mut shown = 0;
+        show_new_seed_or_remove(&mut wallet, |_| {
+            shown += 1;
+            Ok(())
+        })
+        .unwrap();
+        show_new_seed_or_remove(&mut wallet, |_| {
+            shown += 1;
+            Err(io::Error::other("must not be called"))
+        })
+        .unwrap();
+        assert_eq!(shown, 1);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn docker_seed_refuses_non_terminal_output() {
+        assert!(require_seed_terminal(true, false, true).is_err());
+        assert!(require_seed_terminal(true, true, false).is_err());
+        assert!(require_seed_terminal(true, true, true).is_ok());
     }
 
     #[test]
@@ -5306,14 +5419,16 @@ mod restore_history_probe_tests {
         ));
     }
 
-    /// A window past the cap is final: `sync_no_fail` must not retry it forever.
+    /// A window past the cap or a too-old Core is final: `sync_no_fail` must
+    /// not retry it forever.
     #[test]
-    fn window_cap_is_not_retried() {
+    fn window_cap_and_old_core_are_not_retried() {
         let cap = WalletError::WatchWindowCap {
             window: MAX_WATCH_WINDOW + 1,
             cap: MAX_WATCH_WINDOW,
         };
         assert!(Wallet::sync_error_is_final(&cap));
+        assert!(Wallet::sync_error_is_final(&WalletError::CoreTooOld));
         assert!(!Wallet::sync_error_is_final(&WalletError::General(
             "rpc down".into()
         )));

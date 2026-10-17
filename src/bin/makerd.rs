@@ -1,12 +1,12 @@
 use bitcoind::bitcoincore_rpc::Auth;
 use clap::{Parser, Subcommand};
 use openswap::{
-    lock_debug,
     maker::{bind_port_retry, start_server, MakerError, MakerServer, MakerServerConfig},
-    utill::{parse_proxy_auth, print_new_wallet_seed, setup_maker_logger},
-    wallet::{BackendConfig, BondHint, CoreRpcConfig, ElectrumConfig, RestoreOptions},
+    utill::{parse_proxy_auth, setup_maker_logger},
+    wallet::{BackendConfig, BondHint, CoreRpcConfig, ElectrumConfig, RestoreOptions, Wallet},
 };
 use std::{path::PathBuf, sync::Arc};
+use zeroize::Zeroizing;
 
 /// OpenSwap Maker Server
 ///
@@ -21,7 +21,7 @@ use std::{path::PathBuf, sync::Arc};
 /// For more detailed usage information, please refer the [Maker Doc]<https://github.com/citadel-foss/openswap/blob/master/docs/makerd.md>
 ///
 /// This is early beta, and there are known and unknown bugs. Please report issues in the [Project Issue Board]<https://github.com/citadel-foss/openswap/issues>
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[clap(version = option_env ! ("CARGO_PKG_VERSION").unwrap_or("unknown"),
 author = option_env ! ("CARGO_PKG_AUTHORS").unwrap_or(""))]
 struct Cli {
@@ -81,6 +81,9 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Create the wallet and show its seed, then exit. Used by Docker setup.
+    #[clap(hide = true)]
+    InitWallet,
     /// Restore the wallet from a backup file or its seed phrase, then exit.
     ///
     /// `--mnemonic` prompts for the phrase at a hidden prompt. Stop every
@@ -132,7 +135,8 @@ fn main() -> Result<(), MakerError> {
     // operator's wallet and fidelity bond.
     let wallet_name = args.wallet_name.unwrap_or_else(|| "maker".to_string());
     config.wallet_name = wallet_name.clone();
-    config.password = args.password;
+    let mut wallet_password = args.password.map(Zeroizing::new);
+    config.password = None;
     if let Some(tor_auth) = args.tor_auth {
         config.tor_auth_password = tor_auth;
     }
@@ -157,6 +161,7 @@ fn main() -> Result<(), MakerError> {
         }),
     };
 
+    let init_only = matches!(&args.command, Some(Commands::InitWallet));
     match args.command {
         Some(Commands::Restore {
             backup_file,
@@ -174,7 +179,11 @@ fn main() -> Result<(), MakerError> {
             };
             return MakerServer::restore_wallet(&config, backup_file.as_deref(), options);
         }
-        Some(Commands::Backup { output }) => return MakerServer::backup_wallet(config, output),
+        Some(Commands::Backup { output }) => {
+            config.password = wallet_password.as_mut().map(|p| std::mem::take(&mut **p));
+            return MakerServer::backup_wallet(config, output);
+        }
+        Some(Commands::InitWallet) => {}
         None => {}
     }
 
@@ -191,20 +200,17 @@ fn main() -> Result<(), MakerError> {
     config.rpc_port = rpc_port;
     config.write_to_file(&config_path)?;
 
-    let maker = Arc::new(MakerServer::init(config)?);
-
-    // Display and consume the mnemonic phrase. On failure, create a new wallet to get a new phrase.
-    if let Some(mnemonic) = lock_debug!(maker.wallet.write())
-        .unwrap()
-        .take_new_mnemonic()
-    {
-        print_new_wallet_seed(&mnemonic).inspect_err(|e| {
-            log::error!(
-                "Failed to display new wallet seed phrase: {e}. \
-                 Delete the wallet and re-create it to get a new phrase."
-            );
-        })?;
+    let wallet_path = config.data_dir.join("wallets").join(&config.wallet_name);
+    Wallet::init_interactive(
+        &wallet_path,
+        &config.backend,
+        wallet_password.as_deref().cloned(),
+    )?;
+    if init_only {
+        return Ok(());
     }
+    config.password = wallet_password.as_mut().map(|p| std::mem::take(&mut **p));
+    let maker = Arc::new(MakerServer::init(config)?);
 
     start_server(maker)?;
 

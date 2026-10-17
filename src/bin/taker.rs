@@ -9,7 +9,7 @@ use openswap::{
         error::TakerError, format_state, MakerOfferCandidate, MakerState, SwapParams, Taker,
         TakerConfig, TakerInitConfig,
     },
-    utill::{parse_proxy_auth, print_new_wallet_seed, setup_taker_logger, MAX_TX_COUNT, UTXO},
+    utill::{parse_proxy_auth, setup_taker_logger, MAX_TX_COUNT, UTXO},
     wallet::{AddressType, BondHint, CoreRpcConfig, RestoreOptions, Wallet},
 };
 use serde_json::{json, to_string_pretty};
@@ -18,6 +18,7 @@ use std::{
     str::FromStr,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use zeroize::Zeroizing;
 
 /// A simple command line app to operate as openswap client.
 ///
@@ -30,7 +31,7 @@ use std::{
 /// For more detailed usage information, please refer: <https://github.com/citadel-foss/openswap/blob/master/docs/taker.md>
 ///
 /// This is early beta, and there are known and unknown bugs. Please report issues at: <https://github.com/citadel-foss/openswap/issues>
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[clap(version = option_env ! ("CARGO_PKG_VERSION").unwrap_or("unknown"),
 author = option_env ! ("CARGO_PKG_AUTHORS").unwrap_or(""))]
 struct Cli {
@@ -438,7 +439,8 @@ fn display_offer(
 }
 
 fn main() -> Result<(), TakerError> {
-    let args = Cli::parse();
+    let mut args = Cli::parse();
+    let mut wallet_password = args.password.take().map(Zeroizing::new);
     setup_taker_logger(
         LevelFilter::from_str(&args.verbosity).unwrap(),
         matches!(
@@ -511,6 +513,12 @@ fn main() -> Result<(), TakerError> {
         return Ok(());
     }
 
+    Wallet::init_interactive(
+        &data_dir.join("wallets").join(&wallet_name),
+        &backend,
+        wallet_password.as_deref().cloned(),
+    )?;
+
     // CLI wins where a flag exists; the file fills in the rest.
     let config = TakerInitConfig {
         data_dir: Some(data_dir),
@@ -523,26 +531,13 @@ fn main() -> Result<(), TakerError> {
         tor_auth_password: args.tor_auth.clone().or_else(|| {
             (!file_config.tor_auth_password.is_empty()).then_some(file_config.tor_auth_password)
         }),
-        password: args.password.clone(),
+        password: wallet_password.as_mut().map(|p| std::mem::take(&mut **p)),
         wallet_name: wallet_name.clone(),
         ..TakerInitConfig::default()
     }
     .with_backend(backend.clone());
 
     let mut taker = Taker::init(config)?;
-
-    // Display and consume the mnemonic phrase. On failure, create a new wallet to get a new phrase.
-    if let Some(mnemonic) = lock_debug!(taker.get_wallet().write())
-        .unwrap()
-        .take_new_mnemonic()
-    {
-        print_new_wallet_seed(&mnemonic).inspect_err(|e| {
-            log::error!(
-                "Failed to display new wallet seed phrase: {e}. \
-                 Delete the wallet and re-create it to get a new phrase."
-            );
-        })?;
-    }
 
     // Sync wallet after initialization. Blocklist edits only touch the local
     // JSON file, so they skip the chain sync.

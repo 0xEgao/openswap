@@ -36,6 +36,10 @@ use std::{
     sync::OnceLock,
     time::Duration,
 };
+use zeroize::{Zeroize, Zeroizing};
+
+#[cfg(unix)]
+use std::os::fd::AsFd;
 
 static LOGGER: OnceLock<()> = OnceLock::new();
 
@@ -858,19 +862,23 @@ impl Drop for RawModeGuard {
 /// Prompts the user for a password using the given prompt string.
 /// Temporarily disables canonical mode and echo to mask each typed
 /// character with `*` as feedback.
-pub fn prompt_password(message: String) -> io::Result<String> {
+pub fn prompt_password(message: String) -> io::Result<Zeroizing<String>> {
     let mut stdout = io::stdout();
-    let stdin = io::stdin();
+    // Read the terminal directly: `Stdin`'s buffer would keep a pasted secret unwiped.
+    #[cfg(unix)]
+    let mut stdin = fs::File::from(io::stdin().as_fd().try_clone_to_owned()?);
+    #[cfg(not(unix))]
+    let mut stdin = io::stdin();
 
     print!("{message}");
     stdout.flush()?; // Ensure the prompt is printed
 
     let _guard = RawModeGuard::new()?;
 
-    let mut password = String::new();
-    let mut buf = [0u8; 1];
+    let mut password = Zeroizing::new(Vec::with_capacity(256));
+    let mut buf = Zeroizing::new([0u8; 1]);
 
-    while lock_debug!(stdin.lock()).read(&mut buf)? == 1 {
+    while stdin.read(&mut *buf)? == 1 {
         let c = buf[0] as char;
 
         match c {
@@ -886,7 +894,14 @@ pub fn prompt_password(message: String) -> io::Result<String> {
                 //   and erase the asterisk from the terminal by moving the cursor back,
                 //   writing a space to overwrite, then moving the cursor back again.
                 if !password.is_empty() {
-                    password.pop();
+                    let len = password.len()
+                        - if password.last().unwrap() & 0x80 == 0 {
+                            1
+                        } else {
+                            2
+                        };
+                    password[len..].zeroize();
+                    password.truncate(len);
                     print!("\x08 \x08");
                     stdout.flush()?;
                 }
@@ -894,7 +909,15 @@ pub fn prompt_password(message: String) -> io::Result<String> {
             _ => {
                 // - Otherwise, for any other character, we append it to the password string
                 //   and print an asterisk '*' as a visual placeholder for the typed character.
-                password.push(c);
+                let mut encoded = Zeroizing::new([0u8; 4]);
+                let bytes = c.encode_utf8(&mut *encoded).as_bytes();
+                if password.capacity() < password.len() + bytes.len() {
+                    let mut grown = Vec::with_capacity(password.capacity() * 2);
+                    grown.extend_from_slice(&password);
+                    let old = std::mem::replace(&mut *password, grown);
+                    drop(Zeroizing::new(old));
+                }
+                password.extend_from_slice(bytes);
                 print!("*");
                 stdout.flush()?;
             }
@@ -902,7 +925,15 @@ pub fn prompt_password(message: String) -> io::Result<String> {
     }
 
     println!(); // move to next line after input
-    Ok(password.trim_end().to_string())
+    let len = std::str::from_utf8(&password)
+        .expect("typed characters are UTF-8")
+        .trim_end()
+        .len();
+    password[len..].zeroize();
+    password.truncate(len);
+    Ok(Zeroizing::new(
+        String::from_utf8(std::mem::take(&mut *password)).expect("typed characters are UTF-8"),
+    ))
 }
 
 /// Writes a new wallet's seed phrase to stdout, shown once at wallet creation.
@@ -910,7 +941,11 @@ pub fn prompt_password(message: String) -> io::Result<String> {
 pub fn print_new_wallet_seed(mnemonic: &SecretMnemonic) -> io::Result<()> {
     let mut out = lock_debug!(io::stdout().lock());
     writeln!(out, "\n========== New Wallet Seed Phrase ==========")?;
-    writeln!(out, "{}", mnemonic.words())?;
+    // A whole line skips stdout's buffer, which would keep an unwiped copy.
+    // `words()` reserves the byte for the newline, so this does not reallocate.
+    let mut words = mnemonic.words();
+    words.push('\n');
+    out.write_all(words.as_bytes())?;
     writeln!(
         out,
         "\nWrite these words down and store them offline. They will not be shown again."

@@ -140,7 +140,7 @@ fn assert_ffi_restores_funded_wallet(
         Some(data_dir.to_path_buf()),
         "from-phrase".to_string(),
         backend.clone(),
-        phrase.clone(),
+        phrase.as_str().to_owned(),
         password.clone(),
         RestoreOptions::default(),
     );
@@ -149,7 +149,7 @@ fn assert_ffi_restores_funded_wallet(
         Some(data_dir.to_path_buf()),
         "from-phrase".to_string(),
         backend.clone(),
-        phrase.clone(),
+        phrase.as_str().to_owned(),
         password.clone(),
         RestoreOptions::default(),
     );
@@ -184,7 +184,6 @@ fn assert_ffi_restores_funded_wallet(
         assert!(data_dir.join("wallets").join(name).exists(), "{}", name);
     }
     let km = KeyMaterial::new_from_password(password).unwrap();
-    let phrase = Zeroizing::new(phrase);
     let mut restored_wallets = Vec::new();
     for name in ["lib-phrase", "lib-backup"] {
         let path = data_dir.join("wallets").join(name);
@@ -517,6 +516,21 @@ fn encwallet_encbackup_encrestore(node: &mut Node) {
     // The restore must have written an *encrypted* wallet file, keyed by the
     // restore passphrase.
     assert_wallet_file_encrypted(&restored_wallet_file, "integration-test");
+
+    // Loading a file with no saved tip resumes a restore, rerunning its probe.
+    for path in [&original_wallet, &restored_wallet_file] {
+        let (saved, _) = load_sensitive_struct::<serde_cbor::Value, SerdeCbor>(
+            path,
+            Some("integration-test".to_string()),
+        )
+        .unwrap();
+        let serde_cbor::Value::Map(saved) = saved else {
+            panic!("wallet file is not a map")
+        };
+        let field = |name: &str| saved[&serde_cbor::Value::Text(name.to_string())].clone();
+        assert!(matches!(field("last_synced_height"), serde_cbor::Value::Integer(h) if h > 0));
+        assert_eq!(field("pending_restore"), serde_cbor::Value::Null);
+    }
 
     // A nameless restore path resolves to the backup's original filename
     // instead of colliding with the wallets directory itself.

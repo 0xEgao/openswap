@@ -266,6 +266,15 @@ impl CoreRPC {
         &self.config.wallet_name
     }
 
+    /// Older nodes lack `listdescriptors` and `tr()`, so sync would fail
+    /// and retry forever, whatever kind of wallet the node holds.
+    pub(crate) fn require_v22(&self) -> Result<(), WalletError> {
+        if self.rpc.version()? < 220_000 {
+            return Err(WalletError::CoreTooOld);
+        }
+        Ok(())
+    }
+
     /// Connect and subscribe the ZMQ notification socket up front.
     ///
     /// The watchtower calls this **before** its startup mempool scan so the SUB
@@ -479,33 +488,27 @@ impl Blockchain for CoreRPC {
         Ok(per_kvb.to_sat() as f64 / 1000.0)
     }
 
-    /// Load the watch-only wallet on the node, creating it if absent. Ported
-    /// verbatim from the pre-refactor `Wallet::sync` Core bootstrap so behaviour
-    /// is unchanged; only invoked on the Core sync path.
+    /// Load the watch-only wallet on the node, creating it if absent. Refuses
+    /// Core older than v22; only invoked on the Core sync path.
     fn prepare_backend_wallet(&self, wallet_name: &str) -> Result<(), WalletError> {
+        self.require_v22()?;
         if self.rpc.list_wallets()?.contains(&wallet_name.to_string()) {
             log::debug!("wallet already loaded: {wallet_name}");
         } else if list_wallet_dir(&self.rpc)?.contains(&wallet_name.to_string()) {
             self.rpc.load_wallet(wallet_name)?;
             log::debug!("wallet loaded: {wallet_name}");
         } else {
-            // pre-0.21 uses legacy wallets
-            if self.rpc.version()? < 210_000 {
-                self.rpc
-                    .create_wallet(wallet_name, Some(true), None, None, None)?;
-            } else {
-                // https://github.com/rust-bitcoin/rust-bitcoincore-rpc/issues/225 is
-                // still open, so we issue the call directly to request a descriptor wallet.
-                let args = [
-                    Value::String(wallet_name.to_string()),
-                    Value::Bool(true),  // Disable Private Keys
-                    Value::Bool(false), // Create a blank wallet
-                    Value::Null,        // Optional Passphrase
-                    Value::Bool(false), // Avoid Reuse
-                    Value::Bool(true),  // Descriptor Wallet
-                ];
-                let _: Value = self.rpc.call("createwallet", &args)?;
-            }
+            // https://github.com/rust-bitcoin/rust-bitcoincore-rpc/issues/225 is
+            // still open, so we issue the call directly to request a descriptor wallet.
+            let args = [
+                Value::String(wallet_name.to_string()),
+                Value::Bool(true),  // Disable Private Keys
+                Value::Bool(false), // Create a blank wallet
+                Value::Null,        // Optional Passphrase
+                Value::Bool(false), // Avoid Reuse
+                Value::Bool(true),  // Descriptor Wallet
+            ];
+            let _: Value = self.rpc.call("createwallet", &args)?;
             log::debug!("wallet created: {wallet_name}");
         }
         Ok(())
@@ -551,6 +554,7 @@ impl Blockchain for CoreRPC {
             descriptors: Vec<Listed>,
         }
         let listed: Descriptors = self.rpc.call("listdescriptors", &[])?;
+        // Core lists the range end inclusive, so `end == last_index` covers it.
         Ok(listed
             .descriptors
             .into_iter()
@@ -648,6 +652,11 @@ mod tests {
     };
 
     use super::*;
+    use crate::{
+        security::KeyMaterial,
+        wallet::{api::test_support::test_wallet, AnyBlockchain, BackendConfig, Wallet},
+    };
+    use zeroize::Zeroizing;
 
     /// Serves one canned reply per JSON-RPC method, failing on any other.
     fn mock_core(
@@ -708,9 +717,11 @@ mod tests {
     #[test]
     fn imported_range_covers_needs_the_range_to_start_at_zero() {
         let desc = "wpkh(xpub/0/*)#abcd1234";
+        // `listdescriptors` reports both ends inclusive (`range_end - 1` in Core).
         for (range, last_index, expected) in [
             ([20, 200], 100, false),
             ([0, 200], 100, true),
+            ([0, 100], 100, true),
             ([0, 99], 100, false),
         ] {
             let (core, server) = mock_core(vec![
@@ -730,6 +741,134 @@ mod tests {
             );
             server.join().unwrap();
         }
+    }
+
+    /// Core 0.21 has no `listdescriptors`, and its default wallets are legacy:
+    /// the version is refused before any wallet is loaded or inspected.
+    #[test]
+    fn prepare_backend_wallet_refuses_core_before_v22() {
+        let (core, server) = mock_core(vec![("getnetworkinfo", json!({ "version": 210100 }))]);
+        assert!(matches!(
+            core.prepare_backend_wallet("w"),
+            Err(WalletError::CoreTooOld)
+        ));
+        assert_eq!(server.join().unwrap(), ["getnetworkinfo"]);
+    }
+
+    /// A Core 0.21 node answering only the backup/restore backend probe.
+    fn mock_core_v21() -> (CoreRPC, thread::JoinHandle<Vec<String>>) {
+        let info = json!({ "chain": "regtest", "blocks": 0, "headers": 0,
+            "bestblockhash": "0".repeat(64), "difficulty": 0.0,
+            "mediantime": 0, "verificationprogress": 1.0, "initialblockdownload": false,
+            "chainwork": "00", "size_on_disk": 0, "pruned": false, "warnings": "" });
+        mock_core(vec![
+            ("getblockchaininfo", info),
+            // Asked once by `get_blockchain_info` itself, once by the v22 gate.
+            ("getnetworkinfo", json!({ "version": 210100 })),
+            ("getnetworkinfo", json!({ "version": 210100 })),
+        ])
+    }
+
+    /// The restore's backend probe refuses Core 0.21, so no wallet file is left.
+    #[test]
+    fn restore_refuses_core_before_v22_without_a_wallet_file() {
+        let (core, server) = mock_core_v21();
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("w");
+        let err = Wallet::restore_from_mnemonic(
+            Zeroizing::new("abandon ".repeat(11) + "about"),
+            &path,
+            &BackendConfig::CoreRpc(core.config.clone()),
+            Default::default(),
+            KeyMaterial::new_ephemeral(),
+        )
+        .expect_err("Core 0.21 must be refused");
+        assert!(matches!(err, WalletError::CoreTooOld), "{}", err);
+        assert!(!path.exists());
+        assert_eq!(
+            server.join().unwrap(),
+            ["getblockchaininfo", "getnetworkinfo", "getnetworkinfo"]
+        );
+    }
+
+    /// A new CLI wallet refuses Core 0.21 before its file and seed are written.
+    #[test]
+    fn init_interactive_refuses_core_before_v22_without_a_wallet_file() {
+        let (core, server) = mock_core_v21();
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("w");
+        let err = Wallet::init_interactive(
+            &path,
+            &BackendConfig::CoreRpc(core.config.clone()),
+            Some("pass".to_string()),
+        )
+        .expect_err("Core 0.21 must be refused");
+        assert!(matches!(err, WalletError::CoreTooOld), "{}", err);
+        assert!(!path.exists());
+        assert_eq!(
+            server.join().unwrap(),
+            ["getblockchaininfo", "getnetworkinfo", "getnetworkinfo"]
+        );
+    }
+
+    /// Library callers (`MakerServer::init`, `Taker::init`) create wallets
+    /// through `load_or_init`; Core 0.21 is refused there too, with no file.
+    #[test]
+    fn load_or_init_refuses_core_before_v22_without_a_wallet_file() {
+        let (core, server) = mock_core_v21();
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("w");
+        let err = Wallet::load_or_init(
+            &path,
+            AnyBlockchain::CoreRPC(core),
+            Some("pass".to_string()),
+        )
+        .expect_err("Core 0.21 must be refused");
+        assert!(matches!(err, WalletError::CoreTooOld), "{}", err);
+        assert!(!path.exists());
+        assert_eq!(
+            server.join().unwrap(),
+            ["getblockchaininfo", "getnetworkinfo", "getnetworkinfo"]
+        );
+    }
+
+    /// Loading an existing wallet refuses Core 0.21 before the file is opened,
+    /// and leaves the file untouched.
+    #[test]
+    fn load_or_init_refuses_core_before_v22_for_an_existing_wallet() {
+        let (core, server) = mock_core(vec![("getnetworkinfo", json!({ "version": 210100 }))]);
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("w");
+        drop(test_wallet(&path));
+        let before = std::fs::read(&path).unwrap();
+        let err = Wallet::load_or_init(
+            &path,
+            AnyBlockchain::CoreRPC(core),
+            Some("test-password".to_string()),
+        )
+        .expect_err("Core 0.21 must be refused");
+        assert!(matches!(err, WalletError::CoreTooOld), "{}", err);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(server.join().unwrap(), ["getnetworkinfo"]);
+    }
+
+    /// The backup's backend probe refuses Core 0.21, so no backup file is left.
+    #[test]
+    fn backup_refuses_core_before_v22_without_a_backup_file() {
+        let (core, server) = mock_core_v21();
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("w"));
+        wallet.blockchain = AnyBlockchain::CoreRPC(core);
+        let path = dir.path().join("backup.json");
+        let err = wallet
+            .backup(&path, KeyMaterial::new_ephemeral())
+            .expect_err("Core 0.21 must be refused");
+        assert!(matches!(err, WalletError::CoreTooOld), "{}", err);
+        assert!(!path.exists());
+        assert_eq!(
+            server.join().unwrap(),
+            ["getblockchaininfo", "getnetworkinfo", "getnetworkinfo"]
+        );
     }
 
     #[test]

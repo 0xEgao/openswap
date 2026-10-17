@@ -16,13 +16,15 @@ use crate::{
 use super::{backup::RestoreOptions, error::WalletError, fidelity::FidelityBond};
 
 use bitcoin::{bip32::Xpriv, Network, OutPoint, ScriptBuf};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     collections::{HashMap, HashSet},
+    fmt::Write as _,
     fs::File,
     io::{BufWriter, Write},
     path::Path,
 };
+use zeroize::{Zeroize, Zeroizing};
 
 use super::swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin};
 
@@ -38,22 +40,8 @@ pub enum AddressType {
     P2TR,
 }
 
-/// The wallet's BIP32 master key.
-///
-/// The key is kept *sealed* — AES-256-GCM-encrypted under the wallet's
-/// passphrase-derived key — both in memory and on disk (the sealed blob is
-/// what gets serialized; there is no cleartext-on-disk form by design). It
-/// is only decrypted transiently when a signature or key derivation
-/// requires it, which shrinks the window in which the plaintext key is
-/// exposed to memory-scraping malware from the whole process lifetime to
-/// the duration of a single signing operation.
-///
-/// Note: the sealing key itself must remain in memory for a hot wallet to
-/// sign autonomously, so this defends against passive memory disclosure
-/// (core dumps, swap, cold reads), not against a live attacker reading the
-/// process's memory. Erasure is best-effort (`Xpriv` is `Copy`; a panic
-/// inside the closure skips the wipe; the chain code is never erased).
-/// See `docs/wallet-security.md` for the full threat model.
+/// The wallet's BIP32 master key stays sealed in memory and on disk.
+/// Plaintext is erased after signing or legacy wallet migration.
 pub(crate) enum MasterKey {
     /// Plaintext key. Transient: only present while a legacy (pre-encryption)
     /// wallet file is being migrated and resealed, or in tests. Must never
@@ -63,17 +51,53 @@ pub(crate) enum MasterKey {
     Sealed(EncryptedData),
 }
 
+fn erase_xpriv(key: &mut Xpriv) {
+    key.private_key.non_secure_erase();
+    let chain_code: &mut [u8; 32] = key.chain_code.as_mut();
+    chain_code.zeroize();
+}
+
+impl Drop for MasterKey {
+    fn drop(&mut self) {
+        if let Self::Plaintext(key) = self {
+            erase_xpriv(key);
+        }
+    }
+}
+
+/// Wipes a copied private key and chain code on return or unwind.
+pub(crate) struct SecretXpriv(pub(crate) Xpriv);
+
+impl Drop for SecretXpriv {
+    fn drop(&mut self) {
+        erase_xpriv(&mut self.0);
+    }
+}
+
+// Same text as `Xpriv`'s own impl, which goes through serde's growing and
+// unwiped `to_string`. Base58 of the 82-byte key is at most 112 characters.
+impl Serialize for SecretXpriv {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut text = Zeroizing::new(String::with_capacity(112));
+        write!(text, "{}", self.0).expect("writing to a String cannot fail");
+        serializer.serialize_str(&text)
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretXpriv {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Xpriv::deserialize(deserializer).map(Self)
+    }
+}
+
 impl MasterKey {
     /// Seals a plaintext key in place, erasing the plaintext copy. No-op if
     /// the key is already sealed.
     pub(crate) fn seal(&mut self, key: &KeyMaterial) -> Result<(), WalletError> {
         if let Self::Plaintext(xpriv) = self {
-            let data = encrypt_struct(xpriv, key)
+            let data = encrypt_struct(SecretXpriv(*xpriv), key)
                 .map_err(|e| WalletError::General(format!("master key sealing failed: {e:?}")))?;
-            let mut old = std::mem::replace(self, Self::Sealed(data));
-            if let Self::Plaintext(old_xpriv) = &mut old {
-                old_xpriv.private_key.non_secure_erase();
-            }
+            *self = Self::Sealed(data);
         }
         Ok(())
     }
@@ -89,30 +113,15 @@ impl MasterKey {
         match self {
             Self::Plaintext(xpriv) => f(xpriv),
             Self::Sealed(data) => {
-                let mut xpriv: Xpriv = decrypt_struct(data.clone(), key)?;
-                let result = f(&xpriv);
-                xpriv.private_key.non_secure_erase();
-                result
+                let xpriv = SecretXpriv(decrypt_struct(data.clone(), key)?);
+                f(&xpriv.0)
             }
-        }
-    }
-
-    /// Returns the plaintext key, unsealing first if necessary.
-    ///
-    /// Only used where the surrounding interface cannot propagate errors
-    /// (`PartialEq`); prefer [`MasterKey::with_unlocked`].
-    pub(crate) fn plaintext_with(&self, key: &KeyMaterial) -> Option<Xpriv> {
-        match self {
-            Self::Plaintext(xpriv) => Some(*xpriv),
-            Self::Sealed(data) => decrypt_struct(data.clone(), key).ok(),
         }
     }
 }
 
 /// Byte-wise equality of the stored representation: two loads of the same
-/// wallet file compare equal. To compare master keys across different
-/// passphrases or sealings, decrypt both via [`MasterKey::plaintext_with`]
-/// (as `Wallet`'s `PartialEq` does).
+/// wallet file compare equal.
 impl PartialEq for MasterKey {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -374,11 +383,12 @@ impl WalletStore {
         pending_restore: Option<RestoreOptions>,
         store_enc_material: &KeyMaterial,
     ) -> Result<Self, WalletError> {
+        let master_key = SecretXpriv(master_key);
         Self::init_with(
             file_name,
             path,
             network,
-            master_key,
+            master_key.0,
             wallet_birthday,
             pending_restore,
             store_enc_material,
@@ -399,10 +409,11 @@ impl WalletStore {
         store_enc_material: &KeyMaterial,
         prepare: impl FnOnce(&mut Self),
     ) -> Result<Self, WalletError> {
+        let master_key = SecretXpriv(master_key);
         let mut store = Self {
             file_name,
             network,
-            master_key: MasterKey::Plaintext(master_key),
+            master_key: MasterKey::Plaintext(master_key.0),
             external_index: 0,
             internal_index: 0,
             offer_maxsize: 0,
@@ -420,6 +431,7 @@ impl WalletStore {
             ln_pending_swaps: HashMap::new(),
             ln_maker_swaps: HashMap::new(),
         };
+        drop(master_key);
         prepare(&mut store);
         store.master_key.seal(store_enc_material)?;
 
@@ -569,6 +581,12 @@ mod tests {
         let seed: [u8; 16] = thread_rng().gen();
         let xpriv = Xpriv::new_master(Network::Bitcoin, &seed).unwrap();
         let material = KeyMaterial::new_ephemeral();
+
+        // The wiped encoding writes the same bytes, so older sealed keys still open.
+        assert_eq!(
+            serde_cbor::to_vec(&SecretXpriv(xpriv)).unwrap(),
+            serde_cbor::to_vec(&xpriv).unwrap()
+        );
 
         let mut key = MasterKey::Plaintext(xpriv);
         key.seal(&material).unwrap();
