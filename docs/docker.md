@@ -80,6 +80,9 @@ cd openswap
 # Start the complete stack
 ./docker-setup start
 
+# Show the seed phrase and confirm your backup
+./docker-setup show-seed
+
 # Check status
 ./docker-setup status
 
@@ -112,7 +115,7 @@ The setup script will prompt for:
 
 The script saves your settings and RPC password in `.docker-config`. It keeps the wallet passphrase in a separate 0600 `.docker-wallet-passphrase` file. It passes the passphrase to the maker as a Docker secret. Keep both files private. On your next run, the script moves any older wallet passphrase out of `.docker-config`.
 
-On the first start, run `./docker-setup start` in a terminal. The script creates the wallet in an attached container with Docker logging disabled. Write down the seed phrase shown there. The script then starts the maker in the background. A new wallet refuses to start without a terminal, before it writes a wallet file.
+On the first start, run `./docker-setup start`. The script creates the wallet and starts the maker in the background. It prints no seed phrase. To show the seed and confirm your backup, run `./docker-setup show-seed`. It needs a terminal and asks for the passphrase at a hidden prompt. The running maker holds the wallet, so the script stops the maker, runs `show-seed`, and starts the maker again. Docker keeps no log of that run. The maker warns in its log until you confirm. To only view the words while the maker runs, use `docker exec -it openswap-makerd makerd -w <wallet> show-seed`, where `<wallet>` is your `BITCOIN_WALLET_NAME` (default `openswap-maker`); it cannot record the confirmation. To add the original phrase to an older wallet that has none, run `./docker-setup attach-seed`.
 
 ## Building Docker Images
 
@@ -147,8 +150,8 @@ Run the maker daemon with persistent data storage:
 # Using the setup script (recommended)
 ./docker-setup start
 
-# First create a new wallet in a terminal, without Docker logs
-docker run --rm -it --log-driver none -e OPENSWAP_SEED_LOG_FREE=1 \
+# First create the wallet (no seed is printed)
+docker run --rm \
   --network host \
   -v openswap-maker-data:/home/openswap/.openswap \
   openswap/openswap:latest makerd \
@@ -167,7 +170,7 @@ docker run -d \
     -p <wallet-passphrase>
 ```
 
-The container shares your host network. That way makerd reaches Tor and `bitcoind` on your machine. Makerd always encrypts its wallet. You must set its passphrase with `-p`. Add `-t <tor-password>` if your Tor control port uses a password. The direct `docker run` commands store `-p` in the container settings, where `docker inspect` shows it. The setup script passes it as a Docker secret instead.
+The container shares your host network. That way makerd reaches Tor and `bitcoind` on your machine. Makerd always encrypts its wallet. You must give it the passphrase on every start, with `-p` as here or with `--password-file` on a file you mount into the container. Add `-t <tor-password>` if your Tor control port uses a password. The direct `docker run` commands store `-p` in the container settings, where `docker inspect` shows it. The setup script passes it as a Docker secret instead.
 
 **Ports:**
 - `6102`: Maker network port for openswap protocol
@@ -197,8 +200,8 @@ Run taker operations:
 # Using the setup script
 ./docker-setup taker --help
 
-# Or manually; a new wallet shows its seed only without Docker logs
-docker run --rm -it --log-driver none -e OPENSWAP_SEED_LOG_FREE=1 \
+# Or manually
+docker run --rm \
   -v openswap-taker-data:/home/openswap/.openswap \
   --network host \
   openswap/openswap:latest taker --help

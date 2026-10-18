@@ -693,13 +693,13 @@ start_makerd() {
 
     if ! docker compose run --rm --no-deps --entrypoint sh "$service" \
         -c 'test -f "/home/openswap/.openswap/maker/wallets/${BITCOIN_WALLET_NAME:-openswap-maker}"'; then
-        if [[ ! -t 0 || ! -t 1 ]]; then
-            print_error "A new maker wallet needs an interactive terminal to show its seed."
-            exit 1
-        fi
-        print_info "Creating maker wallet; write down the seed shown in this terminal."
-        docker compose -f docker-compose.yml -f docker/compose-init.yml run --rm --no-deps \
+        print_info "Creating maker wallet..."
+        docker compose run --rm --no-deps \
             -e MAKER_INIT_ONLY=1 "$service" || { print_error "Wallet creation failed"; exit 1; }
+        print_warning "Seed not backed up yet. To show it and confirm your backup, run:"
+        print_warning "  ./docker-setup show-seed"
+        print_warning "It stops makerd for a moment. To only view the words while makerd runs:"
+        print_warning "  docker exec -it openswap-makerd makerd -w ${BITCOIN_WALLET_NAME:-openswap-maker} show-seed"
     fi
     
     if docker compose up -d; then
@@ -735,6 +735,80 @@ start_makerd() {
     fi
 }
 
+# Run show-seed or attach-seed on the maker wallet. The running maker holds the
+# wallet, so stop it first and start it again after; Docker keeps no log of the run.
+run_seed_command() {
+    local cmd="$1"
+    cd "$SCRIPT_DIR"
+    setup_env
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        print_error "$cmd needs an interactive terminal."
+        exit 1
+    fi
+    # Compose needs the secret to restart the maker; the seed command asks for the passphrase itself.
+    prompt_wallet_passphrase
+    local service="makerd"
+    [[ "$COMPOSE_PROFILES" != *"internal-tor"* ]] || service="makerd-internal"
+
+    # Start the maker again even if the operator interrupts us.
+    seed_restart_service="" seed_pid="" seed_container="openswap-seed-$$"
+    trap 'seed_interrupted 130' INT
+    trap 'seed_interrupted 143' TERM
+    trap 'seed_interrupted 129' HUP
+    trap 'restart_after_seed || true' EXIT
+    if [ -n "$(docker compose ps -q --status running "$service")" ]; then
+        seed_restart_service="$service"
+        print_info "Stopping makerd so $cmd can save the wallet..."
+        docker compose stop "$service"
+    fi
+
+    # Run in the background so a signal reaches the traps at once, not after
+    # the seed prompt ends. 0<&0 keeps the terminal; a background job gets /dev/null.
+    local status=0
+    docker compose -f docker-compose.yml -f docker/compose-seed.yml run --rm --no-deps \
+        --name "$seed_container" --entrypoint makerd "$service" \
+        -w "$BITCOIN_WALLET_NAME" "$cmd" 0<&0 &
+    seed_pid=$!
+    wait "$seed_pid" || status=$?
+    seed_pid=""
+
+    # A maker left down matters more than the seed command's status.
+    restart_after_seed || exit 1
+    trap - EXIT INT TERM HUP
+    return "$status"
+}
+
+# Stop the seed run, restart the maker and exit with the seed run's status,
+# or the signal's status if that run succeeded.
+seed_interrupted() {
+    local status=0
+    trap '' INT TERM HUP
+    if [ -n "$seed_pid" ]; then
+        # No container yet: stop the Compose launcher instead.
+        docker stop "$seed_container" >/dev/null 2>&1 || kill -TERM "$seed_pid" 2>/dev/null || true
+        wait "$seed_pid" || status=$?
+        docker rm -f "$seed_container" >/dev/null 2>&1 || true
+    fi
+    [ "$status" -ne 0 ] || status="$1"
+    restart_after_seed || true
+    exit "$status"
+}
+
+# Start the maker stopped by run_seed_command, at most once. Signals are
+# ignored from here so a second Ctrl-C can't cut the restart short.
+restart_after_seed() {
+    [ -n "$seed_restart_service" ] || return 0
+    local service="$seed_restart_service"
+    seed_restart_service=""
+    trap '' INT TERM HUP
+    print_info "Starting makerd again..."
+    if ! docker compose up -d "$service"; then
+        print_error "Failed to start makerd; run ./docker-setup start"
+        return 1
+    fi
+    print_info "Follow its log with: ./docker-setup logs $service"
+}
+
 run_command() {
     local cmd="$1"
     shift
@@ -752,8 +826,8 @@ run_command() {
                 docker exec $tty openswap-bitcoind bitcoin-cli $BITCOIN_NETWORK_ARG "$@"
             fi
             ;;
-        # Attached runs may create a wallet; keep its seed out of Docker's logs.
-        *) docker run --rm $tty --log-driver none -e OPENSWAP_SEED_LOG_FREE=1 --network host \
+        # Attached runs may print or read a seed phrase; keep it out of Docker's logs.
+        *) docker run --rm $tty --log-driver none --network host \
             "openswap/${IMAGE_NAME}:latest" "$cmd" "$@" ;;
     esac
 }
@@ -776,6 +850,9 @@ show_help() {
     echo "                   Services: bitcoind, tor, makerd-internal (bundled Tor), makerd (your own Tor)"
     echo "  status           Show status of running services"
     echo "  shell            Open shell in a new container"
+    echo "  show-seed        Show the maker seed phrase and confirm your backup"
+    echo "                   (stops makerd while it runs, then starts it again)"
+    echo "  attach-seed      Add the original seed phrase to a maker wallet that has none"
     echo ""
     echo "Individual application commands:"
     echo "  makerd [args]   Run makerd with arguments"
@@ -826,6 +903,10 @@ case "${1:-}" in
     "shell")
         setup_env
         docker run --rm -it --network host "openswap/${IMAGE_NAME}:latest" /bin/sh
+    ;;
+    "show-seed"|"attach-seed")
+        check_docker
+        run_seed_command "$1"
     ;;
     "makerd"|"maker-cli"|"taker"|"bitcoin-cli")
         run_command "$@"

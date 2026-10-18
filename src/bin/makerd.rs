@@ -3,7 +3,9 @@ use clap::{Parser, Subcommand};
 use openswap::{
     maker::{bind_port_retry, start_server, MakerError, MakerServer, MakerServerConfig},
     utill::{parse_proxy_auth, setup_maker_logger},
-    wallet::{BackendConfig, BondHint, CoreRpcConfig, ElectrumConfig, RestoreOptions, Wallet},
+    wallet::{
+        seed_cli, BackendConfig, BondHint, CoreRpcConfig, ElectrumConfig, RestoreOptions, Wallet,
+    },
 };
 use std::{path::PathBuf, sync::Arc};
 use zeroize::Zeroizing;
@@ -72,16 +74,25 @@ struct Cli {
     pub(crate) wallet_name: Option<String>,
     /// Password for the encryption of the wallet. Required when creating a
     /// new wallet (wallet files are always encrypted) and to open an
-    /// encrypted one.
+    /// encrypted one. Visible to other users in /proc while the process
+    /// runs; prefer `--password-file`.
     #[clap(name = "PASSWORD", long, short = 'p')]
     pub password: Option<String>,
+    /// Read the wallet password from this file (one trailing newline is
+    /// dropped). Keeps the password off the command line.
+    #[clap(
+        name = "PASSWORD_FILE",
+        long = "password-file",
+        conflicts_with = "PASSWORD"
+    )]
+    pub password_file: Option<PathBuf>,
     #[clap(subcommand)]
     command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Create the wallet and show its seed, then exit. Used by Docker setup.
+    /// Create the wallet (no seed is printed), then exit. Used by Docker setup.
     #[clap(hide = true)]
     InitWallet,
     /// Restore the wallet from a backup file or its seed phrase, then exit.
@@ -104,6 +115,18 @@ enum Commands {
         #[clap(long)]
         bond_hint: Vec<BondHint>,
     },
+    /// Show the wallet's seed phrase and confirm you wrote it down, then exit.
+    ///
+    /// Works offline on an existing wallet file: no backend is needed and the
+    /// maker does not start. The passphrase is asked at a hidden prompt, never
+    /// taken from `-p`. Runs only with stdout on a terminal. In Docker:
+    /// `docker exec -it openswap-makerd makerd -w <wallet> show-seed`, where
+    /// `<wallet>` is your `BITCOIN_WALLET_NAME` (default `openswap-maker`).
+    ShowSeed,
+    /// Store the original seed phrase in a wallet that has none, then exit.
+    ///
+    /// Asks for the passphrase and the phrase at hidden prompts.
+    AttachSeed,
     /// Write an encrypted backup of the existing wallet, then exit.
     ///
     /// Run it with the maker stopped and the Bitcoin Core or Electrum backend
@@ -125,6 +148,26 @@ fn main() -> Result<(), MakerError> {
         None => openswap::utill::get_maker_dir()?,
     };
 
+    // Offline: no config file, backend or maker start.
+    if matches!(
+        args.command,
+        Some(Commands::ShowSeed | Commands::AttachSeed)
+    ) {
+        if args.password.is_some() || args.password_file.is_some() {
+            return Err(MakerError::General(
+                "seed commands never take the passphrase on the command line; \
+                 leave out -p and --password-file and type it at the prompt",
+            ));
+        }
+        let name = args.wallet_name.as_deref().unwrap_or("maker");
+        let path = data_dir.join("wallets").join(name);
+        match args.command {
+            Some(Commands::ShowSeed) => seed_cli::show_seed(&path)?,
+            _ => seed_cli::attach_seed(&path)?,
+        }
+        return Ok(());
+    }
+
     // Load static settings from config file (auto-creates defaults if missing)
     let config_path = data_dir.join("config.toml");
     let mut config = MakerServerConfig::new(Some(&config_path))?;
@@ -135,7 +178,10 @@ fn main() -> Result<(), MakerError> {
     // operator's wallet and fidelity bond.
     let wallet_name = args.wallet_name.unwrap_or_else(|| "maker".to_string());
     config.wallet_name = wallet_name.clone();
-    let mut wallet_password = args.password.map(Zeroizing::new);
+    let mut wallet_password = match &args.password_file {
+        Some(file) => Some(openswap::utill::read_password_file(file)?),
+        None => args.password.map(Zeroizing::new),
+    };
     config.password = None;
     if let Some(tor_auth) = args.tor_auth {
         config.tor_auth_password = tor_auth;
@@ -183,6 +229,7 @@ fn main() -> Result<(), MakerError> {
             config.password = wallet_password.as_mut().map(|p| std::mem::take(&mut **p));
             return MakerServer::backup_wallet(config, output);
         }
+        Some(Commands::ShowSeed | Commands::AttachSeed) => unreachable!("handled above"),
         Some(Commands::InitWallet) => {}
         None => {}
     }
@@ -228,6 +275,24 @@ mod tests {
     #[test]
     fn plain_makerd_has_no_subcommand() {
         assert!(parse(&["-w", "m"]).unwrap().command.is_none());
+    }
+
+    #[test]
+    fn seed_commands_take_the_wallet_flag_the_docs_print() {
+        let cli = parse(&["-w", "openswap-maker", "show-seed"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::ShowSeed)));
+        assert_eq!(cli.wallet_name.as_deref(), Some("openswap-maker"));
+        assert!(matches!(
+            parse(&["attach-seed"]).unwrap().command,
+            Some(Commands::AttachSeed)
+        ));
+    }
+
+    #[test]
+    fn password_file_excludes_the_argv_password() {
+        let cli = parse(&["--password-file", "/run/secrets/pw"]).unwrap();
+        assert_eq!(cli.password_file, Some(PathBuf::from("/run/secrets/pw")));
+        assert!(parse(&["-p", "x", "--password-file", "pw"]).is_err());
     }
 
     #[test]

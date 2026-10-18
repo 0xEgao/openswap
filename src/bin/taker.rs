@@ -10,7 +10,7 @@ use openswap::{
         TakerConfig, TakerInitConfig,
     },
     utill::{parse_proxy_auth, setup_taker_logger, MAX_TX_COUNT, UTXO},
-    wallet::{AddressType, BondHint, CoreRpcConfig, RestoreOptions, Wallet},
+    wallet::{seed_cli, AddressType, BondHint, CoreRpcConfig, RestoreOptions, Wallet},
 };
 use serde_json::{json, to_string_pretty};
 use std::{
@@ -84,9 +84,19 @@ struct Cli {
 
     /// Password for the encryption of the wallet. Required when creating a
     /// new wallet (wallet files are always encrypted) and to open an
-    /// encrypted one.
+    /// encrypted one. Visible to other users in /proc while the process
+    /// runs; prefer `--password-file`.
     #[clap(name = "PASSWORD", long, short = 'p')]
     pub password: Option<String>,
+
+    /// Read the wallet password from this file (one trailing newline is
+    /// dropped). Keeps the password off the command line.
+    #[clap(
+        name = "PASSWORD_FILE",
+        long = "password-file",
+        conflicts_with = "PASSWORD"
+    )]
+    pub password_file: Option<PathBuf>,
 
     /// Sets the verbosity level of debug.log file
     #[arg(long, short = 'v', value_parser = ["off", "error", "warn", "info", "debug", "trace"], default_value = "info")]
@@ -317,6 +327,19 @@ enum Commands {
         #[clap(long)]
         bond_hint: Vec<BondHint>,
     },
+    /// Show the wallet's seed phrase and confirm you wrote it down.
+    ///
+    /// Works offline on an existing wallet file: no backend is needed and
+    /// nothing syncs. The passphrase is asked at a hidden prompt, never taken
+    /// from `-p`. Runs only with stdout on a terminal. Re-type the words it
+    /// asks for to record the backup.
+    ShowSeed,
+    /// Store the original seed phrase in a wallet that has none.
+    ///
+    /// For wallets made before phrases were stored. Asks for the passphrase
+    /// and the phrase at hidden prompts, and accepts only the phrase that
+    /// derives this wallet's key.
+    AttachSeed,
     /// Verify the deniability proof for a specific swap.
     VerifyDeniability {
         /// The swap ID to verify.
@@ -463,6 +486,25 @@ fn main() -> Result<(), TakerError> {
         Some(dir) => dir,
         None => openswap::utill::get_taker_dir()?,
     };
+    // Offline: no config file, backend or wallet sync.
+    if matches!(args.command, Commands::ShowSeed | Commands::AttachSeed) {
+        if wallet_password.is_some() || args.password_file.is_some() {
+            return Err(TakerError::General(
+                "seed commands never take the passphrase on the command line; \
+                 leave out -p and --password-file and type it at the prompt"
+                    .to_string(),
+            ));
+        }
+        let path = data_dir.join("wallets").join(&wallet_name);
+        match args.command {
+            Commands::ShowSeed => seed_cli::show_seed(&path)?,
+            _ => seed_cli::attach_seed(&path)?,
+        }
+        return Ok(());
+    }
+    if let Some(file) = &args.password_file {
+        wallet_password = Some(openswap::utill::read_password_file(file)?);
+    }
     // Static settings live in the file (auto-created with defaults if missing).
     // Read it here, before the backend bakes the proxy address in, so a
     // non-default `socks_port` reaches Tor instead of being silently ignored.
@@ -930,7 +972,7 @@ fn main() -> Result<(), TakerError> {
             let wallet = lock_debug!(taker.get_wallet().read()).unwrap();
             Wallet::backup_interactive(&wallet, None)?;
         }
-        Commands::Restore { .. } => {
+        Commands::Restore { .. } | Commands::ShowSeed | Commands::AttachSeed => {
             // Handled above before taker init
             unreachable!()
         }
@@ -972,6 +1014,13 @@ mod tests {
                 .unwrap();
         assert!(material.is_some());
         assert_eq!(backup.file_name, "w1");
+    }
+
+    #[test]
+    fn password_file_excludes_the_argv_password() {
+        let cli = parse(&["--password-file", "/run/secrets/pw", "fetch-offers"]).unwrap();
+        assert_eq!(cli.password_file, Some(PathBuf::from("/run/secrets/pw")));
+        assert!(parse(&["-p", "x", "--password-file", "pw", "fetch-offers"]).is_err());
     }
 
     #[test]

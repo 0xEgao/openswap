@@ -4,7 +4,7 @@
 //! for exposing swap functionality and reporting to other languages.
 
 use crate::{
-    security::{load_sensitive_struct, KeyMaterial, SerdeJson},
+    security::{is_encrypted_cbor, load_sensitive_struct, KeyMaterial, SerdeJson},
     utill::{get_taker_dir, is_unusable_fee_rate, parse_checked_address, MIN_RELAY_FEE_RATE},
     wallet::{
         infer_address_type, AddressType, Destination, RestoreOptions, Wallet, WalletBackup,
@@ -39,18 +39,19 @@ pub fn restore_wallet_from_backup_gui_app(
     password: Option<String>,
     options: RestoreOptions,
 ) -> Result<(), WalletError> {
-    let Some(mut password) = password.map(Zeroizing::new).filter(|p| !p.is_empty()) else {
+    let Some(password) = password.map(Zeroizing::new).filter(|p| !p.is_empty()) else {
         return Err(WalletError::General(
             "a passphrase is required; cleartext wallet files are not supported".to_string(),
         ));
     };
     // Probe first, so the decrypted backup is not held through a failing backend.
     Wallet::require_backend(&AnyBlockchain::from_config(&backend)?)?;
-    let (backup, encryption_material) = match load_sensitive_struct::<WalletBackup, SerdeJson>(
+    // The loader wipes its copy; `password` still keys the restored wallet.
+    let backup = match load_sensitive_struct::<WalletBackup, SerdeJson>(
         &backup_file_path,
-        Some(std::mem::take(&mut *password)),
+        Some(String::clone(&password)),
     ) {
-        Ok((backup, Some(material))) => (backup, material),
+        Ok((backup, Some(_))) => backup,
         Ok((_, None)) => {
             unreachable!("a supplied passphrase either decrypts or errors")
         }
@@ -72,13 +73,7 @@ pub fn restore_wallet_from_backup_gui_app(
         None => wallets_dir,
     };
 
-    Wallet::restore_owned_with(
-        backup,
-        &restored_wallet_path,
-        &backend,
-        encryption_material,
-        options,
-    )?;
+    Wallet::restore_owned_with(backup, &restored_wallet_path, &backend, password, options)?;
     Ok(())
 }
 
@@ -96,20 +91,18 @@ pub fn restore_wallet_from_mnemonic_gui_app(
     options: RestoreOptions,
 ) -> Result<(), WalletError> {
     let phrase = Zeroizing::new(phrase);
-    let Some(mut password) = password.map(Zeroizing::new).filter(|p| !p.is_empty()) else {
+    let Some(password) = password.map(Zeroizing::new).filter(|p| !p.is_empty()) else {
         return Err(WalletError::General(
             "a passphrase is required; cleartext wallet files are not supported".to_string(),
         ));
     };
-    let material = KeyMaterial::new_from_password(Some(std::mem::take(&mut *password)))
-        .expect("a non-empty passphrase always yields key material");
     let wallet_path = data_dir
         .map(Ok)
         .unwrap_or_else(get_taker_dir)?
         .join("wallets")
         .join(wallet_file_name);
 
-    Wallet::restore_from_mnemonic(phrase, &wallet_path, &backend, options, material)?;
+    Wallet::restore_from_mnemonic(phrase, &wallet_path, &backend, options, password)?;
     Ok(())
 }
 
@@ -153,23 +146,31 @@ impl Wallet {
     ///
     /// This is a ffi-only wrapper around [`Wallet::backup`] that derives the
     /// encryption material from the provided password. Backups contain the
-    /// master key and are always encrypted; a missing or empty password is
-    /// an error.
+    /// master key and seed phrase and are always encrypted; a missing or
+    /// empty password is an error.
     ///
     /// # Parameters
     ///
     /// - `destination_path`: Destination file path for the backup (`.json`)
     /// - `password`: Required password used to encrypt the backup
+    /// - `wallet_password`: The current wallet password, asked for on every
+    ///   backup. A missing or wrong one fails with [`WalletError::WrongPassword`].
     ///
     /// # Example
     ///
     /// ```ignore
-    /// wallet.backup_wallet_gui_app("/path/to/backup".to_string(), Some("my_password".to_string()))?;
+    /// wallet.backup_wallet_gui_app(
+    ///     "/path/to/backup".to_string(),
+    ///     Some("backup_password".to_string()),
+    ///     Some("wallet_password".to_string()),
+    /// )?;
     pub fn backup_wallet_gui_app(
         &self,
         destination_path: String,
         password: Option<String>,
+        wallet_password: Option<String>,
     ) -> Result<(), WalletError> {
+        let wallet_password = Zeroizing::new(wallet_password.unwrap_or_default());
         let Some(mut password) = password.map(Zeroizing::new).filter(|p| !p.is_empty()) else {
             return Err(WalletError::General(
                 "a passphrase is required for wallet backups; \
@@ -180,9 +181,44 @@ impl Wallet {
         let km = KeyMaterial::new_from_password(Some(std::mem::take(&mut *password)))
             .expect("a non-empty passphrase always yields key material");
         let backup_path = Path::new(&destination_path);
-        self.backup(backup_path, km)?;
+        self.backup(backup_path, wallet_password, km)?;
 
         Ok(())
+    }
+
+    /// The seed phrase for GUI/FFI applications to show the user. Wraps
+    /// [`Wallet::get_wallet_mnemonic`]: ask for the current wallet password
+    /// every time. The returned words are wiped on drop; copies the GUI
+    /// makes are not, so dispose of them once the user has written them down.
+    pub fn get_wallet_mnemonic_gui_app(
+        &self,
+        password: Option<String>,
+    ) -> Result<Zeroizing<String>, WalletError> {
+        let password = Zeroizing::new(password.unwrap_or_default());
+        Ok(self.get_wallet_mnemonic(password)?.words())
+    }
+
+    /// Stores the user's original phrase in a wallet that has none. Wraps
+    /// [`Wallet::attach_wallet_mnemonic`].
+    pub fn attach_wallet_mnemonic_gui_app(
+        &mut self,
+        password: Option<String>,
+        phrase: String,
+    ) -> Result<(), WalletError> {
+        let phrase = Zeroizing::new(phrase);
+        let password = Zeroizing::new(password.unwrap_or_default());
+        self.attach_wallet_mnemonic(password, phrase)
+    }
+
+    /// Records that the user wrote the seed phrase down, after the GUI has
+    /// shown it and checked a few re-typed words. Wraps
+    /// [`Wallet::confirm_seed_backup`].
+    pub fn confirm_seed_backup_gui_app(
+        &mut self,
+        password: Option<String>,
+    ) -> Result<(), WalletError> {
+        let password = Zeroizing::new(password.unwrap_or_default());
+        self.confirm_seed_backup(password)
     }
 
     /// Checks whether wallet is encrypted or not.
@@ -192,14 +228,7 @@ impl Wallet {
         }
 
         let content = std::fs::read(wallet_path).map_err(WalletError::IO)?;
-
-        // Try to deserialize as EncryptedData using CBOR
-        // If it succeeds, the wallet is encrypted
-        // If it fails, the wallet is plaintext
-        match serde_cbor::from_slice::<crate::security::EncryptedData>(&content) {
-            Ok(_) => Ok(true),   // Successfully parsed as EncryptedData = encrypted
-            Err(_) => Ok(false), // Failed to parse as EncryptedData = plaintext
-        }
+        Ok(is_encrypted_cbor(&content))
     }
 
     /// Returns a list of recent Incoming Transactions (bydefault last 10)
@@ -260,7 +289,7 @@ impl Wallet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wallet::api::test_support::test_wallet;
+    use crate::wallet::api::test_support::{test_wallet, test_wallet_with_key};
     use bitcoin::{
         secp256k1::{Keypair, Secp256k1, SecretKey},
         Address, Network,
@@ -307,6 +336,48 @@ mod tests {
                 err
             );
         }
+    }
+
+    /// Every GUI seed call needs the wallet password; a missing one is wrong.
+    #[test]
+    fn gui_seed_calls_need_the_password_every_time() {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon \
+                              abandon abandon abandon abandon abandon about";
+        let dir = tempdir().unwrap();
+        let key = Wallet::master_key_from_mnemonic(
+            &bip39::Mnemonic::parse(PHRASE).unwrap(),
+            Network::Regtest,
+        )
+        .unwrap();
+        let mut wallet = test_wallet_with_key(&dir.path().join("wallet"), key);
+        let password = || Some("test-password".to_string());
+
+        assert!(matches!(
+            wallet.get_wallet_mnemonic_gui_app(password()),
+            Err(WalletError::MnemonicUnavailable)
+        ));
+        assert!(matches!(
+            wallet.attach_wallet_mnemonic_gui_app(None, PHRASE.to_string()),
+            Err(WalletError::WrongPassword)
+        ));
+        wallet
+            .attach_wallet_mnemonic_gui_app(password(), PHRASE.to_string())
+            .unwrap();
+        for wrong in [None, Some("wrong-password".to_string())] {
+            assert!(matches!(
+                wallet.get_wallet_mnemonic_gui_app(wrong.clone()),
+                Err(WalletError::WrongPassword)
+            ));
+            assert!(matches!(
+                wallet.confirm_seed_backup_gui_app(wrong),
+                Err(WalletError::WrongPassword)
+            ));
+        }
+        let words = wallet.get_wallet_mnemonic_gui_app(password()).unwrap();
+        assert_eq!(words.as_str(), PHRASE);
+        assert!(!wallet.seed_backed_up());
+        wallet.confirm_seed_backup_gui_app(password()).unwrap();
+        assert!(wallet.seed_backed_up());
     }
 
     #[test]

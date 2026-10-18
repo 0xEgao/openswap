@@ -11,7 +11,7 @@ use zeroize::Zeroizing;
 use openswap::wallet::{
     ffi::{restore_wallet_from_backup_gui_app, restore_wallet_from_mnemonic_gui_app},
     AddressType, AnyBlockchain, BackendConfig, Blockchain, BondHint, CoreRPC, CoreRpcConfig,
-    Destination, Electrum, RestoreOptions, Wallet, WalletBackup,
+    Destination, Electrum, RestoreOptions, Wallet, WalletBackup, WalletError,
 };
 
 use openswap::{
@@ -22,6 +22,11 @@ use openswap::{
 use crate::test_framework::*;
 
 const V023_FIXTURES: &str = include_str!("../../fixtures/restore/v023/fixtures.json");
+
+/// The password of every wallet and backup made here.
+fn password() -> Zeroizing<String> {
+    Zeroizing::new("integration-test".to_string())
+}
 
 fn send_and_mine(
     bitcoind: &BitcoinD,
@@ -85,12 +90,7 @@ fn fund_past_address_gaps(wallet: &mut Wallet, node: &Node) {
 
 /// The default gap bridges the 150 emptied addresses but not the unused run
 /// before index 301; a gap of 200 reaches it.
-fn assert_restores_past_address_gaps(
-    backup: &WalletBackup,
-    dir: &Path,
-    backend: &BackendConfig,
-    km: &KeyMaterial,
-) {
+fn assert_restores_past_address_gaps(backup: &WalletBackup, dir: &Path, backend: &BackendConfig) {
     let wide = RestoreOptions {
         address_gap: 200,
         ..Default::default()
@@ -100,7 +100,7 @@ fn assert_restores_past_address_gaps(
         ("restored-wide-gap", wide, 302, 0.03),
     ] {
         let restored =
-            Wallet::restore_with(backup, &dir.join(name), backend, km.clone(), options).unwrap();
+            Wallet::restore_with(backup, &dir.join(name), backend, password(), options).unwrap();
         assert_eq!(*restored.get_external_index(), next_index, "{name}");
         assert_eq!(
             restored.get_balances().unwrap().spendable,
@@ -121,8 +121,10 @@ fn assert_ffi_restores_funded_wallet(
 ) {
     let bitcoind = node.bitcoind();
     let km = KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap();
-    let phrase = wallet.take_new_mnemonic().unwrap().words();
-    wallet.backup(&data_dir.join("backup"), km).unwrap();
+    let phrase = wallet.get_wallet_mnemonic(password()).unwrap().words();
+    wallet
+        .backup(&data_dir.join("backup"), password(), km)
+        .unwrap();
     for address_type in [AddressType::P2WPKH, AddressType::P2TR] {
         let external = wallet.get_next_external_address(address_type).unwrap();
         let internal = wallet
@@ -183,7 +185,7 @@ fn assert_ffi_restores_funded_wallet(
     for name in ["from-phrase", "from-backup"] {
         assert!(data_dir.join("wallets").join(name).exists(), "{}", name);
     }
-    let km = KeyMaterial::new_from_password(password).unwrap();
+    let wallet_password = || Zeroizing::new("integration-test".to_string());
     let mut restored_wallets = Vec::new();
     for name in ["lib-phrase", "lib-backup"] {
         let path = data_dir.join("wallets").join(name);
@@ -194,10 +196,10 @@ fn assert_ffi_restores_funded_wallet(
                 &path,
                 &backend,
                 RestoreOptions::default(),
-                km.clone(),
+                wallet_password(),
             )
         } else {
-            Wallet::restore(&backup, &path, &backend, km.clone())
+            Wallet::restore(&backup, &path, &backend, wallet_password())
         }
         .unwrap();
         assert_eq!(
@@ -205,6 +207,9 @@ fn assert_ffi_restores_funded_wallet(
             4,
             "{name}"
         );
+        // The backup carried the phrase, sealed again for the restored wallet.
+        let words = restored.get_wallet_mnemonic(wallet_password()).unwrap();
+        assert_eq!(words.words(), phrase, "{name}");
         restored_wallets.push(restored);
     }
 
@@ -240,7 +245,7 @@ fn named(backend: &BackendConfig, name: &str) -> BackendConfig {
 /// indexes 0/1/25/150), then restores that wallet from its phrase and from
 /// its v0.2.3 backup. Both must find the coins at index 150, which is beyond
 /// the default gap but within 200, and the announced bond keys must match.
-fn assert_restores_v023_wallet(backend: &BackendConfig, dir: &Path, node: &Node, km: &KeyMaterial) {
+fn assert_restores_v023_wallet(backend: &BackendConfig, dir: &Path, node: &Node) {
     let fixtures: Value = serde_json::from_str(V023_FIXTURES).unwrap();
     for kind in ["p2wpkh", "p2tr"] {
         for chain in ["external", "internal"] {
@@ -270,7 +275,7 @@ fn assert_restores_v023_wallet(backend: &BackendConfig, dir: &Path, node: &Node,
         &dir.join("v023-phrase"),
         &named(backend, "v023-phrase"),
         options(),
-        km.clone(),
+        Zeroizing::new("integration-test".to_string()),
     )
     .unwrap();
     assert_eq!(from_phrase.list_descriptor_utxo_spend_info().len(), 16);
@@ -306,10 +311,15 @@ fn assert_restores_v023_wallet(backend: &BackendConfig, dir: &Path, node: &Node,
         &backup,
         &dir.join("v023-backup"),
         &named(backend, "v023-backup"),
-        km.clone(),
+        password(),
         options(),
     )
     .unwrap();
+    // A backup from before phrases were stored restores without one.
+    assert!(matches!(
+        from_backup.get_wallet_mnemonic(password()),
+        Err(WalletError::MnemonicUnavailable)
+    ));
 
     let outpoints = |wallet: &Wallet| {
         let mut coins: Vec<_> = wallet
@@ -331,7 +341,7 @@ fn assert_restores_v023_wallet(backend: &BackendConfig, dir: &Path, node: &Node,
 /// both maturing in 10 blocks, then hands out 30 addresses it never funds.
 /// Returns a backup from before all that, and the hint that finds bond 0.
 fn create_sparse_bonds(wallet: &mut Wallet, node: &Node) -> (WalletBackup, BondHint) {
-    let seed_only = WalletBackup::from(&*wallet);
+    let seed_only = WalletBackup::new(wallet, password()).unwrap();
     let addr = wallet.get_next_external_address(AddressType::P2TR).unwrap();
     send_to_address(node.bitcoind(), &addr, Amount::from_btc(0.1).unwrap());
     node.mine(1);
@@ -366,7 +376,6 @@ fn assert_restores_sparse_bonds(
     hint: BondHint,
     dir: &Path,
     backend: &BackendConfig,
-    km: &KeyMaterial,
     node: &Node,
 ) {
     let indexes = |wallet: &Wallet| -> Vec<u32> {
@@ -384,14 +393,14 @@ fn assert_restores_sparse_bonds(
         backup,
         &dir.join("restored-hint"),
         backend,
-        km.clone(),
+        password(),
         hinted,
     )
     .unwrap();
     assert_eq!(indexes(&with_hint), [0, 1]);
 
     let mut restored =
-        Wallet::restore(backup, &dir.join("restored-no-hint"), backend, km.clone()).unwrap();
+        Wallet::restore(backup, &dir.join("restored-no-hint"), backend, password()).unwrap();
     assert_eq!(indexes(&restored), [1]);
     assert_eq!(
         restored.get_balances().unwrap().fidelity,
@@ -411,7 +420,7 @@ fn assert_restores_sparse_bonds(
         .unwrap();
     assert_eq!(restored.get_balances().unwrap().fidelity, Amount::ZERO);
 
-    let from_full = Wallet::restore(full, &dir.join("restored-full"), backend, km.clone()).unwrap();
+    let from_full = Wallet::restore(full, &dir.join("restored-full"), backend, password()).unwrap();
     assert_eq!(indexes(&from_full), [0, 1]);
     let spent: Vec<bool> = from_full
         .get_fidelity_bonds()
@@ -463,14 +472,16 @@ fn encwallet_encbackup_encrestore(node: &mut Node) {
     let mut wallet = Wallet::init(
         &original_wallet,
         AnyBlockchain::CoreRPC(CoreRPC::new(&rpc_config).unwrap()),
-        km.clone(),
+        Zeroizing::new("integration-test".to_string()),
     )
     .unwrap();
 
     let addr = wallet.get_next_external_address(AddressType::P2TR).unwrap();
     send_and_mine(bitcoind, &addr, 0.05, 1).unwrap();
 
-    let _ = wallet.backup(&wallet_backup_file, km.clone());
+    wallet
+        .backup(&wallet_backup_file, password(), km.clone())
+        .unwrap();
 
     // Bond 0 expires at once and is redeemed, so the restore must see it spent.
     wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
@@ -498,7 +509,7 @@ fn encwallet_encbackup_encrestore(node: &mut Node) {
         &backup,
         &restored_wallet_file,
         &BackendConfig::CoreRpc(rpc_config.clone()),
-        km.clone(),
+        password(),
     )
     .unwrap();
 
@@ -540,7 +551,7 @@ fn encwallet_encbackup_encrestore(node: &mut Node) {
         &backup,
         &nameless_dir,
         &BackendConfig::CoreRpc(rpc_config.clone()),
-        km.clone(),
+        password(),
     )
     .unwrap();
     assert_wallet_file_encrypted(&nameless_dir.join("original-wallet"), "integration-test");
@@ -560,7 +571,7 @@ fn encwallet_encbackup_encrestore_electrum(node: &mut Node) {
     let mut wallet = Wallet::init(
         &original_wallet,
         AnyBlockchain::Electrum(Electrum::new(&electrum_cfg).unwrap()),
-        km.clone(),
+        Zeroizing::new("integration-test".to_string()),
     )
     .unwrap();
 
@@ -568,7 +579,7 @@ fn encwallet_encbackup_encrestore_electrum(node: &mut Node) {
     send_and_mine(bitcoind, &addr, 0.05, 1).unwrap();
     wait_for_electrs_tip(bitcoind, node.electrsd(), &electrum_cfg);
 
-    wallet.backup(&backup_file, km.clone()).unwrap();
+    wallet.backup(&backup_file, password(), km).unwrap();
 
     // Bond 0 expires at once and is redeemed, so the restore must see it spent.
     wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
@@ -598,7 +609,7 @@ fn encwallet_encbackup_encrestore_electrum(node: &mut Node) {
         &backup,
         &restored_wallet_file,
         &BackendConfig::Electrum(electrum_cfg.clone()),
-        km.clone(),
+        password(),
     )
     .unwrap();
 
@@ -626,7 +637,7 @@ fn original_wallet<B: TestBackend>(
     let wallet = Wallet::init(
         &dir.join("original-wallet"),
         AnyBlockchain::from_config(&backend).unwrap(),
-        km.clone(),
+        Zeroizing::new("integration-test".to_string()),
     )
     .unwrap();
     (dir, backend, wallet, km)
@@ -644,14 +655,14 @@ fn run_restore_past_address_gaps<B: TestBackend>(node: &mut Node) {
 
     // Taken before any hand-out, so only the gap search can reach the funds.
     let backup_file = dir.join("wallet-backup.json");
-    wallet.backup(&backup_file, km.clone()).unwrap();
+    wallet.backup(&backup_file, password(), km).unwrap();
     fund_past_address_gaps(&mut wallet, node);
     let (backup, _) = load_sensitive_struct::<WalletBackup, SerdeJson>(
         &backup_file,
         Some("integration-test".to_string()),
     )
     .unwrap();
-    assert_restores_past_address_gaps(&backup, &dir, &backend, &km);
+    assert_restores_past_address_gaps(&backup, &dir, &backend);
 
     if let BackendConfig::CoreRpc(rpc_config) = &backend {
         // Core reports a rejected descriptor in its result, not as an RPC error.
@@ -683,15 +694,14 @@ fn run_ffi_restore_funded<B: TestBackend>(node: &mut Node) {
     ],
 )]
 fn run_restore_sparse_bonds<B: TestBackend>(node: &mut Node) {
-    let (dir, backend, mut wallet, km) = original_wallet::<B>(node);
+    let (dir, backend, mut wallet, _) = original_wallet::<B>(node);
     let (seed_only, hint) = create_sparse_bonds(&mut wallet, node);
     assert_restores_sparse_bonds(
         &seed_only,
-        &WalletBackup::from(&wallet),
+        &WalletBackup::new(&wallet, password()).unwrap(),
         hint,
         &dir,
         &backend,
-        &km,
         node,
     );
 }
@@ -706,6 +716,5 @@ fn run_restore_sparse_bonds<B: TestBackend>(node: &mut Node) {
 fn run_restore_v023<B: TestBackend>(node: &mut Node) {
     let dir = node.temp_dir().join("wallets");
     let backend = node.backend_config::<B>("original-wallet");
-    let km = KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap();
-    assert_restores_v023_wallet(&backend, &dir, node, &km);
+    assert_restores_v023_wallet(&backend, &dir, node);
 }

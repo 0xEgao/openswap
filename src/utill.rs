@@ -55,12 +55,11 @@ pub(crate) fn global_secp() -> &'static Secp256k1<All> {
 
 use crate::{
     error::NetError,
-    lock_debug,
     protocol::{
         common_messages::ProtocolVersion, contract::derive_maker_pubkey_and_nonce,
         error::ProtocolError,
     },
-    wallet::{SecretMnemonic, UTXOSpendInfo, WalletError},
+    wallet::{UTXOSpendInfo, WalletError},
 };
 
 const INPUT_CHARSET: &str =
@@ -858,6 +857,43 @@ impl Drop for RawModeGuard {
         let _ = disable_raw_mode();
     }
 }
+const PASSWORD_FILE_MAX: usize = 4096;
+
+/// Reads a wallet password from a file, dropping one trailing newline.
+/// Keeps the secret off the command line, where `/proc` shows it.
+pub fn read_password_file(path: &std::path::Path) -> io::Result<Zeroizing<String>> {
+    // Fixed capacity: a growing buffer would leave unwiped copies behind.
+    let mut raw = Zeroizing::new(Vec::with_capacity(PASSWORD_FILE_MAX + 1));
+    fs::File::open(path)?
+        .take(PASSWORD_FILE_MAX as u64 + 1)
+        .read_to_end(&mut raw)?;
+    if raw.len() > PASSWORD_FILE_MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "password file is too large",
+        ));
+    }
+    let mut password =
+        Zeroizing::new(String::from_utf8(std::mem::take(&mut *raw)).map_err(|e| {
+            let mut bytes = e.into_bytes();
+            bytes.zeroize();
+            io::Error::new(io::ErrorKind::InvalidData, "password file is not UTF-8")
+        })?);
+    if password.ends_with('\n') {
+        password.pop();
+        if password.ends_with('\r') {
+            password.pop();
+        }
+    }
+    if password.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "password file is empty",
+        ));
+    }
+    Ok(password)
+}
+
 /// Returns the current time as seconds since the Unix epoch.
 /// Prompts the user for a password using the given prompt string.
 /// Temporarily disables canonical mode and echo to mask each typed
@@ -934,23 +970,6 @@ pub fn prompt_password(message: String) -> io::Result<Zeroizing<String>> {
     Ok(Zeroizing::new(
         String::from_utf8(std::mem::take(&mut *password)).expect("typed characters are UTF-8"),
     ))
-}
-
-/// Writes a new wallet's seed phrase to stdout, shown once at wallet creation.
-/// Returns write errors instead of panicking like `println!`.
-pub fn print_new_wallet_seed(mnemonic: &SecretMnemonic) -> io::Result<()> {
-    let mut out = lock_debug!(io::stdout().lock());
-    writeln!(out, "\n========== New Wallet Seed Phrase ==========")?;
-    // A whole line skips stdout's buffer, which would keep an unwiped copy.
-    // `words()` reserves the byte for the newline, so this does not reallocate.
-    let mut words = mnemonic.words();
-    words.push('\n');
-    out.write_all(words.as_bytes())?;
-    writeln!(
-        out,
-        "\nWrite these words down and store them offline. They will not be shown again."
-    )?;
-    out.flush()
 }
 
 /// Publish `local_port` as an ephemeral Tor onion service via `ADD_ONION`.
@@ -1323,6 +1342,25 @@ mod tests {
     use crate::protocol::common_messages::{MakerHello, MakerToTakerMessage, ProtocolVersion};
 
     use super::*;
+
+    #[test]
+    fn password_file_drops_one_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let read = |content: &str| {
+            let path = dir.path().join("pw");
+            fs::write(&path, content).unwrap();
+            read_password_file(&path)
+        };
+        assert_eq!(*read("secret").unwrap(), "secret");
+        assert_eq!(*read("secret\n").unwrap(), "secret");
+        assert_eq!(*read("secret\r\n").unwrap(), "secret");
+        assert_eq!(*read("secret\n\n").unwrap(), "secret\n");
+        assert!(read("").is_err());
+        assert!(read("\n").is_err());
+        assert!(read(&"x".repeat(PASSWORD_FILE_MAX + 1)).is_err());
+        assert!(read(&"x".repeat(PASSWORD_FILE_MAX)).is_ok());
+        assert!(read_password_file(&dir.path().join("missing")).is_err());
+    }
 
     #[test]
     fn capped_fee_steps_down_until_the_output_relays() {

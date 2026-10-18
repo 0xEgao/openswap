@@ -104,7 +104,10 @@ Options:
           Sets the taker wallet's name. If the wallet file already exists, it will load that wallet. Default: taker-wallet
 
   -p, --PASSWORD <PASSWORD>
-          Password for the encryption of the wallet. Required when creating a new wallet (wallet files are always encrypted) and to open an encrypted one
+          Password for the encryption of the wallet. Required when creating a new wallet (wallet files are always encrypted) and to open an encrypted one. Visible to other users in /proc while the process runs; prefer `--password-file`
+
+      --password-file <PASSWORD_FILE>
+          Read the wallet password from this file (one trailing newline is dropped). Keeps the password off the command line
 
   -v, --verbosity <VERBOSITY>
           Sets the verbosity level of debug.log file
@@ -123,7 +126,7 @@ If you build the taker with `--features lightning`, it also has the `ln-swap-in`
 
 ### Key Points About Command Arguments
 
-- The `-p` or `--PASSWORD` option sets the wallet encryption passphrase. It is **required** when creating a new wallet and to open an encrypted one — wallet files are always encrypted (see [wallet security](./wallet-security.md)). The passphrase must be supplied on every (re)start; it is never persisted.
+- The wallet passphrase creates and opens the wallet file, which is always encrypted (see [wallet security](./wallet-security.md)). Give it with `--password-file <FILE>` (one trailing newline is dropped) or with `-p`/`--PASSWORD`, never both. Prefer the file: other users on the machine can see `-p` in the process list. One of the two is **required** every time a command opens the wallet; the passphrase is never saved. `restore` instead asks for the new wallet's passphrase at a prompt. `show-seed` and `attach-seed` refuse both options and ask only at a hidden prompt.
 
 - The `-r` or `--ADDRESS:PORT` option specifies the Bitcoin Core RPC address and port. By default, this is set to `127.0.0.1:38332`.
 
@@ -143,10 +146,10 @@ If you build the taker with `--features lightning`, it also has the `ln-swap-in`
   - Pass your custom values using the `-r` and `-a` options, like this:
 
 ```bash
-  $ ./taker -r 127.0.0.1:38332 -a myuser:mypass -p my-wallet-passphrase <SUBCOMMAND>
+  $ ./taker -r 127.0.0.1:38332 -a myuser:mypass --password-file ./wallet.pass <SUBCOMMAND>
 ```
 
-> **Note:** Every `taker` command opens the encrypted wallet, so `-p` is required on each invocation. The tutorial's bare `taker <SUBCOMMAND>` examples assume it is supplied.
+> **Note:** Every `taker` command opens the encrypted wallet, so each invocation needs `--password-file` or `-p` (except `restore`, which prompts for the new wallet's passphrase, and `show-seed` and `attach-seed`, which prompt for the current one). The tutorial's bare `taker <SUBCOMMAND>` examples assume one is supplied.
 
 ## For this tutorial, we'll assume a custom configuration with port 38332. Output examples will reflect this setup.
 
@@ -532,11 +535,23 @@ To back up the selected wallet (use `-w` to pick a non-default wallet), run:
 $ taker backup
 ```
 
-The backup is created in the current working directory as `<wallet_name>-backup.json`. Backups contain the master key and are always encrypted — you will be prompted interactively for a passphrase.
+The backup is created in the current working directory as `<wallet_name>-backup.json`. Backups contain the master key and are always encrypted. The command asks for two passphrases at hidden prompts. First it asks for your current wallet passphrase, even though the wallet is already unlocked: that fresh entry authorizes putting the seed phrase into the backup. Then it asks for a backup passphrase, which encrypts only the backup file.
 
 Backup and restore both need your Bitcoin Core or Electrum backend running and reachable. They stop with an error if it is not.
 
 A backup holds your keys, your fidelity bond records and your swept-coin tags. It does not hold swaps in progress or the swap report file. If swaps are open, `taker backup` prints how many. Finish them first, and copy `<wallet_name>_swap_report.json` by hand. See [wallet security](wallet-security.md) for the full list.
+
+### Your Seed Phrase
+
+A new wallet seals its seed phrase in the wallet file and prints nothing. The taker warns on every command until you confirm a backup. Show the phrase and confirm it:
+
+```bash
+$ taker -w <wallet_name> show-seed
+```
+
+The command works offline and asks for the passphrase at a hidden prompt, never from `-p` or `--password-file`. It prints only to a terminal, not a pipe. Write the words down, then re-type the words it asks for. The command records the confirmation only when no other `taker` command is running on this wallet, and says so if it cannot. Wait for the other command to finish, then run `show-seed` again.
+
+A wallet made before phrases were stored has none, and `show-seed` says so. It never invents one. If you still have the original phrase, store it with `taker -w <wallet_name> attach-seed`. It accepts only the phrase that derives this wallet's key. Otherwise keep an encrypted backup, or sweep the coins to a new wallet.
 
 ### Restoring a Wallet
 

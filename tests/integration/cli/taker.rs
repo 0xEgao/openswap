@@ -3,6 +3,8 @@
 //! and send-to-address, verifying correct wallet behavior through the command-line interface.
 
 use bitcoin::{address::NetworkChecked, Address, Amount};
+use openswap::wallet::Wallet;
+use zeroize::Zeroizing;
 
 use serde_json::{json, Value};
 use std::{
@@ -93,10 +95,25 @@ fn wallet_commands(node: &mut Node) {
 
     info!("Funding taker with 3 UTXOs of 1 BTC each");
     // Fund the taker with 3 utxos of 1 BTC each.
-    for _ in 0..3 {
-        // The command that creates the wallet prints the seed phrase before its
-        // result, so the address is the last line.
+    for i in 0..3 {
         let output = taker_cli.execute(&["get-new-address"]);
+        if i == 0 {
+            // The first call created the wallet. Its output is the address
+            // alone, with none of the seed words.
+            let wallet = Wallet::open_offline(
+                &taker_cli.data_dir.join("wallets").join("test_wallet"),
+                Zeroizing::new("integration-test".to_string()),
+            )
+            .unwrap();
+            let phrase = wallet
+                .get_wallet_mnemonic(Zeroizing::new("integration-test".to_string()))
+                .unwrap()
+                .words();
+            assert_eq!(output.lines().count(), 1, "{output}");
+            for word in phrase.split(' ') {
+                assert!(!output.split_whitespace().any(|w| w == word));
+            }
+        }
         let taker_address = output.lines().last().unwrap();
 
         let taker_address: Address<NetworkChecked> =
@@ -164,6 +181,48 @@ fn wallet_commands(node: &mut Node) {
     info!("Transfer verification successful");
 
     info!("Taker CLI test completed successfully!");
+}
+
+/// `show-seed` is the only way to read the seed, so it must refuse a piped
+/// stdout and a passphrase on argv, and leave the wallet file untouched.
+#[world_test(backend = BitcoindBackend)]
+fn show_seed_refuses_pipes_and_argv_passwords(node: &mut Node) {
+    let taker_cli = TakerCli::new(node);
+    taker_cli.execute(&["get-new-address"]);
+    let data_dir = taker_cli.data_dir.to_str().unwrap();
+    let wallet_file = taker_cli.data_dir.join("wallets").join("test_wallet");
+    let before = fs::read(&wallet_file).unwrap();
+
+    let refused = |bin: &str, args: &[&str], needle: &str| {
+        let output = Command::new(bin).args(args).output().unwrap();
+        assert!(!output.status.success(), "{:?}", args);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(needle), "{:?}: {}", args, stderr);
+    };
+
+    // Both binaries can read this wallet offline. A pipe is refused, and
+    // neither argv passwords nor password files may authorize seed commands.
+    let base = ["-d", data_dir, "-w", "test_wallet"];
+    for bin in [env!("CARGO_BIN_EXE_taker"), env!("CARGO_BIN_EXE_makerd")] {
+        let piped: Vec<&str> = base.iter().copied().chain(["show-seed"]).collect();
+        refused(bin, &piped, "terminal");
+        for command in ["show-seed", "attach-seed"] {
+            for credential in [
+                ["--PASSWORD", "integration-test"],
+                ["--password-file", "must-not-be-read"],
+            ] {
+                let argv: Vec<&str> = base
+                    .iter()
+                    .copied()
+                    .chain(credential)
+                    .chain([command])
+                    .collect();
+                refused(bin, &argv, "command line");
+            }
+        }
+    }
+
+    assert_eq!(fs::read(&wallet_file).unwrap(), before);
 }
 
 /// The CLI is the only place a maker's standing is put into words, so a state

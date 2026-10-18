@@ -110,10 +110,10 @@ Both commands run on their own and then exit. They do not start the maker. Both 
 ### Backup
 
 ```bash
-$ makerd -p <wallet-passphrase> backup -o maker-backup.json
+$ makerd --password-file <path> backup -o maker-backup.json
 ```
 
-`-p` is the wallet's own passphrase, needed to open the encrypted wallet; it goes before `backup`. The command then asks for a backup password, which is separate: it encrypts only the backup file. It writes an encrypted file. Without `-o`, the file is `<wallet>-backup.json` in the current directory. The file always ends in `.json`: `-o maker.bak` writes `maker.json`. The log shows the path written. The command needs an existing wallet. It never creates one.
+`--password-file` (or `-p`) is the wallet's own passphrase. It only unlocks the wallet file at startup; it does not authorize the seed export. The command then asks for two more passphrases at hidden prompts. First it asks for the current wallet passphrase again, which opens the seed phrase to put it into the backup. Then it asks for a backup password, which is separate: it encrypts only the backup file. It writes an encrypted file. Without `-o`, the file is `<wallet>-backup.json` in the current directory. The file always ends in `.json`: `-o maker.bak` writes `maker.json`. The log shows the path written. The command needs an existing wallet. It never creates one.
 
 The backup holds your keys, your fidelity bond records and your swept-coin tags. It does not hold swaps in progress or the swap report file. Finish open swaps first. Copy `<wallet>_swap_report.json` by hand. There is no backup command in `maker-cli`.
 
@@ -234,7 +234,10 @@ Options:
           Optional wallet name. If the wallet exists, load the wallet, else create a new wallet with the given name. Default: maker
 
   -p, --PASSWORD <PASSWORD>
-          Password for the encryption of the wallet. Required when creating a new wallet (wallet files are always encrypted) and to open an encrypted one
+          Password for the encryption of the wallet. Required when creating a new wallet (wallet files are always encrypted) and to open an encrypted one. Visible to other users in /proc while the process runs; prefer `--password-file`
+
+      --password-file <PASSWORD_FILE>
+          Read the wallet password from this file (one trailing newline is dropped). Keeps the password off the command line
 
   -h, --help
           Print help (see a summary with '-h')
@@ -257,7 +260,7 @@ This will give you detailed information about the options and arguments availabl
 
 - The `-w` or `--WALLET` option selects the wallet file. The default wallet name is **`maker`**.
 
-- The `-p` or `--PASSWORD` option sets the wallet encryption passphrase. It is **required** when creating a new wallet and to open an encrypted one — wallet files are always encrypted (see [wallet security](./wallet-security.md)). The passphrase must be supplied on every (re)start; it is never persisted.
+- The wallet passphrase creates and opens the wallet file, which is always encrypted (see [wallet security](./wallet-security.md)). Give it with `--password-file <FILE>` (one trailing newline is dropped) or with `-p`/`--PASSWORD`, never both. Prefer the file: other users on the machine can see `-p` in the process list. One of the two is **required** on every start; the passphrase is never saved. `restore` instead asks for the new wallet's passphrase at a prompt. `show-seed` and `attach-seed` refuse both options and ask only at a hidden prompt.
 
 - #### If you're using the **default configuration**:
 
@@ -267,7 +270,7 @@ This will give you detailed information about the options and arguments availabl
   - Pass your custom values using the `-r` and `-a` options, like this:
 
 ```bash
-  $ ./makerd -r 127.0.0.1:38332 -a myuser:mypass -p my-wallet-passphrase
+  $ ./makerd -r 127.0.0.1:38332 -a myuser:mypass --password-file ./wallet.pass
 ```
 
 ## For this tutorial, we'll assume a custom configuration with port 38332. Output examples will reflect this setup.
@@ -279,10 +282,10 @@ This will give you detailed information about the options and arguments availabl
 To start `makerd`, run the following command:
 
 ```bash
-$ ./makerd -a user:password -r 127.0.0.1:38332 -p my-wallet-passphrase
+$ ./makerd -a user:password -r 127.0.0.1:38332 --password-file ./wallet.pass
 ```
 
-This will launch `makerd` and connect it to the Bitcoin RPC core running on its RPC port, using the default data directory for `maker` located at `$HOME/.openswap/maker`. The `-p` passphrase is required every time: it opens (or creates) the encrypted wallet file.
+This will launch `makerd` and connect it to the Bitcoin RPC core running on its RPC port, using the default data directory for `maker` located at `$HOME/.openswap/maker`. The passphrase is required every time, from `--password-file` as here or from `-p`: it opens (or creates) the encrypted wallet file.
 
 **What happens next:**
 
@@ -292,22 +295,19 @@ This will launch `makerd` and connect it to the Bitcoin RPC core running on its 
   INFO openswap::wallet::api - Wallet file at "/path/to/maker" successfully loaded.
   ```
 
-- **New Wallet Creation**: If no wallet file is found, `makerd` will create a new wallet named `maker`. Wallet files are always encrypted, so a wallet passphrase must be supplied via `-p`/`--PASSWORD` when creating (and later opening) the wallet — restarts always require an operator to provide it:
+- **New Wallet Creation**: If no wallet file is found, `makerd` will create a new wallet named `maker`. Wallet files are always encrypted, so a wallet passphrase must be supplied via `--password-file` or `-p`/`--PASSWORD` when creating (and later opening) the wallet — restarts always require an operator to provide it:
 
   ```bash
-  $ ./makerd -a user:password -r 127.0.0.1:38332 -p my-wallet-passphrase
+  $ ./makerd -a user:password -r 127.0.0.1:38332 --password-file ./wallet.pass
   ```
 
-  On creation, the wallet's mnemonic seed phrase is displayed once on the terminal — back it up securely before continuing:
+  On creation, the wallet's seed phrase is sealed in the wallet file and not printed. `makerd` warns on every start until you back it up. Run `makerd -w <wallet> show-seed` in a terminal, write the words down, and re-type the words it asks for:
 
   ```bash
-  INFO openswap::wallet::api - New Wallet created at : "$HOME/.openswap/maker/wallets/maker"
-
-  ========== New Wallet Seed Phrase ==========
-  harvest trust catalog degree oxygen business crawl enemy hamster music this idle
-
-  Write these words down and store them offline. They will not be shown again.
+  $ makerd -w maker show-seed
   ```
+
+  The command works offline, asks for the passphrase at a hidden prompt, and refuses unless stdout is a terminal. It shows the words and never writes while the maker runs. To record the confirmation, stop the maker first: it holds the wallet and would overwrite the change. In Docker, run `./docker-setup show-seed`: it stops the maker, shows the words, records the confirmation and starts the maker again. `docker exec -it openswap-makerd makerd -w <wallet> show-seed`, with your `BITCOIN_WALLET_NAME` as `<wallet>` (default `openswap-maker`), only shows the words while the maker runs. See [Docker](./docker.md).
 
 - **Configuration File**: If no `config` file exists, `makerd` will create a default `config.toml` file at `$HOME/.openswap/maker/config.toml`:
 

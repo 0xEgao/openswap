@@ -6,7 +6,6 @@
 use std::{
     cmp::max,
     fmt::Display,
-    io::{self, IsTerminal},
     path::PathBuf,
     str::FromStr,
     thread,
@@ -42,9 +41,9 @@ use crate::{
     protocol::{contract::create_multisig_redeemscript, ProtocolVersion},
     utill::{
         capped_fee, compute_checksum, fee_at_rate_sats, generate_keypair,
-        get_hd_path_from_descriptor, now_secs, print_new_wallet_seed, redeemscript_to_scriptpubkey,
-        HEART_BEAT_INTERVAL, LEGACY_CONTRACT_SPEND_VSIZE, MIN_RELAY_FEE_RATE,
-        TAPROOT_KEYPATH_VSIZE, TX_BROADCAST_TIMEOUT, TX_CONFIRMATION_TIMEOUT,
+        get_hd_path_from_descriptor, now_secs, redeemscript_to_scriptpubkey, HEART_BEAT_INTERVAL,
+        LEGACY_CONTRACT_SPEND_VSIZE, MIN_RELAY_FEE_RATE, TAPROOT_KEYPATH_VSIZE,
+        TX_BROADCAST_TIMEOUT, TX_CONFIRMATION_TIMEOUT,
     },
 };
 
@@ -58,6 +57,8 @@ use super::{
     backup::RestoreOptions,
     blockchain::{AnyBlockchain, BackendConfig, Blockchain, HdOrigin},
     error::WalletError,
+    seed::{seal_mnemonic, SEED_NOT_BACKED_UP},
+    seed_cli::WalletInUse,
     storage::{AddressType, SecretXpriv, WalletStore},
     swapcoin::{contract_timelock, WatchOnlySwapCoin},
 };
@@ -88,26 +89,6 @@ const LEGACY_TIMELOCK_VSIZE: u64 = 142;
 /// ≈138 + 2 (growing block-height)
 const TAPROOT_TIMELOCK_VSIZE: u64 = 140;
 
-/// A BIP39 seed phrase for one-time display.No `Debug`/`Display`;
-/// [`SecretMnemonic::words`] is the only reader.
-pub struct SecretMnemonic(Mnemonic);
-
-impl SecretMnemonic {
-    /// Callers must not log or persist the result.
-    pub fn words(&self) -> Zeroizing<String> {
-        // Sized up front: a growing string frees unwiped copies of the words.
-        let size = self.0.words().map(|word| word.len() + 1).sum();
-        let mut phrase = Zeroizing::new(String::with_capacity(size));
-        for word in self.0.words() {
-            if !phrase.is_empty() {
-                phrase.push(' ');
-            }
-            phrase.push_str(word);
-        }
-        phrase
-    }
-}
-
 /// Represents a Bitcoin wallet with associated functionality and data.
 pub struct Wallet {
     pub(crate) blockchain: AnyBlockchain,
@@ -118,11 +99,11 @@ pub struct Wallet {
     /// the master key in memory. The original passphrase is never stored —
     /// only the derived key is kept in memory.
     pub(crate) store_enc_material: KeyMaterial,
-    /// Transient: seed phrase of a wallet created by
-    /// [`Wallet::init`]. Read once via [`Wallet::take_new_mnemonic`].
-    pub(super) new_mnemonic: Option<SecretMnemonic>,
     /// Wallet-side set of outpoints excluded from coin selection.
     pub(crate) locked_utxos: HashSet<OutPoint>,
+    /// Shared lock on the wallet file for this owner's lifetime, so the
+    /// offline seed commands never write under it. `None` only offline.
+    pub(crate) _in_use: Option<WalletInUse>,
 }
 
 /// Manual impl: `AnyBlockchain` (and the encryption material) carry no useful
@@ -451,58 +432,25 @@ pub struct Balances {
     pub spendable: Amount,
 }
 
-fn require_seed_terminal(docker: bool, terminal: bool, log_free: bool) -> Result<(), WalletError> {
-    if docker && !(terminal && log_free) {
-        return Err(WalletError::General(
-            "New Docker wallets need an interactive terminal with Docker logging disabled; \
-             run once with `docker run -it --log-driver none -e OPENSWAP_SEED_LOG_FREE=1`"
-                .into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Shows a new wallet's seed phrase with `show`. If that fails, nobody saw
-/// the phrase, so the wallet file just written is removed and a rerun creates
-/// a fresh wallet with a new phrase. A loaded wallet has no phrase to show.
-fn show_new_seed_or_remove(
-    wallet: &mut Wallet,
-    show: impl FnOnce(&SecretMnemonic) -> io::Result<()>,
-) -> Result<(), WalletError> {
-    let Some(mnemonic) = wallet.take_new_mnemonic() else {
-        return Ok(());
-    };
-    let Err(e) = show(&mnemonic) else {
-        return Ok(());
-    };
-    drop(mnemonic);
-    let path = &wallet.wallet_file_path;
-    match std::fs::remove_file(path) {
-        Ok(()) => {
-            log::error!(
-                "Failed to display the new wallet seed phrase: {e}. \
-                 Removed the new wallet at {path:?}; run again to create a new one."
-            );
-            Err(WalletError::IO(e))
-        }
-        Err(remove_error) => Err(WalletError::General(format!(
-            "failed to display the new wallet seed phrase: {e}; could not remove \
-             the new wallet at {path:?} ({remove_error}); delete it and run again \
-             to get a new phrase"
-        ))),
-    }
-}
-
 impl Wallet {
     /// Initialize the wallet at a given path.
     ///
     /// The path should include the full path for a wallet file.
     /// If the wallet file doesn't exist it will create a new wallet file.
+    /// `password` encrypts the file and seals the new seed phrase in it; read
+    /// the phrase back with [`Wallet::get_wallet_mnemonic`].
     pub fn init(
         path: &Path,
         blockchain: AnyBlockchain,
-        store_enc_material: KeyMaterial,
+        password: Zeroizing<String>,
     ) -> Result<Self, WalletError> {
+        if password.is_empty() {
+            return Err(WalletError::General(
+                "a passphrase is required to create a wallet; \
+                 cleartext wallet files are not supported"
+                    .to_string(),
+            ));
+        }
         let network = blockchain.get_blockchain_info()?.chain;
         // Refuse old Core before a seed is generated or a wallet file is
         // written, whichever caller creates the wallet.
@@ -519,12 +467,19 @@ impl Wallet {
             })?
             .to_string();
 
+        // Network and key derivation come first: none of it runs while the phrase exists.
         let wallet_birthday = blockchain.get_block_count()?;
+        let store_enc_material = KeyMaterial::new_from_password(Some(password.to_string()))
+            .expect("a passphrase always yields key material");
         let mnemonic = Mnemonic::generate(12)?;
         let master_key = SecretXpriv(Self::master_key_from_mnemonic(&mnemonic, network)?);
+        let sealed_mnemonic = seal_mnemonic(&mnemonic, &master_key.0, network, &password)?;
+        drop(mnemonic);
+        drop(password);
+        let in_use = WalletInUse::shared(path)?;
         // WalletStore::init seals the master key before the first write, so
-        // the plaintext key never reaches disk.
-        let store = WalletStore::init(
+        // the plaintext key never reaches disk. The phrase is in that write.
+        let store = WalletStore::init_with(
             file_name,
             path,
             network,
@@ -532,19 +487,21 @@ impl Wallet {
             Some(wallet_birthday),
             None,
             &store_enc_material,
+            |store| store.sealed_mnemonic = Some(sealed_mnemonic),
         )?;
         drop(master_key);
         log::info!(
             "Wallet birth_height = {wallet_birthday}, last_synced_height = {:?}",
             store.last_synced_height
         );
+        log::warn!("{SEED_NOT_BACKED_UP}");
         Ok(Self {
             blockchain,
             wallet_file_path: path.to_path_buf(),
             store,
             store_enc_material,
-            new_mnemonic: Some(SecretMnemonic(mnemonic)),
             locked_utxos: HashSet::new(),
+            _in_use: Some(in_use),
         })
     }
 
@@ -555,11 +512,6 @@ impl Wallet {
     ) -> Result<Xpriv, WalletError> {
         let seed = zeroize::Zeroizing::new(mnemonic.to_seed(""));
         Ok(Xpriv::new_master(network, seed.as_slice())?)
-    }
-
-    /// `Some` at most once; always `None` for loaded or restored wallets.
-    pub fn take_new_mnemonic(&mut self) -> Option<SecretMnemonic> {
-        self.new_mnemonic.take()
     }
 
     /// Get the wallet name
@@ -597,6 +549,8 @@ impl Wallet {
             password = None;
         }
 
+        // Taken before the read, so a seed command can't write after it.
+        let in_use = WalletInUse::shared(path)?;
         let (mut store, store_enc_material) = match WalletStore::read_from_disk(
             path,
             password.as_mut().map(|p| std::mem::take(&mut **p)),
@@ -614,7 +568,7 @@ impl Wallet {
             Err(WalletError::Security(SecurityError::PasswordRequired)) => {
                 return Err(WalletError::General(format!(
                     "wallet file {path:?} is encrypted; \
-                         provide the wallet passphrase via -p/--PASSWORD"
+                         provide the wallet passphrase via --password-file or -p"
                 )))
             }
             Err(e) => return Err(e),
@@ -655,14 +609,16 @@ impl Wallet {
                 .pending_restore
                 .get_or_insert_with(RestoreOptions::default);
         }
-        Ok(Self {
+        let wallet = Self {
             blockchain,
             wallet_file_path: path.to_path_buf(),
             store,
             store_enc_material,
-            new_mnemonic: None,
             locked_utxos: HashSet::new(),
-        })
+            _in_use: Some(in_use),
+        };
+        wallet.warn_if_seed_not_backed_up();
+        Ok(wallet)
     }
 
     /// Loads an existing wallet from the given path or initializes a new one if none exists.
@@ -690,18 +646,11 @@ impl Wallet {
             wallet
         } else {
             // wallet doesn't exists at the given path, create a new one
-            let Some(mut password) = password.map(Zeroizing::new).filter(|p| !p.is_empty()) else {
-                return Err(WalletError::General(
-                    "a passphrase is required to create a wallet; \
-                     cleartext wallet files are not supported"
-                        .to_string(),
-                ));
-            };
-            let store_enc_material =
-                KeyMaterial::new_from_password(Some(std::mem::take(&mut *password)))
-                    .expect("a non-empty passphrase always yields key material");
-
-            let wallet = Wallet::init(path, blockchain, store_enc_material)?;
+            let wallet = Wallet::init(
+                path,
+                blockchain,
+                Zeroizing::new(password.unwrap_or_default()),
+            )?;
 
             log::info!("New Wallet created at : {path:?}");
             wallet
@@ -710,8 +659,8 @@ impl Wallet {
         Ok(wallet)
     }
 
-    /// Creates a missing wallet for the CLI and shows its seed phrase at once,
-    /// so no later startup failure can drop a phrase the user never saw.
+    /// Creates a missing wallet for the CLI and saves its first tip. The seed
+    /// phrase is sealed in the file; only a notice to back it up is logged.
     pub fn init_interactive(
         path: &Path,
         backend: &BackendConfig,
@@ -721,18 +670,12 @@ impl Wallet {
         if path.exists() {
             return Ok(());
         }
-        require_seed_terminal(
-            std::env::var_os("OPENSWAP_DOCKER").is_some(),
-            io::stdout().is_terminal(),
-            std::env::var_os("OPENSWAP_SEED_LOG_FREE").is_some(),
-        )?;
         // `Wallet::init` refuses old Core before a wallet file and seed are written.
         let mut wallet = Self::load_or_init(
             path,
             AnyBlockchain::from_config(backend)?,
             password.as_mut().map(|p| std::mem::take(&mut **p)),
         )?;
-        show_new_seed_or_remove(&mut wallet, print_new_wallet_seed)?;
         // Save a tip, or the next load resumes this wallet as an unfinished restore.
         wallet.sync_and_save(&crate::utill::NO_SHUTDOWN)
     }
@@ -4849,7 +4792,14 @@ pub(crate) mod test_support {
     /// Regtest wallet with an empty UTXO cache, so coin selection fails
     /// locally instead of calling out to a node.
     pub(crate) fn test_wallet(path: &Path) -> Wallet {
-        let master_key = Xpriv::new_master(bitcoin::Network::Regtest, &[42; 32]).unwrap();
+        test_wallet_with_key(
+            path,
+            Xpriv::new_master(bitcoin::Network::Regtest, &[42; 32]).unwrap(),
+        )
+    }
+
+    /// Like [`test_wallet`], with `master_key` and no stored seed phrase.
+    pub(crate) fn test_wallet_with_key(path: &Path, master_key: Xpriv) -> Wallet {
         let enc_material =
             KeyMaterial::new_from_password(Some("test-password".to_string())).unwrap();
         let store = WalletStore::init(
@@ -4871,8 +4821,8 @@ pub(crate) mod test_support {
             wallet_file_path: path.to_path_buf(),
             store,
             store_enc_material: enc_material,
-            new_mnemonic: None,
             locked_utxos: HashSet::new(),
+            _in_use: None,
         }
     }
 }
@@ -5036,69 +4986,6 @@ mod prevout_contract_tests {
     use bitcoind::tempfile::tempdir;
 
     #[test]
-    fn new_mnemonic_is_yielded_once_then_dropped() {
-        const TEST_PHRASE: &str = "abandon abandon abandon abandon abandon abandon \
-                                   abandon abandon abandon abandon abandon about";
-
-        let temp_dir = tempdir().unwrap();
-        let mut wallet = test_wallet(&temp_dir.path().join("wallet.cbor"));
-        wallet.new_mnemonic = Some(SecretMnemonic(Mnemonic::parse(TEST_PHRASE).unwrap()));
-
-        let words: Zeroizing<String> = wallet.take_new_mnemonic().unwrap().words();
-        assert_eq!(words.as_str(), TEST_PHRASE);
-        // Sized to one byte over the phrase, so the buffer never had to grow.
-        assert_eq!(words.capacity(), TEST_PHRASE.len() + 1);
-        assert!(
-            wallet.take_new_mnemonic().is_none(),
-            "the phrase must be dropped from the wallet after the first take"
-        );
-    }
-
-    /// A seed phrase nobody saw must not stay behind in a wallet file.
-    #[test]
-    fn failed_seed_display_removes_the_new_wallet() {
-        let temp_dir = tempdir().unwrap();
-        let path = temp_dir.path().join("wallet.cbor");
-        let mut wallet = test_wallet(&path);
-        wallet.new_mnemonic = Some(SecretMnemonic(Mnemonic::generate(12).unwrap()));
-        assert!(path.exists());
-
-        let err = show_new_seed_or_remove(&mut wallet, |_| Err(io::Error::other("closed")))
-            .expect_err("a failed display must be reported");
-        assert!(matches!(err, WalletError::IO(_)), "{}", err);
-        assert!(!path.exists(), "the unseen wallet must be removed");
-    }
-
-    /// A shown phrase, or a loaded wallet without one, keeps the wallet file.
-    #[test]
-    fn shown_seed_or_loaded_wallet_keeps_the_wallet_file() {
-        let temp_dir = tempdir().unwrap();
-        let path = temp_dir.path().join("wallet.cbor");
-        let mut wallet = test_wallet(&path);
-        wallet.new_mnemonic = Some(SecretMnemonic(Mnemonic::generate(12).unwrap()));
-        let mut shown = 0;
-        show_new_seed_or_remove(&mut wallet, |_| {
-            shown += 1;
-            Ok(())
-        })
-        .unwrap();
-        show_new_seed_or_remove(&mut wallet, |_| {
-            shown += 1;
-            Err(io::Error::other("must not be called"))
-        })
-        .unwrap();
-        assert_eq!(shown, 1);
-        assert!(path.exists());
-    }
-
-    #[test]
-    fn docker_seed_refuses_non_terminal_output() {
-        assert!(require_seed_terminal(true, false, true).is_err());
-        assert!(require_seed_terminal(true, true, false).is_err());
-        assert!(require_seed_terminal(true, true, true).is_ok());
-    }
-
-    #[test]
     fn proof_of_funding_rejects_missing_cached_contract() {
         let temp_dir = tempdir().unwrap();
         let wallet = test_wallet(&temp_dir.path().join("wallet.cbor"));
@@ -5177,8 +5064,12 @@ mod prevout_contract_tests {
 #[cfg(test)]
 mod restore_history_probe_tests {
     use super::*;
-    use crate::wallet::{
-        blockchain::Electrum, ffi::restore_wallet_from_backup_gui_app, BackendConfig,
+    use crate::{
+        security::{load_sensitive_struct, SerdeJson},
+        wallet::{
+            blockchain::Electrum, ffi::restore_wallet_from_backup_gui_app, storage::SecretEntropy,
+            BackendConfig, WalletBackup,
+        },
     };
     use bitcoin::{
         consensus::encode::serialize_hex,
@@ -5306,8 +5197,8 @@ mod restore_history_probe_tests {
             wallet_file_path: path.to_path_buf(),
             store,
             store_enc_material: enc_material,
-            new_mnemonic: None,
             locked_utxos: HashSet::new(),
+            _in_use: None,
         }
     }
 
@@ -5509,7 +5400,7 @@ mod restore_history_probe_tests {
                 birthday: Some(1),
                 ..Default::default()
             },
-            KeyMaterial::new_ephemeral(),
+            Zeroizing::new("test-password".to_string()),
         )
         .expect_err("a birthday above the tip is rejected");
         assert!(err.to_string().contains("above the chain tip"), "{}", err);
@@ -5523,7 +5414,7 @@ mod restore_history_probe_tests {
                 address_gap: 200,
                 ..Default::default()
             },
-            KeyMaterial::new_ephemeral(),
+            Zeroizing::new("test-password".to_string()),
         )
         .unwrap();
         assert_eq!(wallet.store.external_index, 151);
@@ -5531,6 +5422,177 @@ mod restore_history_probe_tests {
             wallet.with_master_key(|key| Ok(*key)).unwrap(),
             Wallet::master_key_from_mnemonic(&mnemonic, bitcoin::Network::Regtest).unwrap()
         );
+    }
+
+    /// A new wallet's phrase is in its first write: a restart reads it back,
+    /// even if nothing after `Wallet::init` ever ran.
+    #[test]
+    fn new_wallet_seals_its_phrase_in_the_first_write() {
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("new-wallet");
+        let url = start_stub(StdHashSet::new());
+        let backend =
+            || AnyBlockchain::Electrum(Electrum::new(&electrum_config(url.clone())).unwrap());
+        let password = || Zeroizing::new("test-password".to_string());
+
+        let err = Wallet::init(&path, backend(), Zeroizing::default()).unwrap_err();
+        assert!(
+            err.to_string().contains("passphrase is required"),
+            "{}",
+            err
+        );
+        assert!(!path.exists());
+
+        let created = Wallet::init(&path, backend(), password()).unwrap();
+        let first_words = created.get_wallet_mnemonic(password()).unwrap().words();
+        assert_eq!(first_words.split(' ').count(), 12);
+        drop(created);
+
+        let (saved, _) =
+            WalletStore::read_from_disk(&path, Some("test-password".to_string())).unwrap();
+        assert!(saved.sealed_mnemonic.is_some());
+        assert!(!saved.seed_backed_up);
+
+        let loaded =
+            Wallet::load_or_init(&path, backend(), Some("test-password".to_string())).unwrap();
+        let words = loaded.get_wallet_mnemonic(password()).unwrap().words();
+        assert_eq!(words, first_words);
+        let mnemonic = Mnemonic::parse(words.as_str()).unwrap();
+        assert_eq!(
+            loaded.with_master_key(|key| Ok(*key)).unwrap(),
+            Wallet::master_key_from_mnemonic(&mnemonic, bitcoin::Network::Regtest).unwrap()
+        );
+        assert!(!loaded.seed_backed_up());
+    }
+
+    /// Every library owner holds the wallet lock while it lives, so the seed
+    /// commands refuse to write under it. The offline reader holds nothing.
+    #[test]
+    fn live_library_wallet_blocks_seed_command_writes() {
+        use crate::wallet::seed_cli::WalletInUse;
+
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("wallet");
+        let url = start_stub(StdHashSet::new());
+        let backend =
+            || AnyBlockchain::Electrum(Electrum::new(&electrum_config(url.clone())).unwrap());
+        let password = || Zeroizing::new("test-password".to_string());
+        let idle = || WalletInUse::exclusive_if_idle(&path).unwrap().is_some();
+
+        let created = Wallet::init(&path, backend(), password()).unwrap();
+        assert!(!idle());
+        drop(created);
+        assert!(idle());
+
+        let loaded =
+            Wallet::load_or_init(&path, backend(), Some("test-password".to_string())).unwrap();
+        assert!(!idle());
+        let offline = Wallet::open_offline(&path, password()).unwrap();
+        drop(loaded);
+        assert!(idle());
+        drop(offline);
+
+        let phrase = Mnemonic::generate(12).unwrap().to_string();
+        let restored_path = temp_dir.path().join("restored");
+        let restored = Wallet::restore_from_mnemonic(
+            Zeroizing::new(phrase),
+            &restored_path,
+            &BackendConfig::Electrum(electrum_config(url.clone())),
+            RestoreOptions::default(),
+            password(),
+        )
+        .unwrap();
+        assert!(WalletInUse::exclusive_if_idle(&restored_path)
+            .unwrap()
+            .is_none());
+        drop(restored);
+        assert!(WalletInUse::exclusive_if_idle(&restored_path)
+            .unwrap()
+            .is_some());
+    }
+
+    /// A malformed blocklist aborts `Taker::init` immediately after the
+    /// wallet's first write. Its seed must survive that failed startup.
+    #[test]
+    fn seed_is_readable_after_taker_init_fails() {
+        use crate::{
+            blocklist::{blocklist_path, BlocklistError},
+            taker::{error::TakerError, Taker, TakerInitConfig},
+        };
+
+        let temp_dir = tempdir().unwrap();
+        let data_dir = temp_dir.path().join("taker");
+        let path = data_dir.join("wallets").join("new-wallet");
+        let url = start_stub(StdHashSet::new());
+        let password = || Zeroizing::new("test-password".to_string());
+        std::fs::write(blocklist_path(&data_dir), "{not valid json").unwrap();
+        assert!(!path.exists());
+
+        let err = Taker::init(TakerInitConfig {
+            data_dir: Some(data_dir),
+            wallet_name: "new-wallet".to_string(),
+            backend: BackendConfig::Electrum(electrum_config(url)),
+            password: Some("test-password".to_string()),
+            check_blocklist: Some(true),
+            ..Default::default()
+        })
+        .err()
+        .expect("the blocklist must abort startup after the wallet was created");
+        assert!(matches!(err, TakerError::Blocklist(BlocklistError::IO(_))));
+
+        let first_write = std::fs::read(&path).unwrap();
+        let offline = Wallet::open_offline(&path, password()).unwrap();
+        let words = offline.get_wallet_mnemonic(password()).unwrap().words();
+        assert_eq!(words.split(' ').count(), 12);
+        let mnemonic = Mnemonic::parse(words.as_str()).unwrap();
+        assert_eq!(
+            offline.with_master_key(|key| Ok(*key)).unwrap(),
+            Wallet::master_key_from_mnemonic(&mnemonic, bitcoin::Network::Regtest).unwrap()
+        );
+        assert!(!offline.seed_backed_up());
+        assert_eq!(std::fs::read(&path).unwrap(), first_write);
+    }
+
+    /// Restore stores the phrase it was given, whatever its length.
+    #[test]
+    fn restore_from_mnemonic_seals_the_phrase() {
+        let url = start_stub(StdHashSet::new());
+        let backend = BackendConfig::Electrum(electrum_config(url.clone()));
+        for words in [12, 24] {
+            let temp_dir = tempdir().unwrap();
+            let path = temp_dir.path().join("restored");
+            let phrase = Mnemonic::generate(words).unwrap().to_string();
+            let password = || Zeroizing::new("test-password".to_string());
+            let err = Wallet::restore_from_mnemonic(
+                Zeroizing::new(phrase.clone()),
+                &path,
+                &backend,
+                RestoreOptions::default(),
+                Zeroizing::default(),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("passphrase is required"),
+                "{}",
+                err
+            );
+            assert!(!path.exists());
+
+            Wallet::restore_from_mnemonic(
+                Zeroizing::new(phrase.clone()),
+                &path,
+                &backend,
+                RestoreOptions::default(),
+                password(),
+            )
+            .unwrap();
+            let blockchain =
+                AnyBlockchain::Electrum(Electrum::new(&electrum_config(url.clone())).unwrap());
+            let loaded =
+                Wallet::load_or_init(&path, blockchain, Some("test-password".to_string())).unwrap();
+            let read = loaded.get_wallet_mnemonic(password()).unwrap().words();
+            assert_eq!(read.as_str(), phrase);
+        }
     }
 
     /// A nameless backup restore into a fresh data dir lands under `wallets/`,
@@ -5542,7 +5604,9 @@ mod restore_history_probe_tests {
         let password = "backup password".to_string();
         let backup = temp_dir.path().join("backup.json");
         let km = KeyMaterial::new_from_password(Some(password.clone())).unwrap();
-        wallet.write_backup(&backup, km).unwrap();
+        wallet
+            .write_backup(&backup, Zeroizing::new("test-password".to_string()), km)
+            .unwrap();
 
         let data_dir = temp_dir.path().join("fresh");
         restore_wallet_from_backup_gui_app(
@@ -5558,6 +5622,84 @@ mod restore_history_probe_tests {
             .join("wallets")
             .join(&wallet.store.file_name)
             .is_file());
+    }
+
+    /// A backup takes the phrase only past the current wallet password, and a
+    /// restore seals it again under the new wallet's own password. A backup
+    /// without one restores with none; one whose phrase doesn't derive its
+    /// key is refused before any file is written.
+    #[test]
+    fn backup_carries_the_phrase_to_the_restored_wallet() {
+        let temp_dir = tempdir().unwrap();
+        let backend = BackendConfig::Electrum(electrum_config(start_stub(StdHashSet::new())));
+        let password = |text: &str| Zeroizing::new(text.to_string());
+        let wallet = Wallet::init(
+            &temp_dir.path().join("source"),
+            AnyBlockchain::from_config(&backend).unwrap(),
+            password("test-password"),
+        )
+        .unwrap();
+        let phrase = wallet
+            .get_wallet_mnemonic(password("test-password"))
+            .unwrap()
+            .words();
+
+        let backup_file = temp_dir.path().join("backup.json");
+        let backup_gui = |wallet_password: Option<&str>| {
+            wallet.backup_wallet_gui_app(
+                backup_file.display().to_string(),
+                Some("backup password".to_string()),
+                wallet_password.map(str::to_string),
+            )
+        };
+        for wrong in [None, Some(""), Some("wrong-password")] {
+            let err = backup_gui(wrong).unwrap_err();
+            assert!(matches!(err, WalletError::WrongPassword), "{}", err);
+        }
+        assert!(!backup_file.exists());
+        backup_gui(Some("test-password")).unwrap();
+        let (mut backup, _) = load_sensitive_struct::<WalletBackup, SerdeJson>(
+            &backup_file,
+            Some("backup password".to_string()),
+        )
+        .unwrap();
+
+        let restore = |backup: &WalletBackup, name: &str| {
+            Wallet::restore_with(
+                backup,
+                &temp_dir.path().join(name),
+                &backend,
+                password("new-password"),
+                RestoreOptions::default(),
+            )
+        };
+        let restored = restore(&backup, "restored").unwrap();
+        let read = restored.get_wallet_mnemonic(password("new-password"));
+        assert_eq!(read.unwrap().words(), phrase);
+        assert!(matches!(
+            restored.get_wallet_mnemonic(password("test-password")),
+            Err(WalletError::WrongPassword)
+        ));
+        let (saved, _) = WalletStore::read_from_disk(
+            &temp_dir.path().join("restored"),
+            Some("new-password".to_string()),
+        )
+        .unwrap();
+        assert_eq!(saved.sealed_mnemonic, restored.store.sealed_mnemonic);
+        assert_ne!(saved.sealed_mnemonic, wallet.store.sealed_mnemonic);
+
+        let other = Mnemonic::generate(12).unwrap();
+        backup.mnemonic = Some(SecretEntropy::from_mnemonic(&other).unwrap());
+        let err = restore(&backup, "mismatched").unwrap_err();
+        assert!(matches!(err, WalletError::MnemonicMismatch), "{}", err);
+        assert!(!temp_dir.path().join("mismatched").exists());
+
+        backup.mnemonic = None;
+        let old = restore(&backup, "old").unwrap();
+        assert!(matches!(
+            old.get_wallet_mnemonic(password("new-password")),
+            Err(WalletError::MnemonicUnavailable)
+        ));
     }
 
     /// Proves a stopped sync returns before making its first backend request.
@@ -5812,8 +5954,8 @@ mod timelock_reconcile_tests {
             wallet_file_path: path.to_path_buf(),
             store,
             store_enc_material: enc_material,
-            new_mnemonic: None,
             locked_utxos: HashSet::new(),
+            _in_use: None,
         }
     }
 
