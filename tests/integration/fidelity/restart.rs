@@ -228,26 +228,27 @@ fn live_bond_is_advertised_while_another_is_pending(world: &mut World) {
     // restarted maker running.
     let still_pending = bitcoind.client.get_mempool_entry(&pending_txid).is_ok();
     // The restart must actually publish the live bond, not just log the intent:
-    // a relay has to accept the event built right after that intent line.
+    // a relay has to accept the event built right after an intent line. Every
+    // attempt counts, since a failed first one is retried by the periodic
+    // rebroadcast (every 30s) with a fresh event ID.
     let published = format!("Publishing fidelity bond to Nostr | outpoint={live_outpoint} ");
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(120);
     let published_in_run_2 = loop {
         let log = fs::read_to_string(&log_path).unwrap_or_default();
         let accepted = log.get(mark as usize..).is_some_and(|new| {
-            let Some(intent) = new.find(&published) else {
-                return false;
-            };
-            let after = &new[intent..];
-            let Some(event_id) = after
-                .split("Nostr event built | event_id=")
-                .nth(1)
-                .and_then(|rest| rest.split_whitespace().next())
-            else {
-                return false;
-            };
-            after.lines().any(|l| {
-                l.contains("Nostr relay accepted event")
-                    && l.contains(&format!("event_id={event_id}"))
+            new.match_indices(&published).any(|(intent, _)| {
+                let after = &new[intent..];
+                let Some(event_id) = after
+                    .split("Nostr event built | event_id=")
+                    .nth(1)
+                    .and_then(|rest| rest.split_whitespace().next())
+                else {
+                    return false;
+                };
+                after.lines().any(|l| {
+                    l.contains("Nostr relay accepted event")
+                        && l.contains(&format!("event_id={event_id}"))
+                })
             })
         });
         if accepted {
