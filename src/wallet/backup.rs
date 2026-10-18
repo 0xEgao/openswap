@@ -606,7 +606,7 @@ impl Wallet {
         let restore_password = prompt_password(
             "Enter restored wallet encryption passphrase: ".to_string(),
         )
-        .map_err(|e| WalletError::General(format!("encryption passphrase prompt failed: {e}")))?;
+        .map_err(|e| WalletError::prompt_failed("encryption passphrase prompt failed", e))?;
         // Refused here too, before the user types the backup password for nothing.
         if restore_password.is_empty() {
             return Err(WalletError::General(
@@ -628,7 +628,7 @@ impl Wallet {
             Ok((backup, Some(_))) => backup,
             Err(SecurityError::PasswordRequired) => {
                 let mut password = prompt_password("Enter encryption passphrase: ".to_string())
-                    .map_err(|e| WalletError::General(format!("failed to read passphrase: {e}")))?;
+                    .map_err(|e| WalletError::prompt_failed("failed to read passphrase", e))?;
                 load_sensitive_struct::<WalletBackup, SerdeJson>(
                     backup_file_path,
                     Some(std::mem::take(&mut *password)),
@@ -660,9 +660,7 @@ impl Wallet {
         println!("{RESTORE_OPEN_SWAPS_WARNING}");
         Self::require_backend(&AnyBlockchain::from_config(backend)?)?;
         let password = prompt_password("Enter restored wallet encryption passphrase: ".to_string())
-            .map_err(|e| {
-                WalletError::General(format!("encryption passphrase prompt failed: {e}"))
-            })?;
+            .map_err(|e| WalletError::prompt_failed("encryption passphrase prompt failed", e))?;
         // Refused here too, before the user types the phrase for nothing.
         if password.is_empty() {
             return Err(WalletError::General(
@@ -673,7 +671,7 @@ impl Wallet {
         }
 
         let phrase = prompt_password("Enter seed phrase: ".to_string())
-            .map_err(|e| WalletError::General(format!("failed to read seed phrase: {e}")))?;
+            .map_err(|e| WalletError::prompt_failed("failed to read seed phrase", e))?;
 
         let hints = options.bond_hints.clone();
         let wallet =
@@ -732,11 +730,11 @@ impl Wallet {
         );
 
         let wallet_password = prompt_password("Enter current wallet passphrase: ".to_string())
-            .map_err(|e| WalletError::General(format!("failed to read passphrase: {e}")))?;
+            .map_err(|e| WalletError::prompt_failed("failed to read passphrase", e))?;
         let backup_enc_material = KeyMaterial::new_interactive(Some(
             "Enter new backup encryption passphrase: ".to_string(),
         ))
-        .map_err(|e| WalletError::General(format!("encryption passphrase prompt failed: {e}")))?
+        .map_err(|e| WalletError::prompt_failed("encryption passphrase prompt failed", e))?
         .ok_or_else(|| {
             WalletError::General(
                 "wallet backup failed: a passphrase is required; \

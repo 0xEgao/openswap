@@ -462,6 +462,17 @@ fn display_offer(
 }
 
 fn main() -> Result<(), TakerError> {
+    match run() {
+        // Ctrl-C at a passphrase prompt: exit as SIGINT would.
+        Err(TakerError::IO(e)) if e.kind() == std::io::ErrorKind::Interrupted => {
+            std::process::exit(130)
+        }
+        Err(TakerError::Wallet(e)) if e.is_prompt_cancelled() => std::process::exit(130),
+        result => result,
+    }
+}
+
+fn run() -> Result<(), TakerError> {
     let mut args = Cli::parse();
     let mut wallet_password = args.password.take().map(Zeroizing::new);
     setup_taker_logger(

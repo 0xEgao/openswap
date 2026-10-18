@@ -925,13 +925,15 @@ pub fn prompt_password(message: String) -> io::Result<Zeroizing<String>> {
                 break;
             }
             '\x03' => {
-                // - Ctrl-C (ASCII 0x03): raw mode turned off SIGINT, so act as it
-                //   would. Wipe the input, restore the terminal and exit 130
-                //   before any caller can write a wallet, backup or config file.
-                password.zeroize();
+                // - Ctrl-C (ASCII 0x03): raw mode turned off SIGINT, so cancel here.
+                //   The input is wiped on return; callers pass the `Interrupted`
+                //   error up before writing anything, and the CLI exits 130.
                 drop(guard);
                 println!();
-                std::process::exit(130);
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "passphrase prompt cancelled with Ctrl-C",
+                ));
             }
             '\x04' => {
                 // - Ctrl-D (ASCII 0x04): end of input on an empty prompt, ignored otherwise.
