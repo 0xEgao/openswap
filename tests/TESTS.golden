@@ -33,6 +33,7 @@ openswap maker::rpc::server::tests::send_to_address_rejects_unusable_rates_over_
 openswap maker::server::tests::bind_port_retry_tries_the_given_port_first
 openswap maker::server::tests::established_connections_are_bounded
 openswap maker::server::tests::heartbeat_admission_rejects_throttles_and_promotes
+openswap maker::server::tests::heartbeat_socket_cannot_switch_swap_id
 openswap maker::server::tests::pending_connections_are_bounded
 openswap maker::server::tests::pending_deadline_stops_slow_reads
 openswap maker::server::tests::token_bucket_limits_connection_burst
@@ -486,6 +487,7 @@ openswap::integration rejection::funding_proof::makers_reject_duplicate_funding_
 openswap::integration rejection::funding_proof::taproot_maker_rejects_contract_amount_mismatch
 openswap::integration rejection::keepalive::completed_swap_state_is_restored_after_a_failed_sweep
 openswap::integration rejection::keepalive::keepalive_naming_unseen_funding_is_refused
+openswap::integration rejection::keepalive::keepalive_socket_cannot_switch_swap_id
 openswap::integration rejection::keepalive::keepalive_with_mempool_funding_still_refreshes
 openswap::integration rejection::keepalive::slow_taker_is_readmitted_before_funding
 openswap::integration rejection::partial_broadcast::maker_recovers_partial_broadcast_electrum
