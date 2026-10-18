@@ -693,7 +693,15 @@ fn handle_connection(
                 &mut last_keepalive,
                 &mut permit,
             ) {
-                HeartbeatAction::Reject | HeartbeatAction::Throttle => break,
+                HeartbeatAction::Reject => {
+                    log::warn!(
+                        "[{}] Refusing keepalive for swap {}: unknown or not this connection's swap",
+                        maker.config.network_port,
+                        id
+                    );
+                    break;
+                }
+                HeartbeatAction::Throttle => break,
                 HeartbeatAction::Accept => {}
             }
         }
