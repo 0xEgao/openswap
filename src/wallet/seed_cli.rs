@@ -89,8 +89,7 @@ fn write_now(out: &mut impl Write, text: &[u8]) -> Result<(), WalletError> {
 const QUIZ_WORDS: usize = 3;
 
 fn prompt(message: &str) -> Result<Zeroizing<String>, WalletError> {
-    prompt_password(message.to_string())
-        .map_err(|e| WalletError::General(format!("prompt failed: {e}")))
+    prompt_password(message.to_string()).map_err(|e| WalletError::prompt_failed("prompt failed", e))
 }
 
 /// Picks `count` distinct word positions below `total`, in ascending order.

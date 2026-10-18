@@ -161,6 +161,33 @@ pub enum WalletError {
     InvalidAddress(bitcoin::address::ParseError),
 }
 
+impl WalletError {
+    /// Wraps a failed passphrase prompt as `General`, except a prompt
+    /// cancelled with Ctrl-C, which keeps its error so the CLI can exit 130.
+    pub(crate) fn prompt_failed(
+        context: &str,
+        e: impl std::fmt::Display + Into<WalletError>,
+    ) -> Self {
+        let message = format!("{context}: {e}");
+        let e = e.into();
+        if e.is_prompt_cancelled() {
+            e
+        } else {
+            Self::General(message)
+        }
+    }
+
+    /// True when a passphrase prompt was cancelled with Ctrl-C.
+    pub fn is_prompt_cancelled(&self) -> bool {
+        match self {
+            Self::IO(e) | Self::Security(SecurityError::Io(e)) => {
+                e.kind() == std::io::ErrorKind::Interrupted
+            }
+            _ => false,
+        }
+    }
+}
+
 impl From<std::io::Error> for WalletError {
     fn from(e: std::io::Error) -> Self {
         Self::IO(e)
@@ -353,5 +380,25 @@ impl std::error::Error for WalletError {
             WalletError::InvalidAddress(e) => Some(e),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn prompt_failed_keeps_only_a_cancelled_prompt() {
+        let cancelled = || io::Error::new(io::ErrorKind::Interrupted, "Ctrl-C");
+        assert!(WalletError::prompt_failed("ctx", cancelled()).is_prompt_cancelled());
+        assert!(
+            WalletError::prompt_failed("ctx", SecurityError::Io(cancelled())).is_prompt_cancelled()
+        );
+
+        let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "Ctrl-D");
+        let err = WalletError::prompt_failed("ctx", eof);
+        assert!(!err.is_prompt_cancelled());
+        assert!(matches!(err, WalletError::General(m) if m == "ctx: Ctrl-D"));
     }
 }

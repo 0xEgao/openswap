@@ -139,6 +139,17 @@ enum Commands {
 }
 
 fn main() -> Result<(), MakerError> {
+    match run() {
+        // Ctrl-C at a passphrase prompt: exit as SIGINT would.
+        Err(MakerError::IO(e)) if e.kind() == std::io::ErrorKind::Interrupted => {
+            std::process::exit(130)
+        }
+        Err(MakerError::Wallet(e)) if e.is_prompt_cancelled() => std::process::exit(130),
+        result => result,
+    }
+}
+
+fn run() -> Result<(), MakerError> {
     let args = Cli::parse();
 
     setup_maker_logger(log::LevelFilter::Info, args.data_directory.clone());
