@@ -551,28 +551,8 @@ impl Wallet {
 
         // Taken before the read, so a seed command can't write after it.
         let in_use = WalletInUse::shared(path)?;
-        let (mut store, store_enc_material) = match WalletStore::read_from_disk(
-            path,
-            password.as_mut().map(|p| std::mem::take(&mut **p)),
-        ) {
-            Ok((store, Some(material))) => (store, material),
-            // Cleartext wallet files are not supported at all.
-            Ok((_, None)) => {
-                return Err(WalletError::General(format!(
-                    "wallet file {path:?} is unencrypted; \
-                         cleartext wallet files are not supported"
-                )))
-            }
-            // Encrypted file, no passphrase supplied. Report how to supply
-            // one instead of failing decryption with an empty passphrase.
-            Err(WalletError::Security(SecurityError::PasswordRequired)) => {
-                return Err(WalletError::General(format!(
-                    "wallet file {path:?} is encrypted; \
-                         provide the wallet passphrase via --password-file or -p"
-                )))
-            }
-            Err(e) => return Err(e),
-        };
+        let (mut store, store_enc_material) =
+            Self::read_store(path, password.as_mut().map(|p| std::mem::take(&mut **p)))?;
         // An older file may hold the key in plaintext; seal it before any backend call.
         store.master_key.seal(&store_enc_material)?;
         if let AnyBlockchain::CoreRPC(core) = &blockchain {
@@ -619,6 +599,31 @@ impl Wallet {
         };
         wallet.warn_if_seed_not_backed_up();
         Ok(wallet)
+    }
+
+    /// Reads and decrypts the wallet file at `path`, refusing a cleartext file
+    /// and a missing passphrase. Does not touch the backend.
+    fn read_store(
+        path: &Path,
+        password: Option<String>,
+    ) -> Result<(WalletStore, KeyMaterial), WalletError> {
+        match WalletStore::read_from_disk(path, password) {
+            Ok((store, Some(material))) => Ok((store, material)),
+            // Cleartext wallet files are not supported at all.
+            Ok((_, None)) => Err(WalletError::General(format!(
+                "wallet file {path:?} is unencrypted; \
+                 cleartext wallet files are not supported"
+            ))),
+            // Encrypted file, no passphrase supplied. Report how to supply
+            // one instead of failing decryption with an empty passphrase.
+            Err(WalletError::Security(SecurityError::PasswordRequired)) => {
+                Err(WalletError::General(format!(
+                    "wallet file {path:?} is encrypted; \
+                     provide the wallet passphrase via --password-file or -p"
+                )))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Loads an existing wallet from the given path or initializes a new one if none exists.
@@ -668,6 +673,15 @@ impl Wallet {
     ) -> Result<(), WalletError> {
         let mut password = password.map(Zeroizing::new);
         if path.exists() {
+            // Check a given passphrase now, not on the next start.
+            if let Some(p) = password.as_mut().filter(|p| !p.is_empty()) {
+                Self::read_store(path, Some(std::mem::take(&mut **p))).map_err(|e| {
+                    WalletError::General(format!(
+                        "wallet {path:?} already exists and could not be opened \
+                         with the given passphrase: {e}"
+                    ))
+                })?;
+            }
             return Ok(());
         }
         // `Wallet::init` refuses old Core before a wallet file and seed are written.
@@ -5369,6 +5383,34 @@ mod restore_history_probe_tests {
             assert!(saved.last_synced_height.is_some());
             assert!(saved.pending_restore.is_none());
         }
+    }
+
+    /// `init-wallet` on an existing wallet must reject a wrong passphrase
+    /// instead of exiting 0, without needing a backend.
+    #[test]
+    fn init_interactive_checks_the_passphrase_of_an_existing_wallet() {
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("init-existing");
+        let material = KeyMaterial::new_from_password(Some("right".to_string())).unwrap();
+        let master = Xpriv::new_master(bitcoin::Network::Regtest, &MASTER_SEED).unwrap();
+        WalletStore::init(
+            "init-existing".to_string(),
+            &path,
+            bitcoin::Network::Regtest,
+            master,
+            None,
+            None,
+            &material,
+        )
+        .unwrap();
+        // Unreachable, so a backend call would fail the right-passphrase case.
+        let backend = BackendConfig::Electrum(electrum_config("tcp://127.0.0.1:1".to_string()));
+
+        Wallet::init_interactive(&path, &backend, Some("right".to_string())).unwrap();
+        let err = Wallet::init_interactive(&path, &backend, Some("wrong".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already exists"), "{}", err);
     }
 
     /// The phrase alone must give the key and, with a wide enough gap, the

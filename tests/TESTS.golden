@@ -202,6 +202,7 @@ openswap wallet::api::recovery_address_tests::first_recovery_creates_an_address
 openswap wallet::api::recovery_address_tests::retry_reuses_the_stored_recovery_address
 openswap wallet::api::restore_history_probe_tests::backup_carries_the_phrase_to_the_restored_wallet
 openswap wallet::api::restore_history_probe_tests::backup_restore_into_a_fresh_data_dir
+openswap wallet::api::restore_history_probe_tests::init_interactive_checks_the_passphrase_of_an_existing_wallet
 openswap wallet::api::restore_history_probe_tests::interrupted_restore_finishes_before_wallet_is_loaded
 openswap wallet::api::restore_history_probe_tests::live_library_wallet_blocks_seed_command_writes
 openswap wallet::api::restore_history_probe_tests::new_wallet_seals_its_phrase_in_the_first_write

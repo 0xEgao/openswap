@@ -909,7 +909,7 @@ pub fn prompt_password(message: String) -> io::Result<Zeroizing<String>> {
     print!("{message}");
     stdout.flush()?; // Ensure the prompt is printed
 
-    let _guard = RawModeGuard::new()?;
+    let guard = RawModeGuard::new()?;
 
     let mut password = Zeroizing::new(Vec::with_capacity(256));
     let mut buf = Zeroizing::new([0u8; 1]);
@@ -923,6 +923,26 @@ pub fn prompt_password(message: String) -> io::Result<Zeroizing<String>> {
                 //   it signals the end of input, so we break the loop.
                 println!();
                 break;
+            }
+            '\x03' => {
+                // - Ctrl-C (ASCII 0x03): raw mode turned off SIGINT, so act as it
+                //   would. Wipe the input, restore the terminal and exit 130
+                //   before any caller can write a wallet, backup or config file.
+                password.zeroize();
+                drop(guard);
+                println!();
+                std::process::exit(130);
+            }
+            '\x04' => {
+                // - Ctrl-D (ASCII 0x04): end of input on an empty prompt, ignored otherwise.
+                if password.is_empty() {
+                    drop(guard);
+                    println!();
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "passphrase prompt closed with Ctrl-D",
+                    ));
+                }
             }
             '\x08' | '\x7f' => {
                 // - If the byte is Backspace (ASCII 0x08 or 0x7f),
