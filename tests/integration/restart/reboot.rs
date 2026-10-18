@@ -382,6 +382,9 @@ fn run_restart_rebuilds_watches(world: &mut World, params: SwapParams) {
 
     // Each maker must claim its *incoming* side with the preimage. A bare
     // "Recovered" also matches the outgoing timelock line, which proves nothing.
+    // The claim line can report a partial sweep (a contract still in the
+    // mempool is swept on a later pass), so also wait, with the miner still
+    // running, until every incoming contract is swept and confirmed.
     for maker in world.makers() {
         let port = maker.inner().config.network_port;
         let claimed = format!("[{port}] Recovered");
@@ -389,13 +392,20 @@ fn run_restart_rebuilds_watches(world: &mut World, params: SwapParams) {
             Duration::from_secs(300),
             every Duration::from_secs(5),
             format!(
-                "maker {} to claim its incoming contract with the preimage",
+                "maker {} to claim all its incoming contracts with the preimage",
                 port
             ),
             std::fs::read_to_string(&log_path)
                 .unwrap_or_default()
                 .lines()
                 .any(|l| l.contains(&claimed) && l.contains("incoming swapcoins via hashlock"))
+                && maker
+                    .inner()
+                    .wallet
+                    .read()
+                    .unwrap()
+                    .get_incoming_swapcoins_count()
+                    == 0
         );
     }
     assert_log!(world, since maker_offset; {
