@@ -66,8 +66,9 @@ fn makers_reject_duplicate_funding_outpoints(world: &mut World, params: SwapPara
             expected = "Duplicate funding outpoint",
         ),
         /// The taker declares 600k in SwapDetails but funds the honest 500k. The
-        /// maker priced and froze its plan on the declared amount, so the equality
-        /// check — not a band — refuses the proof.
+        /// maker priced and froze its plan on the declared amount; a hop may fall
+        /// short only by what upstream funding bumps take, and a sixth is far past
+        /// that bound, so the proof is refused.
         maker_rejects_underdelivered_legacy_amount(
             behavior = TakerBehavior::ForgeBounds(Amount::from_sat(600_000)),
             tx_count = 3,

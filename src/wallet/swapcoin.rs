@@ -1463,6 +1463,17 @@ impl WatchOnlySwapCoin {
         )
     }
 
+    /// Whether `other` is this contract in another version of its funding,
+    /// as a fee bump leaves it: the same keys and scripts, other coins.
+    pub(crate) fn is_version_of(&self, other: &WatchOnlySwapCoin) -> bool {
+        self.protocol == other.protocol
+            && self.sender_pubkey == other.sender_pubkey
+            && self.receiver_pubkey == other.receiver_pubkey
+            && self.contract_redeemscript == other.contract_redeemscript
+            && self.hashlock_script == other.hashlock_script
+            && self.timelock_script == other.timelock_script
+    }
+
     /// The contract output this coin watches: the one paying the funding amount.
     pub(crate) fn contract_outpoint(&self) -> OutPoint {
         let vout = self

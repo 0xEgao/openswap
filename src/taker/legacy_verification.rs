@@ -114,18 +114,24 @@ impl Taker {
         }
     }
 
-    /// Require every maker funding tx to pay the agreed feerate, priced from
-    /// its prevouts and the transaction's own vsize. Backend failure retries
-    /// then aborts; a shortfall is recorded as a proven violation.
+    /// Require every maker funding tx to pay the feerate it was agreed at,
+    /// one per tx in `feerates`: the swap feerate, or the rate a bump asked
+    /// for. Priced from its prevouts and the transaction's own vsize. Backend
+    /// failure retries then aborts; a shortfall is recorded as a proven violation.
     pub(crate) fn verify_maker_funding_feerate(
         &self,
         funding_txs: &[Transaction],
+        feerates: &[f64],
         maker_idx: usize,
     ) -> Result<(), TakerError> {
-        let feerate = self.swap_state()?.params.swap_feerate();
+        if feerates.len() != funding_txs.len() {
+            return Err(TakerError::General(
+                "One feerate per maker funding tx is needed".to_string(),
+            ));
+        }
         let chain = self.backend.connect()?;
         let mut prev_txs: HashMap<Txid, Transaction> = HashMap::new();
-        for (i, tx) in funding_txs.iter().enumerate() {
+        for (i, (tx, &feerate)) in funding_txs.iter().zip(feerates).enumerate() {
             let mut input_sum = Amount::ZERO;
             for input in &tx.input {
                 let prev_outpoint = input.previous_output;
