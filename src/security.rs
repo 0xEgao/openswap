@@ -16,7 +16,10 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::utill;
+use crate::{
+    protocol::features::{check_requires, supported},
+    utill,
+};
 use std::{fs, io, path::Path};
 
 /// Errors returned while loading or decrypting sensitive data.
@@ -34,6 +37,8 @@ pub enum SecurityError {
     /// responsible for obtaining a password (e.g. by prompting the user)
     /// and retrying with `Some(password)`.
     PasswordRequired,
+    /// The container requires features this build cannot read.
+    NeedsUpgrade(Vec<String>),
 }
 
 impl std::fmt::Display for SecurityError {
@@ -44,6 +49,9 @@ impl std::fmt::Display for SecurityError {
             Self::Decryption => write!(f, "decryption failed; wrong password or corrupted data"),
             Self::Cbor(err) => write!(f, "CBOR error: {err}"),
             Self::PasswordRequired => write!(f, "file is encrypted but no password was supplied"),
+            Self::NeedsUpgrade(names) => {
+                write!(f, "file needs features this build lacks: {names:?}")
+            }
         }
     }
 }
@@ -312,7 +320,7 @@ const ENCRYPTED_DATA_VERSION: u32 = 2;
 pub struct EncryptedDataV2 {
     version: u32,
     /// Features a reader must support before it may open the file.
-    requires: Vec<String>,
+    pub(crate) requires: Vec<String>,
     nonce: EncryptionNonce,
     pbkdf2_salt: PBKDF2Salt,
     ciphertext: Vec<u8>,
@@ -325,7 +333,7 @@ struct ContainerVersion {
 }
 
 /// The cleartext header as authenticated data: editing it fails decryption.
-fn header_aad(version: u32, requires: &[String]) -> Result<Vec<u8>, serde_cbor::Error> {
+pub(crate) fn header_aad(version: u32, requires: &[String]) -> Result<Vec<u8>, serde_cbor::Error> {
     serde_cbor::to_vec(&(version, requires))
 }
 
@@ -391,8 +399,12 @@ impl SealedSecret {
 
 /// Whether CBOR `content` is an encrypted container of any version.
 pub fn is_encrypted_cbor(content: &[u8]) -> bool {
+    is_versioned_container(content) || serde_cbor::from_slice::<EncryptedData>(content).is_ok()
+}
+
+/// Whether CBOR `content` is a versioned ([`EncryptedDataV2`] or newer) container.
+pub(crate) fn is_versioned_container(content: &[u8]) -> bool {
     serde_cbor::from_slice::<ContainerVersion>(content).is_ok()
-        || serde_cbor::from_slice::<EncryptedData>(content).is_ok()
 }
 
 /// Counts the bytes written to it, to size a buffer before filling it.
@@ -426,7 +438,17 @@ pub fn encrypt_struct<T: Serialize>(
     plain_struct: T,
     enc_material: &KeyMaterial,
 ) -> Result<EncryptedData, EncryptError> {
-    let (nonce, encrypted_payload) = seal_cbor(&plain_struct, &enc_material.key, &[])?;
+    encrypt_struct_with_aad(plain_struct, enc_material, &[])
+}
+
+/// [`encrypt_struct`] with associated data. `aad` is authenticated but not
+/// encrypted: decryption fails unless the same bytes are supplied.
+pub fn encrypt_struct_with_aad<T: Serialize>(
+    plain_struct: T,
+    enc_material: &KeyMaterial,
+    aad: &[u8],
+) -> Result<EncryptedData, EncryptError> {
+    let (nonce, encrypted_payload) = seal_cbor(&plain_struct, &enc_material.key, aad)?;
     Ok(EncryptedData {
         nonce,
         encrypted_payload,
@@ -434,12 +456,13 @@ pub fn encrypt_struct<T: Serialize>(
     })
 }
 
-/// Like [`encrypt_struct`], but writes the version 2 container.
+/// Like [`encrypt_struct`], but writes the version 2 container with authenticated
+/// requirements. Wallet writers supply the sorted union of format and record names.
 pub fn encrypt_struct_v2<T: Serialize>(
     plain_struct: &T,
     enc_material: &KeyMaterial,
+    requires: Vec<String>,
 ) -> Result<EncryptedDataV2, EncryptError> {
-    let requires = Vec::new();
     let aad = header_aad(ENCRYPTED_DATA_VERSION, &requires)?;
     let (nonce, ciphertext) = seal_cbor(plain_struct, &enc_material.key, &aad)?;
     Ok(EncryptedDataV2 {
@@ -510,13 +533,41 @@ pub fn decrypt_struct<T: DeserializeOwned>(
     encrypted_struct: EncryptedData,
     enc_material: &KeyMaterial,
 ) -> Result<T, SecurityError> {
+    decrypt_struct_with_aad(encrypted_struct, enc_material, &[])
+}
+
+/// [`decrypt_struct`] with the associated data the data was encrypted with.
+pub fn decrypt_struct_with_aad<T: DeserializeOwned>(
+    encrypted_struct: EncryptedData,
+    enc_material: &KeyMaterial,
+    aad: &[u8],
+) -> Result<T, SecurityError> {
     open_cbor(
         &encrypted_struct.nonce,
         &encrypted_struct.encrypted_payload,
         &enc_material.key,
-        &[],
+        aad,
     )
 }
+
+/// Derives the key for `encrypted` from `password` and decrypts it with `aad`.
+pub(crate) fn decrypt_with_password<T: DeserializeOwned>(
+    encrypted: EncryptedData,
+    password: String,
+    aad: &[u8],
+) -> Result<(T, KeyMaterial), SecurityError> {
+    let material = KeyMaterial::existing(password, encrypted.nonce, encrypted.pbkdf2_salt);
+    let decrypted = decrypt_struct_with_aad(encrypted, &material, aad)?;
+    Ok((decrypted, material))
+}
+
+/// Marks stores that preserve reports and unknown fields. Pre-port V2 readers
+/// refuse any nonempty `requires`, preventing a downgrade from dropping them.
+pub(crate) const WALLET_STORE_FORMAT: &str = "wallet-store-2";
+
+/// Requirements written on every wallet save, alongside record requirements.
+pub(crate) const FORMAT_NAMES: &[&str] = &[WALLET_STORE_FORMAT];
+
 /// Loads a sensitive struct from a file, supporting both encrypted and plaintext formats.
 ///
 /// When a non-empty password is supplied, this function requires the file to
@@ -542,15 +593,23 @@ pub fn load_sensitive_struct<T: DeserializeOwned, F: SerdeFormat>(
     password: Option<String>,
 ) -> Result<(T, Option<KeyMaterial>), SecurityError> {
     let content = Zeroizing::new(fs::read(file)?);
+    load_sensitive_struct_from_slice::<T, F>(&content, file, password)
+}
 
+/// Loads a single file snapshot, so header inspection and decryption agree.
+pub(crate) fn load_sensitive_struct_from_slice<T: DeserializeOwned, F: SerdeFormat>(
+    content: &[u8],
+    file: &Path,
+    password: Option<String>,
+) -> Result<(T, Option<KeyMaterial>), SecurityError> {
     let password = password.map(Zeroizing::new);
     // Checked before the plaintext attempt: a versioned file is never plaintext.
-    if let Ok(ContainerVersion { version }) = F::from_slice::<ContainerVersion>(&content) {
-        return decrypt_v2::<T, F>(&content, file, version, password);
+    if let Ok(ContainerVersion { version }) = F::from_slice::<ContainerVersion>(content) {
+        return decrypt_v2::<T, F>(content, file, version, password);
     }
     let password = match password {
         Some(mut encryption_password) if !encryption_password.is_empty() => {
-            let encrypted_struct = F::from_slice::<EncryptedData>(&content).map_err(|err| {
+            let encrypted_struct = F::from_slice::<EncryptedData>(content).map_err(|err| {
                 SecurityError::Format(format!(
                     "expected encrypted file {file:?} because a password was supplied: {err}"
                 ))
@@ -567,9 +626,9 @@ pub fn load_sensitive_struct<T: DeserializeOwned, F: SerdeFormat>(
         password => password,
     };
 
-    let (sensitive_struct, encryption_material) = match F::from_slice::<T>(&content) {
+    let (sensitive_struct, encryption_material) = match F::from_slice::<T>(content) {
         Ok(unencrypted_struct) => (unencrypted_struct, None),
-        Err(unencrypted_err) => match F::from_slice::<EncryptedData>(&content) {
+        Err(unencrypted_err) => match F::from_slice::<EncryptedData>(content) {
             Ok(encrypted_struct) => {
                 let mut encryption_password = match password {
                     Some(p) => p,
@@ -611,12 +670,7 @@ fn decrypt_v2<T: DeserializeOwned, F: SerdeFormat>(
     }
     let data = F::from_slice::<EncryptedDataV2>(content)
         .map_err(|err| SecurityError::Format(format!("invalid encrypted file {file:?}: {err}")))?;
-    if !data.requires.is_empty() {
-        return Err(SecurityError::Format(format!(
-            "{file:?} needs features this build lacks: {:?}",
-            data.requires
-        )));
-    }
+    check_requires(&data.requires, &supported()).map_err(SecurityError::NeedsUpgrade)?;
     let Some(mut password) = password.filter(|p| !p.is_empty()) else {
         return Err(SecurityError::PasswordRequired);
     };
@@ -636,7 +690,8 @@ mod tests {
     fn v2_container_is_refused_by_old_readers() {
         let material = KeyMaterial::new_from_password(Some("test password".to_string())).unwrap();
         let v2 =
-            serde_cbor::to_vec(&encrypt_struct_v2(&"wallet state", &material).unwrap()).unwrap();
+            serde_cbor::to_vec(&encrypt_struct_v2(&"wallet state", &material, Vec::new()).unwrap())
+                .unwrap();
         let v1 = serde_cbor::to_vec(&encrypt_struct("wallet state", &material).unwrap()).unwrap();
 
         // Older builds parse wallet files only as `EncryptedData`.
@@ -668,7 +723,7 @@ mod tests {
     #[test]
     fn v2_container_refuses_unknown_versions_and_edited_headers() {
         let material = KeyMaterial::new_from_password(Some("test password".to_string())).unwrap();
-        let data = encrypt_struct_v2(&"wallet state", &material).unwrap();
+        let data = encrypt_struct_v2(&"wallet state", &material, Vec::new()).unwrap();
         let dir = tempdir().unwrap();
         let path = dir.path().join("wallet");
         let load = |data: &EncryptedDataV2| {
@@ -695,7 +750,7 @@ mod tests {
             ..data.clone()
         };
         assert!(
-            matches!(load(&needs_more), Err(SecurityError::Format(e)) if e.contains("future-feature"))
+            matches!(load(&needs_more), Err(SecurityError::NeedsUpgrade(names)) if names == ["future-feature"])
         );
 
         // The header is authenticated: a requirement stripped by hand fails decryption.
@@ -707,6 +762,46 @@ mod tests {
             ..data
         };
         assert!(matches!(load(&stripped), Err(SecurityError::Decryption)));
+    }
+
+    #[test]
+    fn v2_version_precedes_requirements_password_and_payload() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        for version in [0, 1, 3, u32::MAX] {
+            // A newer layout need not retain any other V2 fields.
+            let bytes = serde_cbor::to_vec(&serde_json::json!({
+                "version": version,
+                "requires": ["wallet-store-3"],
+                "ciphertext": [0],
+            }))
+            .unwrap();
+            fs::write(&path, &bytes).unwrap();
+            for password in [None, Some(String::new()), Some("wrong".into())] {
+                let error =
+                    load_sensitive_struct::<String, SerdeCbor>(&path, password).unwrap_err();
+                assert!(
+                    matches!(error, SecurityError::Format(message) if message.contains(&format!("version {version}")))
+                );
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+            }
+        }
+        let bytes = serde_cbor::to_vec(&EncryptedDataV2 {
+            version: 2,
+            requires: vec![WALLET_STORE_FORMAT.into(), "wallet-store-3".into()],
+            nonce: [0; 12],
+            pbkdf2_salt: [0; 16],
+            ciphertext: vec![0],
+        })
+        .unwrap();
+        fs::write(&path, &bytes).unwrap();
+        for password in [None, Some(String::new()), Some("wrong".into())] {
+            let error = load_sensitive_struct::<String, SerdeCbor>(&path, password).unwrap_err();
+            assert!(
+                matches!(error, SecurityError::NeedsUpgrade(names) if names == ["wallet-store-3"])
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
     }
 
     #[derive(Serialize)]
@@ -751,6 +846,59 @@ mod tests {
                 Err(SecurityError::Format(_))
             ));
         }
+    }
+
+    #[test]
+    fn compat_aad_vectors_and_legacy_ciphertext_are_frozen() {
+        assert_eq!(header_aad(2, &[]).unwrap(), b"\x82\x02\x80");
+        let names = vec![
+            "legacy".into(),
+            "taproot".into(),
+            WALLET_STORE_FORMAT.into(),
+        ];
+        let aad = header_aad(2, &names).unwrap();
+        assert_eq!(aad, b"\x82\x02\x83\x66legacy\x67taproot\x6ewallet-store-2");
+        let material = KeyMaterial::new_from_password(Some("compat-password".into())).unwrap();
+        let encrypted = encrypt_struct_with_aad("known payload", &material, &aad).unwrap();
+        assert_eq!(
+            decrypt_struct_with_aad::<String>(encrypted.clone(), &material, &aad).unwrap(),
+            "known payload"
+        );
+        assert!(matches!(
+            decrypt_struct::<String>(encrypted.clone(), &material),
+            Err(SecurityError::Decryption)
+        ));
+        for wrong in [
+            Vec::new(),
+            header_aad(2, &["taproot".into()]).unwrap(),
+            header_aad(3, &names).unwrap(),
+        ] {
+            assert!(matches!(
+                decrypt_struct_with_aad::<String>(encrypted.clone(), &material, &wrong),
+                Err(SecurityError::Decryption)
+            ));
+        }
+        let old_compatible = encrypt_struct("old payload", &material).unwrap();
+        assert_eq!(
+            decrypt_struct_with_aad::<String>(old_compatible.clone(), &material, &[]).unwrap(),
+            "old payload"
+        );
+        let empty_aad = encrypt_struct_with_aad("helper payload", &material, &[]).unwrap();
+        assert_eq!(
+            decrypt_struct::<String>(empty_aad, &material).unwrap(),
+            "helper payload"
+        );
+        let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(material.key));
+        let plain = cipher
+            .decrypt(
+                &aes_gcm::Nonce::from(old_compatible.nonce),
+                old_compatible.encrypted_payload.as_ref(),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_cbor::from_slice::<String>(&plain).unwrap(),
+            "old payload"
+        );
     }
 
     #[test]

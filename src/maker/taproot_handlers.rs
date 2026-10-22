@@ -477,13 +477,16 @@ fn process_taproot_contract<M: Maker>(
                 "[{}] Test behavior: skipping Taproot funding broadcast",
                 maker.network_port()
             );
-            // The unrecorded variant leaves the record empty, so recovery sees
-            // the swap as never funded and the discard grace applies.
+            // The unrecorded variant leaves the coins uncommitted, so recovery
+            // frees their inputs after the grace and keeps watching them.
             if maker.behavior() == MakerBehavior::SkipFundingBroadcast {
                 state.funding_broadcast_txids = outgoing_swapcoins
                     .iter()
                     .map(|outgoing| outgoing.contract_tx.compute_txid())
                     .collect();
+                for outgoing in outgoing_swapcoins.iter_mut() {
+                    outgoing.committed = true;
+                }
             }
             state.phase = SwapPhase::AwaitingPrivateKeyHandover;
             for incoming in &incoming_swapcoins {
@@ -512,18 +515,15 @@ fn process_taproot_contract<M: Maker>(
 
     // Persist swapcoins before broadcasting contract txs. A later broadcast
     // failure can leave earlier Taproot contract txs on-chain, and the wallet
-    // needs these records for timelock recovery after a restart.
-    for incoming in &incoming_swapcoins {
-        maker.save_incoming_swapcoin(incoming)?;
-    }
-    for outgoing in &outgoing_swapcoins {
-        maker.save_outgoing_swapcoin(outgoing)?;
-    }
+    // needs these records for timelock recovery after a restart. Each coin is
+    // committed only once its own send is accepted. Recovery never sends an
+    // uncommitted coin: it keeps it, and frees its inputs after a grace unless
+    // the backend has seen it.
+    maker.save_funding_batch(&incoming_swapcoins, &outgoing_swapcoins)?;
 
     for (index, outgoing) in outgoing_swapcoins.iter().enumerate() {
-        // The index only feeds the test hook below; touch it so production
-        // builds have no unused binding.
-        let _ = index;
+        // A crash during this send must not free its inputs at once.
+        maker.restart_funding_grace(&data.id)?;
         // QA: a mid-batch failure must leave the earlier sends recorded, or
         // recovery discards contract txs already on the wire. Inert for
         // single-tx batches.
@@ -539,6 +539,24 @@ fn process_taproot_contract<M: Maker>(
                     message: "Test: second funding broadcast rejected".to_string(),
                     data: None,
                 })),
+            )));
+        }
+        #[cfg(feature = "integration-test")]
+        if index == 0
+            && matches!(
+                maker.behavior(),
+                MakerBehavior::FailFirstBroadcast | MakerBehavior::BroadcastThenFailFirst
+            )
+        {
+            if maker.behavior() == MakerBehavior::BroadcastThenFailFirst {
+                maker.broadcast_transaction(&outgoing.contract_tx)?;
+            }
+            log::warn!(
+                "[{}] Test behavior: failing the first Taproot funding broadcast",
+                maker.network_port()
+            );
+            return Err(MakerError::Wallet(WalletError::General(
+                "Test: failing the first funding broadcast".to_string(),
             )));
         }
         let txid = outgoing.contract_tx.compute_txid();
@@ -588,6 +606,10 @@ fn process_taproot_contract<M: Maker>(
         }
         // Record each send before the next one, so a mid-batch failure never
         // reads back as "never broadcast".
+        if let Some(sent) = state.outgoing_swapcoins.get_mut(index) {
+            sent.committed = true;
+            maker.save_outgoing_swapcoin(sent)?;
+        }
         maker.record_funding_broadcast(&data.id, &txid)?;
         if !state.funding_broadcast_txids.contains(&txid) {
             state.funding_broadcast_txids.push(txid);

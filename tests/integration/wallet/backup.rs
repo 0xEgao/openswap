@@ -5,6 +5,8 @@ use bitcoind::{
     bitcoincore_rpc::{self, RpcApi},
     BitcoinD,
 };
+use serde::Deserialize;
+use serde_cbor::Value as CborValue;
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
@@ -15,7 +17,9 @@ use openswap::wallet::{
 };
 
 use openswap::{
-    security::{load_sensitive_struct, KeyMaterial, SecurityError, SerdeCbor, SerdeJson},
+    security::{
+        load_sensitive_struct, EncryptedData, KeyMaterial, SecurityError, SerdeCbor, SerdeJson,
+    },
     utill::MIN_RELAY_FEE_RATE,
 };
 
@@ -431,28 +435,37 @@ fn assert_restores_sparse_bonds(
     assert_eq!(*from_full.get_external_index(), 31);
 }
 
-/// Asserts the wallet file on disk is genuinely encrypted with the given
-/// passphrase: it must be an encrypted container, reject a wrong password,
-/// and open with the correct one. (The missing-password `PasswordRequired`
-/// path is covered by wallet storage unit tests, which have the concrete
-/// `WalletStore` type available.)
+#[derive(Deserialize)]
+struct WalletHeader {
+    version: u32,
+    requires: Vec<String>,
+}
+
+/// Decrypts the V2 wallet with its authenticated header and stored salt.
+fn decrypt_wallet_file(path: &Path, password: &str) -> Result<CborValue, SecurityError> {
+    load_sensitive_struct::<CborValue, SerdeCbor>(path, Some(password.to_string()))
+        .map(|(store, _)| store)
+}
+
+/// Check the V2 header and ciphertext with both passwords.
 fn assert_wallet_file_encrypted(path: &Path, password: &str) {
+    let bytes = fs::read(path).unwrap();
+    let header: WalletHeader = serde_cbor::from_slice(&bytes).unwrap();
+    assert_eq!(header.version, 2);
+    assert!(header.requires.iter().any(|name| name == "wallet-store-2"));
+    assert!(serde_cbor::from_slice::<EncryptedData>(&bytes).is_err());
     assert!(
         Wallet::is_wallet_encrypted(path).unwrap(),
         "restored wallet file must be encrypted"
     );
-
-    let err = load_sensitive_struct::<serde_cbor::Value, SerdeCbor>(
-        path,
-        Some("definitely-wrong-password".to_string()),
-    )
-    .expect_err("encrypted wallet file must reject a wrong password");
-    assert!(matches!(err, SecurityError::Decryption));
-
-    let (_, material) =
-        load_sensitive_struct::<serde_cbor::Value, SerdeCbor>(path, Some(password.to_string()))
-            .expect("the restore password must open the restored wallet file");
-    assert!(material.is_some());
+    assert!(matches!(
+        decrypt_wallet_file(path, "definitely-wrong-password"),
+        Err(SecurityError::Decryption)
+    ));
+    assert!(matches!(
+        decrypt_wallet_file(path, password).unwrap(),
+        CborValue::Map(_)
+    ));
 }
 
 #[world_test(backend = BitcoindBackend, keypool = 1)]
@@ -530,17 +543,12 @@ fn encwallet_encbackup_encrestore(node: &mut Node) {
 
     // Loading a file with no saved tip resumes a restore, rerunning its probe.
     for path in [&original_wallet, &restored_wallet_file] {
-        let (saved, _) = load_sensitive_struct::<serde_cbor::Value, SerdeCbor>(
-            path,
-            Some("integration-test".to_string()),
-        )
-        .unwrap();
-        let serde_cbor::Value::Map(saved) = saved else {
+        let CborValue::Map(saved) = decrypt_wallet_file(path, "integration-test").unwrap() else {
             panic!("wallet file is not a map")
         };
-        let field = |name: &str| saved[&serde_cbor::Value::Text(name.to_string())].clone();
-        assert!(matches!(field("last_synced_height"), serde_cbor::Value::Integer(h) if h > 0));
-        assert_eq!(field("pending_restore"), serde_cbor::Value::Null);
+        let field = |name: &str| saved[&CborValue::Text(name.to_string())].clone();
+        assert!(matches!(field("last_synced_height"), CborValue::Integer(h) if h > 0));
+        assert_eq!(field("pending_restore"), CborValue::Null);
     }
 
     // A nameless restore path resolves to the backup's original filename
