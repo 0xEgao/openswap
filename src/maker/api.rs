@@ -3778,6 +3778,13 @@ impl MakerTrait for MakerServer {
         }
     }
 
+    fn mark_replaced_funding(&self, contract_txids: &[Txid]) -> Result<(), MakerError> {
+        lock_debug!(self.wallet.write())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .mark_replaced_versions(contract_txids)
+            .map_err(MakerError::Wallet)
+    }
+
     #[cfg(feature = "integration-test")]
     fn stall_funding_for_test(&self, txid: &Txid) {
         if self.behavior() != MakerBehavior::StallFunding {

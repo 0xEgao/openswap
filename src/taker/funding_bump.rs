@@ -1553,6 +1553,7 @@ impl Taker {
             }
         }
 
+        self.write_wallet()?.mark_replaced_versions(&losing)?;
         log::info!(
             "Hop {} settled; keeping {} other funding version(s) until the winner is buried deep",
             funding.hop,

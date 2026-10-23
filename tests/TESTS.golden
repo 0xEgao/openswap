@@ -312,6 +312,7 @@ openswap wallet::api::timelock_reconcile_tests::a_leftover_version_is_retired_on
 openswap wallet::api::timelock_reconcile_tests::a_mined_leftover_version_is_reported_revived
 openswap wallet::api::timelock_reconcile_tests::a_slot_confirms_on_whichever_version_is_mined
 openswap wallet::api::timelock_reconcile_tests::an_unconfirmed_wait_returns_at_its_interrupt_height
+openswap wallet::api::timelock_reconcile_tests::an_unflagged_coin_is_never_retired_or_revived
 openswap wallet::api::timelock_reconcile_tests::cleanup_save_failure_preserves_coins_and_monotonic_flags
 openswap wallet::api::timelock_reconcile_tests::compat_coin_flags_default_to_safe_values_and_preserve_fresh_values
 openswap wallet::api::timelock_reconcile_tests::compat_coin_flags_stay_monotonic_after_stale_reinsert_and_reload

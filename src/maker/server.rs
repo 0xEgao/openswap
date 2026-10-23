@@ -325,9 +325,13 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
             }
 
             // A completed swap leaves only the funding versions a bump left
-            // behind; recovery drops each once its winner is deep, and
-            // refunds one a reorg revived.
+            // behind: retired once their winner is deep, recovered as revived
+            // if a reorg mined one. Any other swap is recovered as usual.
             for (swap_id, (inc, out)) in groups {
+                if inc.is_empty() && !out.is_empty() && out.iter().all(|coin| coin.replaced) {
+                    spawn_version_retirement(&maker, swap_id)?;
+                    continue;
+                }
                 let maker_clone = Arc::clone(&maker);
                 let handle = thread::Builder::new()
                     .name(format!("reboot-recovery-{}", maker.config.network_port))

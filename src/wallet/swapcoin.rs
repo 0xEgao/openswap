@@ -131,10 +131,15 @@ pub struct IncomingSwapCoin {
     /// difference and can leave the sweep underpriced.
     #[serde(default = "default_negotiated_feerate")]
     pub negotiated_feerate: u64,
+    /// A funding version a fee bump replaced, kept until the version that
+    /// beat it is buried deep: a reorg can still mine it. Needs
+    /// `funding-bump-v1`, so no build without bumps reads such a coin.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replaced: bool,
 }
 
 impl Requires for IncomingSwapCoin {
-    fn requires(&self, _out: &mut BTreeSet<&'static str>) {
+    fn requires(&self, out: &mut BTreeSet<&'static str>) {
         let Self {
             protocol,
             my_privkey: _,
@@ -157,8 +162,12 @@ impl Requires for IncomingSwapCoin {
             spending_tx: _,
             payment_target,
             negotiated_feerate: _,
+            replaced,
         } = self;
         protocol_requires(protocol);
+        if *replaced {
+            out.insert(crate::protocol::funding_bump::FUNDING_BUMP_FEATURE);
+        }
         if let Some(PaymentTarget {
             script_pubkey: _,
             amount: _,
@@ -208,6 +217,7 @@ impl IncomingSwapCoin {
             spending_tx: None,
             payment_target: None,
             negotiated_feerate,
+            replaced: false,
         }
     }
 
@@ -242,6 +252,7 @@ impl IncomingSwapCoin {
             spending_tx: None,
             payment_target: None,
             negotiated_feerate,
+            replaced: false,
         }
     }
 
@@ -916,6 +927,11 @@ pub struct OutgoingSwapCoin {
     /// refund early. Missing reads as `true`, the safe answer.
     #[serde(default = "yes")]
     pub incoming_claimed: bool,
+    /// A funding version a fee bump replaced, kept until the version that
+    /// beat it is buried deep: a reorg can still mine it. Needs
+    /// `funding-bump-v1`, so no build without bumps reads such a coin.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replaced: bool,
 }
 
 fn yes() -> bool {
@@ -923,7 +939,7 @@ fn yes() -> bool {
 }
 
 impl Requires for OutgoingSwapCoin {
-    fn requires(&self, _out: &mut BTreeSet<&'static str>) {
+    fn requires(&self, out: &mut BTreeSet<&'static str>) {
         let Self {
             protocol,
             my_privkey: _,
@@ -946,8 +962,12 @@ impl Requires for OutgoingSwapCoin {
             negotiated_feerate: _,
             committed: _,
             incoming_claimed: _,
+            replaced,
         } = self;
         protocol_requires(protocol);
+        if *replaced {
+            out.insert(crate::protocol::funding_bump::FUNDING_BUMP_FEATURE);
+        }
     }
 }
 
@@ -990,6 +1010,7 @@ impl OutgoingSwapCoin {
             negotiated_feerate,
             committed: false,
             incoming_claimed: false,
+            replaced: false,
         }
     }
 
@@ -1024,6 +1045,7 @@ impl OutgoingSwapCoin {
             negotiated_feerate,
             committed: false,
             incoming_claimed: false,
+            replaced: false,
         }
     }
 

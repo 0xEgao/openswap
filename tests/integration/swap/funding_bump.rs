@@ -465,12 +465,12 @@ fn taproot_next_maker_follows_a_replacement_after_reorg(world: &mut World) {
     takers = [taker],
     setup = [fund_taker_default(3), fund_makers_default(), start_makers(120), mine(1)],
     cases = [
-        /// Our own hop 0: our recovery loop keeps working the swap.
+        /// Our own hop 0: our recovery loop sees it revived and keeps it.
         taker_recovers_a_replaced_funding_a_reorg_mines(
             taker = TakerBehavior::StallFunding,
             behaviors = [MakerBehavior::Normal, MakerBehavior::Normal],
             hop = 0,
-            recovery = "Recovery loop: contracts still unresolved",
+            recovery = "is mined after a reorg; recovering",
             refunds = false,
         ),
         /// Maker 0's hop 1: its version retirement sees it revived and hands

@@ -793,6 +793,11 @@ pub trait Maker: Send + Sync {
     /// Feerate in sat/vB a replacement must add over what it replaces.
     fn replacement_increment_rate(&self) -> f64;
 
+    /// Flag the outgoing swapcoins of these contract txids as funding
+    /// versions a bump replaced: retired once beaten deep, recovered if a
+    /// reorg mines one.
+    fn mark_replaced_funding(&self, contract_txids: &[Txid]) -> Result<(), MakerError>;
+
     /// Test hook: keep one of our funding txs out of blocks, the way a fee
     /// spike would, so a test can bump it.
     #[cfg(feature = "integration-test")]

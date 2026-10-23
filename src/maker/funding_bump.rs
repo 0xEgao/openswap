@@ -648,6 +648,15 @@ pub(super) fn resolve_funding_versions<M: Maker>(
         winners.push(winner);
     }
 
+    for loser in &mut losers {
+        loser.replaced = true;
+    }
+    maker.mark_replaced_funding(
+        &losers
+            .iter()
+            .map(|loser| loser.contract_tx.compute_txid())
+            .collect::<Vec<_>>(),
+    )?;
     for loser in &losers {
         log::info!(
             "[{}] Funding version {} of swap {} lost to another; kept until the swap ends",

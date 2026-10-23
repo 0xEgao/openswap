@@ -72,6 +72,8 @@ impl RecoveryLoop {
                 let mut held: Option<AnyBlockchain> = None;
                 // Set by a failed fallback height read on Electrum; see below.
                 let mut deferring = false;
+                // Swaps already reported revived, so the warning fires once.
+                let mut revived = HashSet::new();
                 while !shutdown_clone.load(Relaxed) {
                     let scope = Self::scope(&live_swap, &wallet)
                         .inspect_err(|e| log::warn!("Recovery loop: scope: {e}"))
@@ -157,6 +159,11 @@ impl RecoveryLoop {
                             Ok(retirement) => {
                                 for (outpoint, spk) in retirement.removed {
                                     _ = watch_service.unwatch(outpoint, spk);
+                                }
+                                if retirement.revived && revived.insert(swap_id.clone()) {
+                                    log::warn!(
+                                        "A replaced funding version of swap {swap_id} is mined after a reorg; recovering"
+                                    );
                                 }
                             }
                             Err(e) => {

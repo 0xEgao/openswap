@@ -1282,6 +1282,25 @@ impl Wallet {
             .any(|coin| coin.swap_id.as_deref() == Some(swap_id) && !coin.committed)
     }
 
+    /// Flag the swapcoins whose contract tx is one of `contract_txids` as
+    /// funding versions a fee bump replaced, and save. Retirement acts only
+    /// on these, and only these can come back revived.
+    pub(crate) fn mark_replaced_versions(
+        &mut self,
+        contract_txids: &[Txid],
+    ) -> Result<(), WalletError> {
+        for txid in contract_txids {
+            let key = txid.to_string();
+            if let Some(coin) = self.store.outgoing_swapcoins.get_mut(&key) {
+                coin.replaced = true;
+            }
+            if let Some(coin) = self.store.incoming_swapcoins.get_mut(&key) {
+                coin.replaced = true;
+            }
+        }
+        self.save_to_disk()
+    }
+
     /// Drop the watch-only coins of `swap_id`, not saving.
     pub(crate) fn remove_watchonly_swapcoins(&mut self, swap_id: &str) {
         self.store.watchonly_swapcoins.remove(swap_id);
@@ -1441,10 +1460,11 @@ impl Wallet {
     }
 
     /// One pass over the funding versions a fee bump left behind for
-    /// `swap_id` once the swap settled on another: each is dropped once the
-    /// spend that beat it is [`REPLACED_VERSION_DISCARD_DEPTH`] deep, and kept
-    /// before that, since a reorg can still confirm it and its refund needs
-    /// the coin. Reads the chain with no wallet lock held.
+    /// `swap_id` once the swap settled on another, the coins flagged
+    /// `replaced`: each is dropped once the spend that beat it is
+    /// [`REPLACED_VERSION_DISCARD_DEPTH`] deep, and kept before that, since a
+    /// reorg can still confirm it and its refund needs the coin. Reads the
+    /// chain with no wallet lock held.
     pub(crate) fn retire_replaced_versions(
         wallet: &std::sync::RwLock<Wallet>,
         chain: &AnyBlockchain,
@@ -1458,7 +1478,7 @@ impl Wallet {
                 .store
                 .outgoing_swapcoins
                 .iter()
-                .filter(|(_, coin)| of_swap(&coin.swap_id))
+                .filter(|(_, coin)| of_swap(&coin.swap_id) && coin.replaced)
                 .map(|(key, coin)| {
                     let funding = match coin.protocol {
                         ProtocolVersion::Taproot => Some(coin.contract_tx.clone()),
@@ -1485,7 +1505,7 @@ impl Wallet {
                 .store
                 .incoming_swapcoins
                 .iter()
-                .filter(|(_, coin)| of_swap(&coin.swap_id))
+                .filter(|(_, coin)| of_swap(&coin.swap_id) && coin.replaced)
                 .map(|(key, coin)| {
                     let funding = (coin.protocol == ProtocolVersion::Taproot)
                         .then(|| coin.contract_tx.clone());
@@ -7816,6 +7836,7 @@ mod timelock_reconcile_tests {
             contract_spk,
         );
         coin.swap_id = Some("swap".to_string());
+        coin.replaced = true;
         let mut wallet = super::test_support::test_wallet(&dir.join("wallet"));
         wallet.add_outgoing_swapcoin(&coin);
         (RwLock::new(wallet), coin, parent)
@@ -7877,6 +7898,35 @@ mod timelock_reconcile_tests {
         let (reloaded, _) =
             WalletStore::read_from_disk(&wallet_path, Some(PASSWORD.to_string())).unwrap();
         assert!(reloaded.outgoing_swapcoins.is_empty());
+    }
+
+    /// Only a flagged version comes back revived: an ordinary swap's coin
+    /// whose funding is mined is no leftover, and retirement leaves it alone.
+    #[test]
+    fn an_unflagged_coin_is_never_retired_or_revived() {
+        let dir = tempdir().unwrap();
+        let (wallet, coin, _) = leftover_version(dir.path());
+        wallet
+            .write()
+            .unwrap()
+            .store
+            .outgoing_swapcoins
+            .values_mut()
+            .for_each(|coin| coin.replaced = false);
+        let unrelated = tx(
+            OutPoint::new(Txid::from_byte_array([4; 32]), 0),
+            1_000,
+            ScriptBuf::new(),
+        );
+        let chain = core(start_core_stub(coin.contract_tx.clone(), unrelated));
+        let retirement = Wallet::retire_replaced_versions(&wallet, &chain, "swap").unwrap();
+        assert!(!retirement.revived);
+        assert_eq!(retirement.remaining, 0);
+        assert!(retirement.removed.is_empty());
+        assert_eq!(
+            wallet.read().unwrap().outgoing_keys_for_swap("swap").len(),
+            1
+        );
     }
 
     /// A reorg mined the leftover version itself: the swap needs recovering
