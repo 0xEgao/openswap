@@ -4131,6 +4131,10 @@ pub enum TakerBehavior {
     /// Lose each maker's answer that its replacement funding is out, so only
     /// finding it on chain lets the swap follow it.
     DropBumpReply,
+    /// Send the first maker our contract signatures with a sighash flag other
+    /// than `SIGHASH_ALL`: each still verifies, but would not sign the
+    /// contract it goes into. The maker must drop the swap and free its claim.
+    SendNonSighashAllContractSigs,
     /// As [`TakerBehavior::StallFunding`], and lose our node's answer to
     /// each replacement's broadcast, as a dropped connection would after the
     /// node took it: the replacement must still be tracked.

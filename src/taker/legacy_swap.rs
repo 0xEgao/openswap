@@ -1449,6 +1449,23 @@ impl Taker {
         receivers_sigs: Vec<bitcoin::ecdsa::Signature>,
         senders_sigs: Vec<bitcoin::ecdsa::Signature>,
     ) -> Result<(), TakerError> {
+        #[cfg(feature = "integration-test")]
+        let (receivers_sigs, senders_sigs) = if self.behavior
+            == super::api::TakerBehavior::SendNonSighashAllContractSigs
+        {
+            log::warn!("Test behavior: sending contract signatures with a non-SIGHASH_ALL flag");
+            let reflag = |sigs: Vec<bitcoin::ecdsa::Signature>| {
+                sigs.into_iter()
+                    .map(|sig| bitcoin::ecdsa::Signature {
+                        sighash_type: bitcoin::sighash::EcdsaSighashType::SinglePlusAnyoneCanPay,
+                        ..sig
+                    })
+                    .collect::<Vec<_>>()
+            };
+            (reflag(receivers_sigs), reflag(senders_sigs))
+        } else {
+            (receivers_sigs, senders_sigs)
+        };
         let mut stream = self.net_connect(maker_address)?;
         let resp = RespContractSigsForRecvrAndSender {
             id: swap_id.to_string(),

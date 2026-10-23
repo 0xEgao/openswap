@@ -704,6 +704,7 @@ openswap::integration rejection::fees::maker_rejects_over_budget_funding_plan
 openswap::integration rejection::fees::maker_without_fee_headroom_fails_before_any_broadcast
 openswap::integration rejection::fees::taproot_bans_funding_fee_underpayment
 openswap::integration rejection::fees::taproot_bans_funding_fee_underpayment_electrum
+openswap::integration rejection::funding_proof::maker_drops_a_swap_whose_contract_sigs_are_not_sighash_all
 openswap::integration rejection::funding_proof::maker_errors_when_seen_funding_tx_is_evicted
 openswap::integration rejection::funding_proof::maker_rejects_duplicated_funding_outpoint
 openswap::integration rejection::funding_proof::maker_rejects_legacy_funding_output_below_floor

@@ -1223,14 +1223,9 @@ impl Wallet {
         Ok(Some(spender))
     }
 
-    /// Point each Taproot incoming swapcoin of `swap_id` whose funding a fee
-    /// bump replaced, after a reorg or behind our back, at the version that
-    /// was mined. Returns each moved coin's old contract txid and the coin as
-    /// it now stands.
-    /// What recovery does with an incoming coin whose contract output it
-    /// cannot find: a Taproot coin whose version lost to a mined replacement
-    /// paying the same contract follows it, one beaten for good by any other
-    /// spend is dropped, and anything else waits.
+    /// What recovery does with an incoming coin whose contract output it cannot
+    /// find: follow a mined Taproot replacement paying the same contract, drop
+    /// one whose coins went elsewhere for good, else wait.
     fn judge_unseen_incoming(
         chain: &AnyBlockchain,
         coin: &super::swapcoin::IncomingSwapCoin,
@@ -1255,6 +1250,9 @@ impl Wallet {
         Ok(UnseenIncoming::Wait)
     }
 
+    /// Point each Taproot incoming swapcoin of `swap_id` at the mined version
+    /// when a funding fee bump replaced its own, after a reorg or behind our
+    /// back. Returns each moved coin's old contract txid and the coin now.
     pub(crate) fn follow_replaced_incoming(
         wallet: &std::sync::RwLock<Wallet>,
         chain: &AnyBlockchain,

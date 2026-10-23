@@ -239,6 +239,41 @@ fn maker_rejects_proof_of_funding_with_missing_contract_cache(
     );
 }
 
+/// Contract signatures that verify, but carry a sighash flag other than
+/// `SIGHASH_ALL`, would not sign the contracts they go into. The maker refuses
+/// them as it does any bad signature: it drops the swap and frees its funding
+/// claim, so a taker cannot hold its coins by repeating the request.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, Normal],
+    takers = [SendNonSighashAllContractSigs],
+    setup = [fund_taker_default(3), fund_makers_default(), start_makers(120)],
+    swap(protocol = Legacy, sats = 500_000, makers = 2, tx_count = 3),
+)]
+fn maker_drops_a_swap_whose_contract_sigs_are_not_sighash_all(
+    world: &mut World,
+    params: SwapParams,
+) {
+    world.mine(1);
+    world.taker_mut().swap_fails(
+        params,
+        "maker must refuse contract signatures that are not SIGHASH_ALL",
+    );
+
+    assert_log!(world; {
+        has "Test behavior: sending contract signatures with a non-SIGHASH_ALL flag",
+        has "is not SIGHASH_ALL",
+        lacks "SECURITY: Broadcasting",
+    });
+    for (i, maker) in world.makers().iter().enumerate() {
+        wait_until!(
+            std::time::Duration::from_secs(60),
+            format!("maker {i} to free its funding claim"),
+            maker.inner().reserved_inputs().unwrap() == 0
+        );
+    }
+}
+
 #[world_test(
     backend = BitcoindBackend,
     maker_behaviors = [Normal, Normal],
