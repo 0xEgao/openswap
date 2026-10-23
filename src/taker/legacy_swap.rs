@@ -982,6 +982,38 @@ impl Taker {
             // maker signature needed to publish its contract during recovery.
             self.payment_stamp_targets()?;
             self.persist_incoming_swapcoins()?;
+
+            // Every losing version of this hop is a copy of its split's coin on
+            // its own contract. Same keys and scripts: a reorg that mines it
+            // leaves the coins ours to claim, with the key the handover brings.
+            let losers =
+                std::mem::take(&mut self.swap_state_mut()?.funding_bump.legacy_last_hop_losers);
+            if !losers.is_empty() {
+                let mut copies = Vec::with_capacity(losers.len());
+                for (split, funding_tx, contract_tx, funding_amount) in losers {
+                    let Some(winner) = self.swap_state()?.incoming_swapcoins.get(split) else {
+                        continue;
+                    };
+                    let mut copy = winner.clone();
+                    copy.contract_tx = contract_tx;
+                    copy.funding_amount = funding_amount;
+                    copy.others_contract_sig = None;
+                    copy.replaced = true;
+                    copy.replaced_funding_tx = Some(funding_tx);
+                    copies.push((split, copy));
+                }
+                {
+                    let mut wallet = self.write_wallet()?;
+                    for (_, copy) in &copies {
+                        wallet.add_incoming_swapcoin(copy);
+                    }
+                    wallet.save_to_disk()?;
+                }
+                self.swap_state_mut()?
+                    .funding_bump
+                    .replaced_incoming
+                    .extend(copies);
+            }
         }
 
         // Breach detector keeps running through finalization.

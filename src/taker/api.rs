@@ -3203,6 +3203,28 @@ impl Taker {
                 {
                     incoming.set_other_privkey(*received_privkey);
                 }
+                // The kept copies of a bumped hop's losing versions share each
+                // split's keys, so they take the same key, saved now.
+                let replaced: Vec<IncomingSwapCoin> = {
+                    let swap = self.swap_state_mut()?;
+                    for (split, copy) in swap.funding_bump.replaced_incoming.iter_mut() {
+                        if let Some(key) = received_privkeys.get(*split) {
+                            copy.set_other_privkey(*key);
+                        }
+                    }
+                    swap.funding_bump
+                        .replaced_incoming
+                        .iter()
+                        .map(|(_, copy)| copy.clone())
+                        .collect()
+                };
+                if !replaced.is_empty() {
+                    let mut wallet = self.write_wallet()?;
+                    for copy in &replaced {
+                        wallet.add_incoming_swapcoin(copy);
+                    }
+                    wallet.save_to_disk()?;
+                }
                 log::info!(
                     "Validated and set taker's incoming swapcoin other_privkeys from last maker ({})",
                     i

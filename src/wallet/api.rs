@@ -1499,16 +1499,18 @@ impl Wallet {
                     )
                 })
                 .collect();
-            // Only a Taproot incoming coin has versions: its contract tx is
-            // the maker's funding.
+            // A Taproot incoming coin's contract tx is the maker's funding; a
+            // Legacy copy carries the funding of the version it stands for.
             let incoming: Vec<(String, Option<Transaction>)> = wallet
                 .store
                 .incoming_swapcoins
                 .iter()
                 .filter(|(_, coin)| of_swap(&coin.swap_id) && coin.replaced)
                 .map(|(key, coin)| {
-                    let funding = (coin.protocol == ProtocolVersion::Taproot)
-                        .then(|| coin.contract_tx.clone());
+                    let funding = match coin.protocol {
+                        ProtocolVersion::Taproot => Some(coin.contract_tx.clone()),
+                        ProtocolVersion::Legacy => coin.replaced_funding_tx.clone(),
+                    };
                     (key.clone(), funding)
                 })
                 .collect();

@@ -138,6 +138,14 @@ pub(crate) struct SwapBumps {
     pub(crate) incoming_versions: Vec<IncomingSwapCoin>,
     /// Watch-only swapcoins of unsettled replacement versions.
     pub(crate) watchonly_versions: Vec<WatchOnlySwapCoin>,
+    /// A Legacy last hop's losing versions, by split: its funding tx,
+    /// contract tx and funding amount. Our incoming coins are built only from the winners,
+    /// so these become flagged copies of them, which recovery needs should a
+    /// reorg mine one.
+    pub(crate) legacy_last_hop_losers: Vec<(usize, Transaction, Transaction, Amount)>,
+    /// Those copies, by split, kept as incoming swapcoins until the winner
+    /// is buried deep. They take the handed-over key with the winners.
+    pub(crate) replaced_incoming: Vec<(usize, IncomingSwapCoin)>,
 }
 
 /// One version of a funding split.
@@ -1494,12 +1502,26 @@ impl Taker {
         };
         let mut losing = Vec::new();
         let mut winning = Vec::new();
+        // A Legacy last hop pays us, and our incoming coins are built only
+        // later, from the winners: keep what a losing version needs.
+        let legacy_last_hop =
+            funding.hop == makers && self.swap_state()?.params.protocol == ProtocolVersion::Legacy;
+        let mut last_hop_losers = Vec::new();
         for (split, &winner) in winners.iter().enumerate() {
             for (index, version) in funding.versions[split].iter().enumerate() {
                 if index == winner {
                     winning.push((split, contract_txid(version)));
                 } else {
                     losing.push(contract_txid(version));
+                    if let (true, Some(contract_tx)) = (legacy_last_hop, &version.contract_tx) {
+                        let vout = funding.contract_vouts[split];
+                        last_hop_losers.push((
+                            split,
+                            version.funding_tx.clone(),
+                            contract_tx.clone(),
+                            version.funding_tx.output[vout].value,
+                        ));
+                    }
                 }
             }
         }
@@ -1508,6 +1530,7 @@ impl Taker {
         let bumps = std::mem::take(&mut swap.funding_bump);
         swap.funding_bump.seq = bumps.seq;
         swap.funding_bump.hop0_input_infos = bumps.hop0_input_infos;
+        swap.funding_bump.legacy_last_hop_losers = last_hop_losers;
         if funding.hop == 0 {
             let every_version: Vec<OutgoingSwapCoin> = swap
                 .outgoing_swapcoins

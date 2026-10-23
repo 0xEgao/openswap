@@ -136,6 +136,11 @@ pub struct IncomingSwapCoin {
     /// `funding-bump-v1`, so no build without bumps reads such a coin.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub replaced: bool,
+    /// The funding tx of a replaced Legacy version: its contract spends it,
+    /// and retirement judges the version by it. Taproot's contract tx is
+    /// its funding already.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_funding_tx: Option<Transaction>,
 }
 
 impl Requires for IncomingSwapCoin {
@@ -163,6 +168,7 @@ impl Requires for IncomingSwapCoin {
             payment_target,
             negotiated_feerate: _,
             replaced,
+            replaced_funding_tx: _,
         } = self;
         protocol_requires(protocol);
         if *replaced {
@@ -218,6 +224,7 @@ impl IncomingSwapCoin {
             payment_target: None,
             negotiated_feerate,
             replaced: false,
+            replaced_funding_tx: None,
         }
     }
 
@@ -253,6 +260,7 @@ impl IncomingSwapCoin {
             payment_target: None,
             negotiated_feerate,
             replaced: false,
+            replaced_funding_tx: None,
         }
     }
 
