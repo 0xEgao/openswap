@@ -1155,24 +1155,6 @@ impl Wallet {
             .collect()
     }
 
-    /// Whether a funding bump left two outgoing swapcoins of `swap_id` that
-    /// spend the same coins, so either of their funding txs may confirm. The
-    /// replaced one was broadcast, so it is public even where our funding is
-    /// otherwise only ever sent by us.
-    pub(crate) fn swap_has_funding_variants(&self, swap_id: &str) -> bool {
-        let mut seen = HashSet::new();
-        self.store
-            .outgoing_swapcoins
-            .values()
-            .filter(|sc| sc.swap_id.as_deref() == Some(swap_id))
-            .filter_map(|sc| match sc.protocol {
-                ProtocolVersion::Legacy => sc.funding_tx.as_ref(),
-                ProtocolVersion::Taproot => Some(&sc.contract_tx),
-            })
-            .filter_map(|funding| funding.input.first())
-            .any(|input| !seen.insert(input.previous_output))
-    }
-
     /// The mined replacement of a Taproot incoming contract whose funding a fee
     /// bump replaced: a confirmed tx spending exactly the same coins and paying
     /// the same contract script once. Its keys and scripts are the contract's,

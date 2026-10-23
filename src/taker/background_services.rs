@@ -148,6 +148,23 @@ impl RecoveryLoop {
                         continue;
                     }
 
+                    // Funding versions a fee bump left behind go once the version
+                    // that beat them is deep: a refund would only wait for their
+                    // timelock to find them dead. One a reorg mined stays, and
+                    // is recovered below like any contract.
+                    for swap_id in &swap_ids {
+                        match Wallet::retire_replaced_versions(&wallet, chain, swap_id) {
+                            Ok(retirement) => {
+                                for (outpoint, spk) in retirement.removed {
+                                    _ = watch_service.unwatch(outpoint, spk);
+                                }
+                            }
+                            Err(e) => {
+                                log::debug!("Recovery loop: retiring versions of {swap_id}: {e:?}")
+                            }
+                        }
+                    }
+
                     // Sweeps and timelock refunds in one pass. It takes the lock itself
                     // and drops it across its wait, so a stuck tx cannot wedge the wallet.
                     match Wallet::recover_swapcoins(

@@ -2969,9 +2969,20 @@ impl MakerTrait for MakerServer {
         {
             let mut wallet = lock_debug!(self.wallet.write())
                 .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-            wallet
-                .remove_swap_coins_and_save(swap_id, false, true)
-                .map_err(MakerError::Wallet)?;
+            if keep.is_empty() {
+                wallet
+                    .remove_swap_coins_and_save(swap_id, false, true)
+                    .map_err(MakerError::Wallet)?;
+            } else {
+                // The kept versions stay, so the swap's coins are removed one
+                // by one; its watch-only coins and claim go as they would.
+                for key in &outgoing_keys {
+                    wallet.remove_outgoing_swapcoin(key);
+                }
+                wallet.remove_watchonly_swapcoins(swap_id);
+                wallet.release_swap_locks(swap_id, None);
+                wallet.save_to_disk().map_err(MakerError::Wallet)?;
+            }
         }
 
         log::info!(

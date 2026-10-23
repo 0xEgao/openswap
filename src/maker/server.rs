@@ -332,7 +332,9 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
                 let handle = thread::Builder::new()
                     .name(format!("reboot-recovery-{}", maker.config.network_port))
                     .spawn(move || {
-                        if let Err(e) = recover_from_swap(maker_clone, swap_id.clone(), inc, out) {
+                        if let Err(e) =
+                            recover_from_swap(maker_clone, swap_id.clone(), inc, out, false)
+                        {
                             log::error!("Reboot recovery failed for {}: {:?}", swap_id, e);
                         }
                     })
@@ -1022,6 +1024,7 @@ fn check_for_idle_states(maker: Arc<MakerServer>) -> Result<(), MakerError> {
                         idle.swap_id,
                         idle.incoming_swapcoins,
                         idle.outgoing_swapcoins,
+                        false,
                     ) {
                         log::error!("Failed to recover from swap {}: {:?}", swap_id, e);
                     }
@@ -1356,6 +1359,7 @@ fn spawn_version_retirement(maker: &Arc<MakerServer>, swap_id: String) -> Result
                                 swap_id.clone(),
                                 Vec::new(),
                                 outgoing,
+                                true,
                             ) {
                                 log::error!("Failed to recover from swap {}: {:?}", swap_id, e);
                             }
@@ -1390,11 +1394,16 @@ fn spawn_version_retirement(maker: &Arc<MakerServer>, swap_id: String) -> Result
 ///    We extract it via the watch tower and sweep our incoming swapcoins.
 /// 2. **Timelock** (outgoing swapcoins): After the timelock expires, we reclaim
 ///    our outgoing funds via the timelock spending path.
+///
+/// `revived` recovers a completed swap whose replaced funding version a reorg
+/// mined: its incoming was claimed long ago, yet the version's coins are
+/// left to the next hop only until the timelock, as any contract's are.
 fn recover_from_swap(
     maker: Arc<MakerServer>,
     swap_id: String,
     mut incoming_swapcoins: Vec<crate::wallet::swapcoin::IncomingSwapCoin>,
     outgoing_swapcoins: Vec<crate::wallet::swapcoin::OutgoingSwapCoin>,
+    revived: bool,
 ) -> Result<(), MakerError> {
     // The watcher hears each new block, so asking the server every pass is waste.
     // The fallback uses its own connection, kept while the watcher is down and dropped on error:
@@ -2129,10 +2138,12 @@ fn recover_from_swap(
                 maker.shutdown.store(true, Relaxed);
                 return Ok(());
             }
-        } else if current_height >= timelock_expiry && !incoming_swapcoins.is_empty() {
+        } else if current_height >= timelock_expiry && (!incoming_swapcoins.is_empty() || revived) {
             // Refund only while incoming coins are left. They are saved before
             // outgoing ones, so a funded swap with none left had its incoming
             // claimed before a restart, and a refund would take both sides.
+            // A revived version is the exception: the next hop had until the
+            // timelock to claim it, and past that its coins would only be stranded.
             // --- Timelock path: reclaim outgoing after timelock expires ---
             log::info!(
                 "[{}] Timelock expired at {} (expiry={}), recovering via timelock path",
@@ -2150,15 +2161,8 @@ fn recover_from_swap(
                 &maker.shutdown,
                 Some(&swap_scope),
                 // Our funding txs leave us unsigned, so no peer can broadcast
-                // them for us. A bumped one went out in every version, though,
-                // and anyone may rebroadcast a replaced one while its coins are
-                // unspent: keep its contract until they are confirmed spent.
-                &|swap_id| {
-                    swap_id.is_some_and(|id| {
-                        lock_debug!(maker.wallet.read())
-                            .map_or(true, |wallet| wallet.swap_has_funding_variants(id))
-                    })
-                },
+                // them for us.
+                &|_| false,
             )
             // Nothing respawns this thread: a failed wait retries on the next pass.
             .unwrap_or_else(|e| {

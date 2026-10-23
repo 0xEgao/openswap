@@ -453,9 +453,11 @@ fn taproot_next_maker_follows_a_replacement_after_reorg(world: &mut World) {
 /// completed on its replacement. The funder kept that version for just this,
 /// and recovers the swap from it.
 ///
-/// Settling it is the receiver's to do, who holds the keys by now; receivers
-/// do not yet keep their replaced incoming versions. So the taker's recovery
-/// refunds it once its timelock passes, and the maker's takes it up.
+/// Settling it is the receiver's to do, who holds the keys by now, but makers
+/// do not yet keep their replaced incoming versions. So this checks the
+/// funder's side: the swap is back in recovery with the version kept. Our own
+/// recovery holds the refund for the first maker's claim; a maker refunds
+/// once the timelock passes, as with any contract left unclaimed.
 #[world_test(
     backend = BitcoindBackend,
     makers = 2,
@@ -463,12 +465,13 @@ fn taproot_next_maker_follows_a_replacement_after_reorg(world: &mut World) {
     takers = [taker],
     setup = [fund_taker_default(3), fund_makers_default(), start_makers(120), mine(1)],
     cases = [
-        /// Our own hop 0: our recovery loop refunds it.
+        /// Our own hop 0: our recovery loop keeps working the swap.
         taker_recovers_a_replaced_funding_a_reorg_mines(
             taker = TakerBehavior::StallFunding,
             behaviors = [MakerBehavior::Normal, MakerBehavior::Normal],
             hop = 0,
-            recovery = None,
+            recovery = "Recovery loop: contracts still unresolved",
+            refunds = false,
         ),
         /// Maker 0's hop 1: its version retirement sees it revived and hands
         /// the swap to recovery.
@@ -476,11 +479,12 @@ fn taproot_next_maker_follows_a_replacement_after_reorg(world: &mut World) {
             taker = TakerBehavior::Normal,
             behaviors = [MakerBehavior::StallFunding, MakerBehavior::Normal],
             hop = 1,
-            recovery = Some("recover_from_swap started"),
+            recovery = "recover_from_swap started",
+            refunds = true,
         ),
     ],
 )]
-fn run_revived_replaced_funding(world: &mut World, hop: usize, recovery: Option<&str>) {
+fn run_revived_replaced_funding(world: &mut World, hop: usize, recovery: &str, refunds: bool) {
     use bitcoind::bitcoincore_rpc::RpcApi;
 
     std::env::set_var("OPENSWAP_FUNDING_BUMP_FEERATE", MARKET_FEERATE);
@@ -519,6 +523,9 @@ fn run_revived_replaced_funding(world: &mut World, hop: usize, recovery: Option<
             (!versions.is_empty() && versions.iter().all(unmined)).then_some(versions)
         }
     );
+
+    let log = world.taker_log_path();
+    let mark = std::fs::read_to_string(&log).map_or(0, |text| text.len());
 
     // Orphan the lowest block that mined a winner, and every block after it.
     world.framework().set_block_gen_paused(true);
@@ -561,32 +568,26 @@ fn run_revived_replaced_funding(world: &mut World, hop: usize, recovery: Option<
     }
     world.framework().set_block_gen_paused(false);
 
-    match recovery {
-        Some(recovery) => {
-            let log = world.taker_log_path();
-            wait_until!(
-                std::time::Duration::from_secs(120),
-                "the funder to see its replaced funding revived and recover",
-                std::fs::read_to_string(&log).is_ok_and(|text| {
-                    text.split_once("is mined after a reorg; recovering")
-                        .is_some_and(|(_, after)| after.contains(recovery))
-                })
-            );
-            // The revived version's refund data is still there for recovery.
-            assert_eq!(
-                funder_wallet()
-                    .read()
-                    .unwrap()
-                    .get_outgoing_swapcoins_count(),
-                replaced.len(),
-                "the funder keeps every revived version"
-            );
-        }
-        None => wait_until!(
+    wait_until!(
+        std::time::Duration::from_secs(180),
+        "the funder to recover the swap from its revived funding",
+        std::fs::read_to_string(&log).is_ok_and(|text| text[mark..].contains(recovery))
+    );
+    // The revived version's refund data is still there for recovery.
+    assert_eq!(
+        funder_wallet()
+            .read()
+            .unwrap()
+            .get_outgoing_swapcoins_count(),
+        replaced.len(),
+        "the funder keeps every revived version"
+    );
+    if refunds {
+        wait_until!(
             std::time::Duration::from_secs(900),
             every std::time::Duration::from_secs(2),
-            "the funder to refund the revived contract",
+            "the funder to refund the revived contract by timelock",
             funder_wallet().read().unwrap().get_outgoing_swapcoins_count() == 0
-        ),
+        );
     }
 }

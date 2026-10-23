@@ -274,11 +274,12 @@ reorg mines one of them instead, the swap is recovered from it. A failed swap's 
 the same depth.
 
 That covers the funder. Once the swap completed, a revived version's coins
-are the receiver's: it holds the keys and should claim them. Receivers do
-not yet keep their replaced incoming versions, so after a reorg that deep
-the funder only holds on to its refund. A taker funder never takes back
-what a maker should claim; a maker funder can refund it once its timelock
-passes. A version you broadcast counts even if your node's answer
+are the receiver's: it holds the keys and should claim them. A taker keeps
+its replaced incoming versions and claims one a reorg revives. A maker does
+not yet keep them (a Legacy last hop has none to keep), so after a reorg that
+deep the funder only holds on to its refund. A taker funder never takes back
+what a maker should claim; a maker funder refunds it once its timelock
+passes, as with any contract left unclaimed. A version you broadcast counts even if your node's answer
 was lost: it is tracked from the moment it is signed.
 
 **A lost answer.** If the maker's answer to a bump never reaches you, your
