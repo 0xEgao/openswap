@@ -83,6 +83,7 @@ openswap protocol::common_messages::tests::undecodable_messages_are_named_by_the
 openswap protocol::contract::test::calculate_swap_fee_normal
 openswap protocol::contract::test::claimed_amounts_above_the_cap_are_rejected_before_summing
 openswap protocol::contract::test::contract_tx_rejects_funding_below_the_fee
+openswap protocol::contract::test::only_a_sighash_all_contract_signature_is_kept
 openswap protocol::contract::test::sender_contract_rejects_dust_outputs
 openswap protocol::contract::test::short_multisig_redeemscript_is_rejected
 openswap protocol::contract::test::test_apply_two_signatures_to_2of2_multisig_spend
@@ -113,6 +114,7 @@ openswap protocol::features::tests::require_features_fails_closed_on_bad_names
 openswap protocol::features::tests::requirements_bind_only_their_own_flows_but_unknown_ones_bind_all
 openswap protocol::features::tests::versions_split_only_on_a_canonical_suffix
 openswap protocol::funding_bump::tests::a_bump_is_authorized_only_by_the_declared_key_for_its_terms
+openswap protocol::funding_bump::tests::a_bump_signed_for_one_maker_is_refused_by_another
 openswap protocol::funding_bump::tests::a_replacement_lowers_only_the_contract_output
 openswap protocol::funding_bump::tests::a_replacement_never_drops_the_contract_below_its_floor
 openswap protocol::funding_bump::tests::an_incoming_hop_may_fall_short_only_within_the_bound
@@ -325,6 +327,7 @@ openswap wallet::api::timelock_reconcile_tests::electrum_keeps_a_contract_the_ot
 openswap wallet::api::timelock_reconcile_tests::electrum_records_our_confirmed_recovery_as_resolved
 openswap wallet::api::timelock_reconcile_tests::electrum_skips_an_unconfirmed_spend_listed_first
 openswap wallet::api::timelock_reconcile_tests::interrupted_waits_keep_the_first_arrival_deadline
+openswap wallet::api::timelock_reconcile_tests::recovery_follows_a_replacement_paying_the_same_contract
 openswap wallet::api::timelock_reconcile_tests::replacement_increment_comes_from_the_backend
 openswap wallet::api::utxo_corroboration_tests::cached_utxo_refresh_preserves_transaction_value_and_script
 openswap wallet::api::utxo_corroboration_tests::fabricated_utxo_fails_corroboration
@@ -776,12 +779,15 @@ openswap::integration swap::funding_bump::legacy_last_maker_bumps_its_stuck_fund
 openswap::integration swap::funding_bump::legacy_last_maker_bumps_its_stuck_funding_electrum
 openswap::integration swap::funding_bump::legacy_maker_bumps_its_stuck_funding
 openswap::integration swap::funding_bump::legacy_maker_bumps_its_stuck_funding_electrum
+openswap::integration swap::funding_bump::legacy_maker_recovers_a_replaced_funding_a_reorg_mines
 openswap::integration swap::funding_bump::legacy_maker_refuses_to_bump_funding_it_saw_mined
 openswap::integration swap::funding_bump::legacy_taker_bumps_its_stuck_funding
 openswap::integration swap::funding_bump::legacy_taker_bumps_its_stuck_funding_electrum
 openswap::integration swap::funding_bump::legacy_taker_finds_a_replacement_it_never_heard_of
 openswap::integration swap::funding_bump::legacy_taker_finds_a_replacement_it_never_heard_of_electrum
+openswap::integration swap::funding_bump::legacy_taker_recovers_a_replaced_funding_a_reorg_mines
 openswap::integration swap::funding_bump::legacy_taker_tracks_a_replacement_whose_broadcast_answer_was_lost
+openswap::integration swap::funding_bump::legacy_taker_tracks_a_replacement_whose_broadcast_answer_was_lost_electrum
 openswap::integration swap::funding_bump::maker_recovers_a_replaced_funding_a_reorg_mines
 openswap::integration swap::funding_bump::maker_refuses_a_funding_bump_the_taker_did_not_sign
 openswap::integration swap::funding_bump::maker_refuses_a_funding_bump_the_taker_did_not_sign_electrum
@@ -797,6 +803,7 @@ openswap::integration swap::funding_bump::taproot_taker_bumps_its_stuck_funding_
 openswap::integration swap::funding_bump::taproot_taker_finds_a_replacement_it_never_heard_of
 openswap::integration swap::funding_bump::taproot_taker_finds_a_replacement_it_never_heard_of_electrum
 openswap::integration swap::funding_bump::taproot_taker_tracks_a_replacement_whose_broadcast_answer_was_lost
+openswap::integration swap::funding_bump::taproot_taker_tracks_a_replacement_whose_broadcast_answer_was_lost_electrum
 openswap::integration swap::mixed_protocol::legacy_and_taproot_swaps_run_together
 openswap::integration swap::multi_confirm::legacy_confirmation_wait_exceeds_admission_deadline
 openswap::integration swap::multi_confirm::legacy_multi_confirm_swap

@@ -287,6 +287,7 @@ impl Taker {
                 )?;
                 let swap = self.swap_state_mut()?;
                 for (swapcoin, sig) in swap.outgoing_swapcoins.iter_mut().zip(sender_sigs) {
+                    crate::protocol::contract::check_contract_sig_sighash(&sig)?;
                     swapcoin.others_contract_sig = Some(sig);
                 }
             }
@@ -780,11 +781,6 @@ impl Taker {
             // and the re-signed tx may come out a vbyte or so larger. What
             // the maker owes is the swap feerate on its own original, so a
             // bumped winner is judged by the signed original it replaced.
-            let funding_feerates: Vec<f64> = funding
-                .versions
-                .iter()
-                .map(|versions| versions[0].feerate as f64)
-                .collect();
             let original_txids: Vec<Txid> = funding
                 .versions
                 .iter()
@@ -814,9 +810,7 @@ impl Taker {
             });
             match confirmed_funding {
                 Ok(confirmed) => {
-                    if let Err(e) =
-                        self.verify_maker_funding_feerate(&confirmed, &funding_feerates, maker_idx)
-                    {
+                    if let Err(e) = self.verify_maker_funding_feerate(&confirmed, maker_idx) {
                         log::warn!(
                             "Maker {} funding fee check failed after confirmation; continuing: {:?}",
                             maker_idx,
@@ -971,6 +965,7 @@ impl Taker {
             // Store the maker's signatures on the incoming swapcoins
             let swap = self.swap_state_mut()?;
             for (incoming, sig) in swap.incoming_swapcoins.iter_mut().zip(receiver_sigs.iter()) {
+                crate::protocol::contract::check_contract_sig_sighash(sig)?;
                 incoming.others_contract_sig = Some(*sig);
             }
             log::info!(

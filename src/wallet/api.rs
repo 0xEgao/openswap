@@ -84,6 +84,17 @@ pub(crate) const RESTORE_ADDRESS_GAP: u32 = 100;
 /// higher indices must not keep the loop or the watch window growing forever.
 const MAX_SYNC_PASSES: u32 = 100;
 pub(crate) const MAX_WATCH_WINDOW: u32 = 100_000;
+/// [`Wallet::judge_unseen_incoming`]'s answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnseenIncoming {
+    /// A mined replacement pays the same contract: move the coin onto it.
+    Follow,
+    /// Its coins went elsewhere for good: nothing is ever swept from it.
+    Drop,
+    /// Not decided yet.
+    Wait,
+}
+
 /// What [`Wallet::retire_replaced_versions`] did with a swap's leftover versions.
 #[derive(Debug, Default)]
 pub(crate) struct Retirement {
@@ -1216,6 +1227,34 @@ impl Wallet {
     /// bump replaced, after a reorg or behind our back, at the version that
     /// was mined. Returns each moved coin's old contract txid and the coin as
     /// it now stands.
+    /// What recovery does with an incoming coin whose contract output it
+    /// cannot find: a Taproot coin whose version lost to a mined replacement
+    /// paying the same contract follows it, one beaten for good by any other
+    /// spend is dropped, and anything else waits.
+    fn judge_unseen_incoming(
+        chain: &AnyBlockchain,
+        coin: &super::swapcoin::IncomingSwapCoin,
+    ) -> Result<UnseenIncoming, WalletError> {
+        if coin.protocol != ProtocolVersion::Taproot
+            || chain
+                .tx_block_height(&coin.contract_tx.compute_txid())?
+                .is_some()
+        {
+            return Ok(UnseenIncoming::Wait);
+        }
+        if !coin.replaced && Self::confirmed_taproot_replacement(chain, coin)?.is_some() {
+            return Ok(UnseenIncoming::Follow);
+        }
+        if Self::replaced_by_confirmed_spend(
+            chain,
+            &coin.contract_tx,
+            replaced_version_discard_depth(),
+        )? {
+            return Ok(UnseenIncoming::Drop);
+        }
+        Ok(UnseenIncoming::Wait)
+    }
+
     pub(crate) fn follow_replaced_incoming(
         wallet: &std::sync::RwLock<Wallet>,
         chain: &AnyBlockchain,
@@ -1227,9 +1266,12 @@ impl Wallet {
             .incoming_swapcoins
             .values()
             .filter(|coin| {
+                // A flagged copy stands for one version only; retirement
+                // drops it once another version is mined deep.
                 coin.protocol == ProtocolVersion::Taproot
                     && coin.swap_id.as_deref() == Some(swap_id)
                     && coin.spending_tx.is_none()
+                    && !coin.replaced
             })
             .cloned()
             .collect();
@@ -2902,14 +2944,17 @@ impl Wallet {
             .any(|locks| locks.outpoints.contains(outpoint))
     }
 
-    /// Test-only: the contract tx of every outgoing swapcoin, which for a
-    /// Taproot coin is its funding.
+    /// Test-only: the funding tx of every outgoing swapcoin that has one:
+    /// a Taproot coin's contract tx, a Legacy coin's stored funding tx.
     #[cfg(feature = "integration-test")]
-    pub fn outgoing_contract_txs_for_test(&self) -> Vec<Transaction> {
+    pub fn outgoing_funding_txs_for_test(&self) -> Vec<Transaction> {
         self.store
             .outgoing_swapcoins
             .values()
-            .map(|coin| coin.contract_tx.clone())
+            .filter_map(|coin| match coin.protocol {
+                ProtocolVersion::Taproot => Some(coin.contract_tx.clone()),
+                ProtocolVersion::Legacy => coin.funding_tx.clone(),
+            })
             .collect()
     }
 
@@ -4595,16 +4640,18 @@ impl Wallet {
                             return Ok(());
                         }
                     } else {
-                        // A fee bump replaced this contract and the other
-                        // version confirmed: nothing is ever swept from this one.
-                        if swapcoin.protocol == crate::protocol::ProtocolVersion::Taproot
-                            && chain.tx_block_height(&utxo_txid)?.is_none()
-                            && Self::replaced_by_confirmed_spend(
-                                chain,
-                                &swapcoin.contract_tx,
-                                replaced_version_discard_depth(),
-                            )?
-                        {
+                        // A fee bump replaced this contract. A replacement paying
+                        // the same contract is ours to claim: follow it, and
+                        // the next pass sweeps it. One beaten for good by any
+                        // other spend is never swept.
+                        let verdict = Self::judge_unseen_incoming(chain, &swapcoin)?;
+                        if verdict == UnseenIncoming::Follow {
+                            if let Some(id) = swapcoin.swap_id.as_deref() {
+                                Self::follow_replaced_incoming(wallet, chain, id)?;
+                            }
+                            return Ok(());
+                        }
+                        if verdict == UnseenIncoming::Drop {
                             log::info!(
                                 "Incoming contract {} for {} was replaced and its inputs are confirmed spent — dropping it",
                                 utxo_txid,
@@ -7900,6 +7947,62 @@ mod timelock_reconcile_tests {
         let (reloaded, _) =
             WalletStore::read_from_disk(&wallet_path, Some(PASSWORD.to_string())).unwrap();
         assert!(reloaded.outgoing_swapcoins.is_empty());
+    }
+
+    /// An incoming Taproot coin whose contract output recovery cannot find.
+    /// A mined replacement paying the same contract is followed, never
+    /// dropped: the coins are still ours to claim there. A flagged copy
+    /// stands for its own version only, so it is dropped once beaten deep;
+    /// so is any coin whose coins went elsewhere. A shallow spend waits.
+    #[test]
+    fn recovery_follows_a_replacement_paying_the_same_contract() {
+        let (outgoing, _) = taproot_coin_and_recovery();
+        let parent = tx(
+            OutPoint::new(Txid::from_byte_array([8; 32]), 0),
+            60_000,
+            ScriptBuf::new_p2wpkh(&pubkey(6).wpubkey_hash().unwrap()),
+        );
+        let contract_spk = outgoing.contract_tx.output[0].script_pubkey.clone();
+        let spending = |value, script: &ScriptBuf| {
+            tx(
+                OutPoint::new(parent.compute_txid(), 0),
+                value,
+                script.clone(),
+            )
+        };
+        let coin = |replaced| {
+            let mut coin = crate::wallet::swapcoin::IncomingSwapCoin::new_taproot(
+                key(3),
+                outgoing.hashlock_script.clone().unwrap(),
+                outgoing.timelock_script.clone().unwrap(),
+                spending(50_000, &contract_spk),
+                Amount::from_sat(50_000),
+                1,
+            );
+            coin.replaced = replaced;
+            coin
+        };
+        let elsewhere = ScriptBuf::new_p2wpkh(&pubkey(7).wpubkey_hash().unwrap());
+        let deep = TIP - REPLACED_VERSION_DISCARD_DEPTH as i64 + 1;
+        for (replaced, winner_script, height, expected) in [
+            (false, &contract_spk, deep, UnseenIncoming::Follow),
+            (true, &contract_spk, deep, UnseenIncoming::Drop),
+            (false, &elsewhere, deep, UnseenIncoming::Drop),
+            (false, &elsewhere, deep + 1, UnseenIncoming::Wait),
+        ] {
+            let chain = core(start_core_stub_at(
+                parent.clone(),
+                spending(49_000, winner_script),
+                height,
+            ));
+            assert_eq!(
+                Wallet::judge_unseen_incoming(&chain, &coin(replaced)).unwrap(),
+                expected,
+                "replaced={} height={}",
+                replaced,
+                height
+            );
+        }
     }
 
     /// Only a flagged version comes back revived: an ordinary swap's coin

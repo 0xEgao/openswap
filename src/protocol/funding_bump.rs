@@ -13,7 +13,7 @@ use bitcoin::{
     ecdsa::Signature as EcdsaSignature,
     hashes::{sha256, Hash, HashEngine},
     secp256k1::{schnorr::Signature, Keypair, Message, Secp256k1, SecretKey, XOnlyPublicKey},
-    Amount, Transaction,
+    Amount, OutPoint, Transaction,
 };
 use serde::{Deserialize, Serialize};
 
@@ -103,12 +103,23 @@ pub struct FundingBumped {
 }
 
 /// The digest the taker signs to authorize a bump (`commit == false`) or a
-/// Legacy commit (`commit == true`).
-pub(crate) fn bump_digest(swap_id: &str, feerate: u64, seq: u32, commit: bool) -> Message {
+/// Legacy commit (`commit == true`) of one hop. `hop` is the first coin the
+/// hop's funding spends, the same in every version and in no other hop: every
+/// maker of the route knows the swap id, so a request signed for one maker
+/// must not move another's funding.
+pub(crate) fn bump_digest(
+    swap_id: &str,
+    hop: &OutPoint,
+    feerate: u64,
+    seq: u32,
+    commit: bool,
+) -> Message {
     let mut engine = sha256::Hash::engine();
     engine.input(BUMP_DIGEST_TAG);
     engine.input(&(swap_id.len() as u64).to_le_bytes());
     engine.input(swap_id.as_bytes());
+    engine.input(hop.txid.as_byte_array());
+    engine.input(&hop.vout.to_le_bytes());
     engine.input(&feerate.to_le_bytes());
     engine.input(&seq.to_le_bytes());
     engine.input(&[u8::from(commit)]);
@@ -119,13 +130,14 @@ pub(crate) fn bump_digest(swap_id: &str, feerate: u64, seq: u32, commit: bool) -
 pub(crate) fn sign_bump(
     key: &SecretKey,
     swap_id: &str,
+    hop: &OutPoint,
     feerate: u64,
     seq: u32,
     commit: bool,
 ) -> Signature {
     let secp = Secp256k1::new();
     let keypair = Keypair::from_secret_key(&secp, key);
-    secp.sign_schnorr(&bump_digest(swap_id, feerate, seq, commit), &keypair)
+    secp.sign_schnorr(&bump_digest(swap_id, hop, feerate, seq, commit), &keypair)
 }
 
 /// Check a bump authorization against the taker key declared at admission.
@@ -133,6 +145,7 @@ pub(crate) fn verify_bump(
     taker_key: &XOnlyPublicKey,
     signature: &Signature,
     swap_id: &str,
+    hop: &OutPoint,
     feerate: u64,
     seq: u32,
     commit: bool,
@@ -140,7 +153,7 @@ pub(crate) fn verify_bump(
     Secp256k1::verification_only()
         .verify_schnorr(
             signature,
-            &bump_digest(swap_id, feerate, seq, commit),
+            &bump_digest(swap_id, hop, feerate, seq, commit),
             taker_key,
         )
         .map_err(|_| ProtocolError::General("Funding bump is not signed by the swap's taker"))
@@ -322,15 +335,34 @@ mod tests {
         let other = SecretKey::from_slice(&[4u8; 32]).unwrap();
         let secp = Secp256k1::new();
         let pubkey = key.x_only_public_key(&secp).0;
-        let sig = sign_bump(&key, "00000000000000ab", 5, 1, false);
-        assert!(verify_bump(&pubkey, &sig, "00000000000000ab", 5, 1, false).is_ok());
+        let hop = OutPoint::new(bitcoin::Txid::from_byte_array([1; 32]), 0);
+        let sig = sign_bump(&key, "00000000000000ab", &hop, 5, 1, false);
+        assert!(verify_bump(&pubkey, &sig, "00000000000000ab", &hop, 5, 1, false).is_ok());
         // Another swap, rate, sequence or step does not carry the signature.
-        assert!(verify_bump(&pubkey, &sig, "00000000000000ac", 5, 1, false).is_err());
-        assert!(verify_bump(&pubkey, &sig, "00000000000000ab", 6, 1, false).is_err());
-        assert!(verify_bump(&pubkey, &sig, "00000000000000ab", 5, 2, false).is_err());
-        assert!(verify_bump(&pubkey, &sig, "00000000000000ab", 5, 1, true).is_err());
-        let forged = sign_bump(&other, "00000000000000ab", 5, 1, false);
-        assert!(verify_bump(&pubkey, &forged, "00000000000000ab", 5, 1, false).is_err());
+        assert!(verify_bump(&pubkey, &sig, "00000000000000ac", &hop, 5, 1, false).is_err());
+        assert!(verify_bump(&pubkey, &sig, "00000000000000ab", &hop, 6, 1, false).is_err());
+        assert!(verify_bump(&pubkey, &sig, "00000000000000ab", &hop, 5, 2, false).is_err());
+        assert!(verify_bump(&pubkey, &sig, "00000000000000ab", &hop, 5, 1, true).is_err());
+        let forged = sign_bump(&other, "00000000000000ab", &hop, 5, 1, false);
+        assert!(verify_bump(&pubkey, &forged, "00000000000000ab", &hop, 5, 1, false).is_err());
+    }
+
+    /// Every maker of the route knows the swap id: a request signed for one
+    /// maker's hop must not move another maker's funding.
+    #[test]
+    fn a_bump_signed_for_one_maker_is_refused_by_another() {
+        let key = SecretKey::from_slice(&[3u8; 32]).unwrap();
+        let pubkey = key.x_only_public_key(&Secp256k1::new()).0;
+        let first = OutPoint::new(bitcoin::Txid::from_byte_array([1; 32]), 0);
+        let second = OutPoint::new(bitcoin::Txid::from_byte_array([2; 32]), 0);
+        let other_vout = OutPoint::new(first.txid, 1);
+        for commit in [false, true] {
+            let sig = sign_bump(&key, "00000000000000ab", &first, 5, 1, commit);
+            assert!(verify_bump(&pubkey, &sig, "00000000000000ab", &first, 5, 1, commit).is_ok());
+            for hop in [&second, &other_vout] {
+                assert!(verify_bump(&pubkey, &sig, "00000000000000ab", hop, 5, 1, commit).is_err());
+            }
+        }
     }
 
     #[test]

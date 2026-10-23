@@ -75,10 +75,20 @@ impl RecoveryLoop {
                 // Swaps already reported revived, so the warning fires once.
                 let mut revived = HashSet::new();
                 while !shutdown_clone.load(Relaxed) {
-                    let scope = Self::scope(&live_swap, &wallet)
+                    // The decision to stop and `complete` are made under one
+                    // guard: a swap that leaves `live_swap` with coins after
+                    // this either is in the scope, or finds the loop complete
+                    // and starts another.
+                    let Ok(live) = lock_debug!(live_swap.lock()) else {
+                        log::warn!("Recovery loop: live swap lock poisoned");
+                        thread::park_timeout(RECOVERY_LOOP_INTERVAL);
+                        continue;
+                    };
+                    let scope = Self::scope_locked(&live, &wallet)
                         .inspect_err(|e| log::warn!("Recovery loop: scope: {e}"))
                         .ok();
                     let Some((swap_ids, incoming_contract_txids)) = scope else {
+                        drop(live);
                         thread::park_timeout(RECOVERY_LOOP_INTERVAL);
                         continue;
                     };
@@ -87,6 +97,7 @@ impl RecoveryLoop {
                         complete_clone.store(true, Relaxed);
                         return;
                     }
+                    drop(live);
 
                     // The chain only moves with a block, so a pass waits for one. The
                     // watcher hears each block; asking the server is the fallback. It
@@ -256,10 +267,15 @@ impl RecoveryLoop {
                             continue;
                         }
 
-                        let more_failed_swaps = Self::scope(&live_swap, &wallet)
+                        // Decided under the guard, as at the top of the loop.
+                        let Ok(live) = lock_debug!(live_swap.lock()) else {
+                            continue;
+                        };
+                        let more_failed_swaps = Self::scope_locked(&live, &wallet)
                             .map(|(ids, _)| !ids.is_empty())
                             .unwrap_or(true);
                         if more_failed_swaps {
+                            drop(live);
                             continue;
                         }
                         complete_clone.store(true, Relaxed);
@@ -285,6 +301,15 @@ impl RecoveryLoop {
     ) -> std::io::Result<(HashSet<String>, HashSet<Txid>)> {
         let live = lock_debug!(live_swap.lock())
             .map_err(|_| std::io::Error::other("live swap lock poisoned"))?;
+        Self::scope_locked(&live, wallet)
+    }
+
+    /// [`Self::scope`] under a `live_swap` guard the caller holds, so it can
+    /// act on the answer before the active swap changes hands.
+    fn scope_locked(
+        live: &Option<String>,
+        wallet: &RwLock<Wallet>,
+    ) -> std::io::Result<(HashSet<String>, HashSet<Txid>)> {
         let wallet = lock_debug!(wallet.read())
             .map_err(|_| std::io::Error::other("wallet lock poisoned"))?;
         let mut swap_ids = wallet.onchain_swap_ids();

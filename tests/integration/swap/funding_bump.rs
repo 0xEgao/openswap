@@ -185,6 +185,14 @@ fn run_stuck_funding_bump(world: &mut World, protocol: ProtocolVersion, hop: usi
         legacy_taker_tracks_a_replacement_whose_broadcast_answer_was_lost(
             protocol = ProtocolVersion::Legacy,
         ),
+        taproot_taker_tracks_a_replacement_whose_broadcast_answer_was_lost_electrum(
+            backend = ElectrumBackend,
+            protocol = ProtocolVersion::Taproot,
+        ),
+        legacy_taker_tracks_a_replacement_whose_broadcast_answer_was_lost_electrum(
+            backend = ElectrumBackend,
+            protocol = ProtocolVersion::Legacy,
+        ),
     ],
 )]
 fn run_lost_broadcast_answer(world: &mut World, protocol: ProtocolVersion) {
@@ -467,6 +475,7 @@ fn taproot_next_maker_follows_a_replacement_after_reorg(world: &mut World) {
     cases = [
         /// Our own hop 0: our recovery loop sees it revived and keeps it.
         taker_recovers_a_replaced_funding_a_reorg_mines(
+            protocol = ProtocolVersion::Taproot,
             taker = TakerBehavior::StallFunding,
             behaviors = [MakerBehavior::Normal, MakerBehavior::Normal],
             hop = 0,
@@ -476,6 +485,25 @@ fn taproot_next_maker_follows_a_replacement_after_reorg(world: &mut World) {
         /// Maker 0's hop 1: its version retirement sees it revived and hands
         /// the swap to recovery.
         maker_recovers_a_replaced_funding_a_reorg_mines(
+            protocol = ProtocolVersion::Taproot,
+            taker = TakerBehavior::Normal,
+            behaviors = [MakerBehavior::StallFunding, MakerBehavior::Normal],
+            hop = 1,
+            recovery = "recover_from_swap started",
+            refunds = true,
+        ),
+        /// Legacy keeps each version with its own contract signatures; the
+        /// revived one is recovered on them.
+        legacy_taker_recovers_a_replaced_funding_a_reorg_mines(
+            protocol = ProtocolVersion::Legacy,
+            taker = TakerBehavior::StallFunding,
+            behaviors = [MakerBehavior::Normal, MakerBehavior::Normal],
+            hop = 0,
+            recovery = "is mined after a reorg; recovering",
+            refunds = false,
+        ),
+        legacy_maker_recovers_a_replaced_funding_a_reorg_mines(
+            protocol = ProtocolVersion::Legacy,
             taker = TakerBehavior::Normal,
             behaviors = [MakerBehavior::StallFunding, MakerBehavior::Normal],
             hop = 1,
@@ -484,14 +512,20 @@ fn taproot_next_maker_follows_a_replacement_after_reorg(world: &mut World) {
         ),
     ],
 )]
-fn run_revived_replaced_funding(world: &mut World, hop: usize, recovery: &str, refunds: bool) {
+fn run_revived_replaced_funding(
+    world: &mut World,
+    protocol: ProtocolVersion,
+    hop: usize,
+    recovery: &str,
+    refunds: bool,
+) {
     use bitcoind::bitcoincore_rpc::RpcApi;
 
     std::env::set_var("OPENSWAP_FUNDING_BUMP_FEERATE", MARKET_FEERATE);
     // Keep the replaced versions past the winner's depth, so the reorg below
     // still finds them kept.
     std::env::set_var("OPENSWAP_REPLACED_VERSION_DISCARD_DEPTH", "1000");
-    let params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 2)
+    let params = SwapParams::new(protocol, Amount::from_sat(500_000), 2)
         .with_tx_count(2)
         .with_required_confirms(1)
         .with_funding_bump(FundingBumpPolicy::new(10).with_after_blocks(2));
@@ -505,7 +539,7 @@ fn run_revived_replaced_funding(world: &mut World, hop: usize, recovery: &str, r
         _ => world.makers()[hop - 1].inner().wallet.clone(),
     };
     let client = &world.bitcoind().client;
-    // A version the node never mined is one that lost: Taproot funding txs,
+    // A version the node never mined is one that lost: its funding tx,
     // signed. The funder drops its winners once it finished the swap.
     let unmined = |tx: &bitcoin::Transaction| {
         client
@@ -519,7 +553,7 @@ fn run_revived_replaced_funding(world: &mut World, hop: usize, recovery: &str, r
             let versions = funder_wallet()
                 .read()
                 .unwrap()
-                .outgoing_contract_txs_for_test();
+                .outgoing_funding_txs_for_test();
             (!versions.is_empty() && versions.iter().all(unmined)).then_some(versions)
         }
     );

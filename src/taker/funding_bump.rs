@@ -231,6 +231,17 @@ impl HopFunding {
         }
     }
 
+    /// The first coin this hop's funding spends, the same in every version:
+    /// what a bump request of it is signed for.
+    fn hop_outpoint(&self) -> Result<OutPoint, TakerError> {
+        self.versions
+            .first()
+            .and_then(|split| split.first())
+            .and_then(|version| version.funding_tx.input.first())
+            .map(|input| input.previous_output)
+            .ok_or_else(|| TakerError::General("Hop has no funding to bump".into()))
+    }
+
     fn slots(&self) -> Vec<Vec<Txid>> {
         self.versions
             .iter()
@@ -897,6 +908,7 @@ impl Taker {
                 self.note_proven_violation(0);
                 TakerError::General(format!("Maker 0 signed a bumped contract wrongly: {e:?}"))
             })?;
+            crate::protocol::contract::check_contract_sig_sighash(&sig)?;
             version.others_contract_sig = Some(sig);
         }
 
@@ -929,14 +941,15 @@ impl Taker {
         feerate: u64,
     ) -> Result<usize, TakerError> {
         let maker_idx = funding.hop - 1;
-        let replacements = match self.send_bump_request(maker_idx, feerate)? {
-            MakerToTakerMessage::FundingBumped(bumped) => bumped.replacements,
-            other => {
-                return Err(TakerError::General(format!(
-                    "Maker {maker_idx} answered a funding bump with {other:?}"
-                )))
-            }
-        };
+        let replacements =
+            match self.send_bump_request(maker_idx, funding.hop_outpoint()?, feerate)? {
+                MakerToTakerMessage::FundingBumped(bumped) => bumped.replacements,
+                other => {
+                    return Err(TakerError::General(format!(
+                        "Maker {maker_idx} answered a funding bump with {other:?}"
+                    )))
+                }
+            };
         let mut added = 0;
         for replacement in replacements {
             let (split, signed, delta) = self.matching_bump(pending, &replacement, maker_idx)?;
@@ -969,17 +982,20 @@ impl Taker {
     ) -> Result<usize, TakerError> {
         let maker_idx = funding.hop - 1;
         let swap_feerate = self.swap_state()?.params.swap_feerate();
-        let (proposal, already_out) = match self.send_bump_request(maker_idx, feerate)? {
-            MakerToTakerMessage::BumpFundingProposal(proposal) => (proposal.replacements, false),
-            // Our earlier commit at this rate went through but its answer
-            // was lost: the maker hands back what it broadcast then.
-            MakerToTakerMessage::FundingBumped(bumped) => (bumped.replacements, true),
-            other => {
-                return Err(TakerError::General(format!(
-                    "Maker {maker_idx} answered a funding bump with {other:?}"
-                )))
-            }
-        };
+        let (proposal, already_out) =
+            match self.send_bump_request(maker_idx, funding.hop_outpoint()?, feerate)? {
+                MakerToTakerMessage::BumpFundingProposal(proposal) => {
+                    (proposal.replacements, false)
+                }
+                // Our earlier commit at this rate went through but its answer
+                // was lost: the maker hands back what it broadcast then.
+                MakerToTakerMessage::FundingBumped(bumped) => (bumped.replacements, true),
+                other => {
+                    return Err(TakerError::General(format!(
+                        "Maker {maker_idx} answered a funding bump with {other:?}"
+                    )))
+                }
+            };
 
         let mut txs_info = Vec::with_capacity(proposal.len());
         let mut checked = Vec::with_capacity(proposal.len());
@@ -1089,12 +1105,13 @@ impl Taker {
 
         let seq = self.swap_state()?.funding_bump.seq;
         let swap_id = self.swap_state()?.id.clone();
+        let hop = funding.hop_outpoint()?;
         let commit = BumpFundingCommit {
             id: swap_id.clone(),
             feerate,
             seq,
             senders_sigs: sigs,
-            signature: sign_bump(&self.bump_key()?, &swap_id, feerate, seq, true),
+            signature: sign_bump(&self.bump_key()?, &swap_id, &hop, feerate, seq, true),
         };
         let maker_address = self.swap_state()?.makers[maker_idx].address.to_string();
         let broadcast = match self.exchange_bump_message(
@@ -1155,10 +1172,12 @@ impl Taker {
             })
     }
 
-    /// Sign and send a [`BumpFunding`] to a maker, returning its answer.
+    /// Sign and send a [`BumpFunding`] for the hop whose funding first spends
+    /// `hop` to a maker, returning its answer.
     fn send_bump_request(
         &mut self,
         maker_idx: usize,
+        hop: OutPoint,
         feerate: u64,
     ) -> Result<MakerToTakerMessage, TakerError> {
         let key = self.bump_key()?;
@@ -1170,7 +1189,7 @@ impl Taker {
             id: swap_id.clone(),
             feerate,
             seq,
-            signature: sign_bump(&key, &swap_id, feerate, seq, false),
+            signature: sign_bump(&key, &swap_id, &hop, feerate, seq, false),
         };
         let maker_address = swap.makers[maker_idx].address.to_string();
         self.exchange_bump_message(&maker_address, TakerToMakerMessage::BumpFunding(request))
@@ -1256,7 +1275,12 @@ impl Taker {
         log::warn!("Test behavior: orphaned the block that mined maker 0's funding {original}");
 
         let feerate = self.swap_state()?.params.feerate * 3;
-        let answer = self.send_bump_request(0, feerate);
+        let hop = original_signed
+            .input
+            .first()
+            .map(|input| input.previous_output)
+            .ok_or_else(|| TakerError::General("Test: funding with no input".into()))?;
+        let answer = self.send_bump_request(0, hop, feerate);
         let replacement = match &answer {
             Ok(MakerToTakerMessage::FundingBumped(bumped)) => bumped
                 .replacements

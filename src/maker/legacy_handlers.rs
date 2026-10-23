@@ -672,6 +672,7 @@ fn process_resp_contract_sigs_for_recvr_and_sender<M: Maker>(
         .iter()
         .zip(state.incoming_swapcoins.iter_mut())
     {
+        crate::protocol::contract::check_contract_sig_sighash(sig)?;
         incoming.others_contract_sig = Some(*sig);
     }
 
@@ -680,6 +681,7 @@ fn process_resp_contract_sigs_for_recvr_and_sender<M: Maker>(
         .iter()
         .zip(state.outgoing_swapcoins.iter_mut())
     {
+        crate::protocol::contract::check_contract_sig_sighash(sig)?;
         outgoing.others_contract_sig = Some(*sig);
     }
 

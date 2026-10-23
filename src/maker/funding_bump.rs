@@ -94,7 +94,15 @@ fn authorize(
     let taker_key = state.taker_auth_pubkey.ok_or(MakerError::General(
         "Swap has no taker key to authorize a bump",
     ))?;
-    verify_bump(&taker_key, signature, swap_id, feerate, seq, commit)?;
+    // Signed for this hop: the first coin our funding spends, in every version.
+    let hop = state
+        .outgoing_swapcoins
+        .first()
+        .and_then(funding_tx)
+        .and_then(|funding| funding.input.first())
+        .map(|input| input.previous_output)
+        .ok_or(MakerError::General("No funded hop to authorize a bump for"))?;
+    verify_bump(&taker_key, signature, swap_id, &hop, feerate, seq, commit)?;
     Ok(())
 }
 
@@ -581,6 +589,7 @@ pub(super) fn handle_bump_funding_commit<M: Maker>(
             &sig.signature,
         )
         .map_err(|_| MakerError::General("Invalid contract signature for the funding bump"))?;
+        crate::protocol::contract::check_contract_sig_sighash(sig)?;
         version.others_contract_sig = Some(*sig);
     }
 
