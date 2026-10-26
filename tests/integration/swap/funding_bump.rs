@@ -138,6 +138,22 @@ fn run_stuck_funding_bump(world: &mut World, protocol: ProtocolVersion, hop: usi
     if hop > 0 {
         assert_log!(world; { has "Broadcast replacement funding" });
     }
+    // The last hop pays us: we keep its losing versions with the handed-over
+    // key, to claim one a reorg mines.
+    if hop == 2 {
+        let keyed = world
+            .taker()
+            .inner()
+            .get_wallet()
+            .read()
+            .unwrap()
+            .replaced_incoming_keyed_for_test();
+        assert!(
+            !keyed.is_empty() && keyed.iter().all(|&has_key| has_key),
+            "the kept losing versions of the last hop must hold the handed-over key: {:?}",
+            keyed
+        );
+    }
 
     world.taker().sync();
     world.mine(1);

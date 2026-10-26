@@ -2956,6 +2956,18 @@ impl Wallet {
             .collect()
     }
 
+    /// Test-only: for each incoming swapcoin flagged as a replaced version,
+    /// whether it holds the other party's private key.
+    #[cfg(feature = "integration-test")]
+    pub fn replaced_incoming_keyed_for_test(&self) -> Vec<bool> {
+        self.store
+            .incoming_swapcoins
+            .values()
+            .filter(|coin| coin.replaced)
+            .map(|coin| coin.other_privkey.is_some())
+            .collect()
+    }
+
     /// Test-only: reserve `outpoints` for `swap_key` and persist it, as
     /// another swap's claim would be.
     #[cfg(feature = "integration-test")]

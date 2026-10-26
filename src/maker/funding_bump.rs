@@ -561,6 +561,9 @@ pub(super) fn handle_bump_funding_commit<M: Maker>(
         true,
         &commit.signature,
     )?;
+    for sig in &commit.senders_sigs {
+        crate::protocol::contract::check_contract_sig_sighash(sig)?;
+    }
     let _funding = maker.begin_funding(&commit.id)?;
     reload_funding_bump(maker, state)?;
     // Checked again under the guard, on the stored state: since the proposal
@@ -606,7 +609,6 @@ pub(super) fn handle_bump_funding_commit<M: Maker>(
             &sig.signature,
         )
         .map_err(|_| MakerError::General("Invalid contract signature for the funding bump"))?;
-        crate::protocol::contract::check_contract_sig_sighash(sig)?;
         version.others_contract_sig = Some(*sig);
     }
 
@@ -839,6 +841,53 @@ mod tests {
         assert!(format!("{:?}", err).contains("settled"), "{:?}", err);
         let stored = maker.get_connection_state(SWAP).unwrap().unwrap();
         assert!(stored.funding_bump.pending.is_none());
+        maker.watch_service.shutdown();
+    }
+
+    /// A valid contract signature under another sighash flag would put a
+    /// refund in the witness that script evaluation rejects: the commit is
+    /// refused before anything is stored or broadcast.
+    #[test]
+    fn a_commit_with_a_non_sighash_all_contract_sig_is_refused() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), Vec::new());
+        let original = version(50_000);
+        let mut state = connection(&original);
+        state.funding_bump.seq = 1;
+        state.funding_bump.pending = Some(proposal(1));
+        maker.seed_swap_for_test(SWAP, &state, &[]).unwrap();
+
+        let replacement = &proposal(1).replacements[0].1;
+        let (my_pubkey, other_pubkey) = (
+            replacement.my_pubkey.unwrap(),
+            replacement.other_pubkey.unwrap(),
+        );
+        let mut sig = crate::protocol::contract::sign_contract_tx(
+            &replacement.contract_tx,
+            &create_multisig_redeemscript(&my_pubkey, &other_pubkey),
+            replacement.funding_amount,
+            &key(7),
+        )
+        .unwrap();
+        verify_contract_tx_sig(
+            &replacement.contract_tx,
+            &create_multisig_redeemscript(&my_pubkey, &other_pubkey),
+            replacement.funding_amount,
+            &other_pubkey,
+            &sig.signature,
+        )
+        .expect("the signature itself is valid");
+        sig.sighash_type = bitcoin::sighash::EcdsaSighashType::SinglePlusAnyoneCanPay;
+        let mut bad = commit(&original, 1);
+        bad.senders_sigs = vec![sig];
+
+        let err = handle_bump_funding_commit(&maker, &mut state, bad).unwrap_err();
+        assert!(format!("{:?}", err).contains("SIGHASH_ALL"), "{:?}", err);
+        assert!(state.funding_bump.pending.is_some());
+        assert_eq!(state.funding_bump.bumps, 0);
+        let stored = maker.get_connection_state(SWAP).unwrap().unwrap();
+        assert_eq!(stored.outgoing_swapcoins.len(), 1);
+        assert!(stored.funding_bump.replacements.is_empty());
         maker.watch_service.shutdown();
     }
 

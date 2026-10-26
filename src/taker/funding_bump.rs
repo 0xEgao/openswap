@@ -1571,6 +1571,32 @@ impl Taker {
                 }
             }
         } else {
+            // A Taproot last hop's losing versions are flagged copies of our
+            // incoming coins: they take the handed-over key with the winners.
+            if funding.hop == makers && !legacy_last_hop {
+                let every_version: Vec<IncomingSwapCoin> = swap
+                    .incoming_swapcoins
+                    .iter()
+                    .chain(&bumps.incoming_versions)
+                    .cloned()
+                    .collect();
+                for (split, &winner) in winners.iter().enumerate() {
+                    for (index, version) in funding.versions[split].iter().enumerate() {
+                        let txid = contract_txid(version);
+                        if index == winner {
+                            continue;
+                        }
+                        if let Some(coin) = every_version
+                            .iter()
+                            .find(|coin| coin.contract_tx.compute_txid() == txid)
+                        {
+                            let mut copy = coin.clone();
+                            copy.replaced = true;
+                            swap.funding_bump.replaced_incoming.push((split, copy));
+                        }
+                    }
+                }
+            }
             for (_, txid) in &winning {
                 if let Some(version) = bumps
                     .watchonly_versions

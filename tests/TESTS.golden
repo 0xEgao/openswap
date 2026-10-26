@@ -37,6 +37,7 @@ openswap maker::api::tests::shutdown_join_releases_pool_lock_and_drains_late_chi
 openswap maker::api::tests::shutdown_signal_latches_request_and_rearms_backend_after_joins
 openswap maker::funding_bump::tests::a_commit_is_refused_once_a_version_of_its_split_confirmed
 openswap maker::funding_bump::tests::a_commit_is_refused_once_another_connection_settled_the_hop
+openswap maker::funding_bump::tests::a_commit_with_a_non_sighash_all_contract_sig_is_refused
 openswap maker::funding_bump::tests::settlement_resolves_on_another_connections_replacement
 openswap maker::handlers::tests::a_settled_version_leaves_the_replacements
 openswap maker::handlers::tests::a_stale_connection_cannot_undo_another_connections_bump
