@@ -953,6 +953,31 @@ pub struct IdleSwapData {
 }
 
 impl MakerServer {
+    /// Test-only: store `state` as the live swap `swap_id`, as an admission
+    /// would, with `latched` funding txids already seen mined.
+    #[cfg(test)]
+    pub(crate) fn seed_swap_for_test(
+        &self,
+        swap_id: &str,
+        state: &ConnectionState,
+        latched: &[Txid],
+    ) -> Result<(), MakerError> {
+        lock_debug!(self.ongoing_swaps.lock())?.insert(
+            swap_id.to_string(),
+            SwapState {
+                swap_start_time: state.swap_start_time,
+                ..SwapState::default()
+            },
+        );
+        self.store_connection_state(swap_id, state, false)?;
+        if let Some(stored) = lock_debug!(self.ongoing_swaps.lock())?.get_mut(swap_id) {
+            stored
+                .funding_seen_confirmed
+                .extend(latched.iter().copied());
+        }
+        Ok(())
+    }
+
     /// Restores `config.wallet_name` from a backup file, or from a seed phrase
     /// prompted for. Runs before `init`, which would create a fresh wallet.
     pub fn restore_wallet(

@@ -563,6 +563,23 @@ pub(super) fn handle_bump_funding_commit<M: Maker>(
     )?;
     let _funding = maker.begin_funding(&commit.id)?;
     reload_funding_bump(maker, state)?;
+    // Checked again under the guard, on the stored state: since the proposal
+    // the hop may have settled on another connection, or a version of a split
+    // it replaces been mined, and the next hop built on it.
+    if state.funding_bump.settled {
+        return Err(MakerError::General(
+            "This hop's funding is settled; the next hop built on it",
+        ));
+    }
+    if let Some(pending) = state.funding_bump.pending.as_ref() {
+        for (split, _) in &pending.replacements {
+            if any_confirmed(maker, &commit.id, &versions(state, *split))? {
+                return Err(MakerError::General(
+                    "A funding tx of this bump's split has confirmed",
+                ));
+            }
+        }
+    }
     let pending = state
         .funding_bump
         .pending
@@ -617,6 +634,18 @@ pub(super) fn resolve_funding_versions<M: Maker>(
         .swap_id
         .clone()
         .ok_or(MakerError::General("No swap to resolve"))?;
+    // Held through resolution and storage, and decided on the stored state:
+    // another connection may have bumped since this one's snapshot, and the
+    // settle decision and next hop's contract must be for the right version.
+    let _funding = maker.begin_funding(&swap_id)?;
+    if let Some(stored) = maker.get_connection_state(&swap_id)? {
+        if stored.outgoing_swapcoins.len() == state.outgoing_swapcoins.len() {
+            state.outgoing_swapcoins = stored.outgoing_swapcoins;
+        }
+        let mut current = stored.funding_bump;
+        current.merge_from(&state.funding_bump, &state.outgoing_swapcoins);
+        state.funding_bump = current;
+    }
     if state.funding_bump.replacements.is_empty() {
         state.funding_bump.pending = None;
         if !state.funding_bump.settled {
@@ -678,4 +707,160 @@ pub(super) fn resolve_funding_versions<M: Maker>(
     state.funding_bump.replacements = losers;
     state.funding_bump.pending = None;
     maker.store_connection_state(&swap_id, state, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        maker::{api::tests::compat_test_maker, handlers::PendingFundingBump},
+        protocol::funding_bump::sign_bump,
+    };
+    use bitcoin::{
+        hashes::Hash,
+        secp256k1::{Message, Secp256k1, SecretKey},
+        Amount, PublicKey, ScriptBuf, TxIn, TxOut,
+    };
+
+    const SWAP: &str = "bump-race";
+
+    fn key(byte: u8) -> SecretKey {
+        SecretKey::from_slice(&[byte; 32]).unwrap()
+    }
+
+    fn tx(input: OutPoint, value: u64) -> Transaction {
+        Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: input,
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        }
+    }
+
+    /// A Legacy version of our one split's funding, told apart by `value`:
+    /// every version spends the same coin.
+    fn version(value: u64) -> OutgoingSwapCoin {
+        let secp = Secp256k1::new();
+        let pubkey = PublicKey {
+            compressed: true,
+            inner: bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &key(7)),
+        };
+        let funding = tx(OutPoint::new(Txid::from_byte_array([9; 32]), 0), value);
+        let contract = tx(OutPoint::new(funding.compute_txid(), 0), value - 500);
+        let mut coin = OutgoingSwapCoin::new_legacy(
+            key(7),
+            pubkey,
+            contract,
+            ScriptBuf::new(),
+            key(8),
+            Amount::from_sat(value),
+            1,
+        );
+        coin.funding_tx = Some(funding);
+        coin.swap_id = Some(SWAP.to_string());
+        coin
+    }
+
+    /// One connection's view of a funded Legacy hop awaiting the handover.
+    fn connection(original: &OutgoingSwapCoin) -> ConnectionState {
+        ConnectionState {
+            swap_id: Some(SWAP.to_string()),
+            phase: SwapPhase::AwaitingPrivateKeyHandover,
+            protocol: ProtocolVersion::Legacy,
+            taker_auth_pubkey: Some(key(5).x_only_public_key(&Secp256k1::new()).0),
+            outgoing_swapcoins: vec![original.clone()],
+            swap_feerate: 1.0,
+            ..Default::default()
+        }
+    }
+
+    fn proposal(seq: u32) -> PendingFundingBump {
+        PendingFundingBump {
+            seq,
+            feerate: 5,
+            replacements: vec![(0, version(49_000))],
+        }
+    }
+
+    /// The taker's commit of the proposal at `seq`, properly signed.
+    fn commit(original: &OutgoingSwapCoin, seq: u32) -> BumpFundingCommit {
+        let hop = original.funding_tx.as_ref().unwrap().input[0].previous_output;
+        let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest([1; 32]), &key(9));
+        BumpFundingCommit {
+            id: SWAP.to_string(),
+            feerate: 5,
+            seq,
+            senders_sigs: vec![bitcoin::ecdsa::Signature::sighash_all(sig)],
+            signature: sign_bump(&key(5), SWAP, &hop, 5, seq, true),
+        }
+    }
+
+    /// The original is mined after the proposal was built, and the next hop
+    /// builds on it: the commit must not put out the conflicting replacement.
+    #[test]
+    fn a_commit_is_refused_once_a_version_of_its_split_confirmed() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), Vec::new());
+        let original = version(50_000);
+        let mut state = connection(&original);
+        state.funding_bump.seq = 1;
+        state.funding_bump.pending = Some(proposal(1));
+        let mined = funding_tx(&original).unwrap().compute_txid();
+        maker.seed_swap_for_test(SWAP, &state, &[mined]).unwrap();
+
+        let err = handle_bump_funding_commit(&maker, &mut state, commit(&original, 1)).unwrap_err();
+        assert!(format!("{:?}", err).contains("has confirmed"), "{:?}", err);
+        maker.watch_service.shutdown();
+    }
+
+    /// Connection B settled the hop and cleared the proposal; A still holds
+    /// it at the same sequence. A's commit must find the hop settled, not
+    /// bring the cleared proposal back.
+    #[test]
+    fn a_commit_is_refused_once_another_connection_settled_the_hop() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), Vec::new());
+        let original = version(50_000);
+        let mut a = connection(&original);
+        a.funding_bump.seq = 3;
+        a.funding_bump.pending = Some(proposal(3));
+        let mut b = a.clone();
+        b.funding_bump.pending = None;
+        b.funding_bump.settled = true;
+        maker.seed_swap_for_test(SWAP, &b, &[]).unwrap();
+
+        let err = handle_bump_funding_commit(&maker, &mut a, commit(&original, 3)).unwrap_err();
+        assert!(format!("{:?}", err).contains("settled"), "{:?}", err);
+        let stored = maker.get_connection_state(SWAP).unwrap().unwrap();
+        assert!(stored.funding_bump.pending.is_none());
+        maker.watch_service.shutdown();
+    }
+
+    /// B stored a replacement while A's snapshot still has none. A resolving
+    /// must decide on B's replacement too, never settle on the original
+    /// alone. The test maker has no node, so it stops at the confirmation
+    /// lookup, which the original-only path never reaches.
+    #[test]
+    fn settlement_resolves_on_another_connections_replacement() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), Vec::new());
+        let original = version(50_000);
+        let mut a = connection(&original);
+        let mut b = a.clone();
+        b.funding_bump.seq = 1;
+        b.funding_bump.bumps = 1;
+        b.funding_bump.replacements = vec![version(49_000)];
+        maker.seed_swap_for_test(SWAP, &b, &[]).unwrap();
+
+        let resolved = resolve_funding_versions(&maker, &mut a);
+        assert_eq!(a.funding_bump.replacements.len(), 1, "{:?}", resolved);
+        assert!(resolved.is_err(), "no node answers which version is mined");
+        maker.watch_service.shutdown();
+    }
 }

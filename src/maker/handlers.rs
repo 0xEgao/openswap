@@ -340,14 +340,22 @@ impl FundingBumpState {
     /// replacements are only ever added. A version that became one of
     /// `outgoing`, the swap's settled coins, is no replacement any more.
     pub(crate) fn merge_from(&mut self, newer: &FundingBumpState, outgoing: &[OutgoingSwapCoin]) {
-        // A pending proposal is the latest request's: a commit clears it.
-        if newer.seq >= self.seq {
+        // A pending proposal is the latest request's. A later request brings
+        // its own; a snapshot of the same request can only clear it (a commit
+        // consumed it, or the hop settled), never bring a cleared one back.
+        if newer.seq > self.seq {
             self.pending = newer.pending.clone();
+        } else if newer.seq == self.seq && newer.pending.is_none() {
+            self.pending = None;
         }
         self.seq = self.seq.max(newer.seq);
         self.feerate = self.feerate.max(newer.feerate);
         self.bumps = self.bumps.max(newer.bumps);
         self.settled |= newer.settled;
+        // A settled hop takes no bump, so it keeps no proposal either.
+        if self.settled {
+            self.pending = None;
+        }
         for version in &newer.replacements {
             let txid = version.contract_tx.compute_txid();
             if !self
