@@ -197,7 +197,9 @@ Fees can jump after a hop's funding is broadcast. The funding then sits in
 the mempool, unconfirmed. After two hours the swap gives up, and every
 party's coins were locked for nothing. A funding bump replaces that stuck
 funding with a copy that pays a higher feerate. It is off unless you turn it
-on with `--bump-max-feerate` (`SwapParams::with_funding_bump`).
+on with `--bump-max-feerate` (`SwapParams::with_funding_bump`). A PaySwap
+refuses it: the route reserves no budget for a bump, so one would come out
+of the exact amount the receiver is owed.
 
 Bumps need every maker on the route to support them. Taker and makers agree
 on them per swap through the `funding-bump-v1` feature in the handshake. If

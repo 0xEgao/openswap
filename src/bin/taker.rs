@@ -219,11 +219,11 @@ enum Commands {
         auto_select: bool,
         /// PaySwap: settle the swap to this third-party address. The swap
         /// amount then means the exact amount the receiver gets.
-        #[clap(long = "payment-address")]
+        #[clap(long = "payment-address", conflicts_with = "bump_max_feerate")]
         payment_address: Option<String>,
         /// Replace a hop's funding at a higher feerate, up to this many sats/vB,
         /// while it sits unconfirmed. The extra fee comes out of the swap amount.
-        /// Off unless set.
+        /// Off unless set. Not with `--payment-address`.
         #[clap(long = "bump-max-feerate")]
         bump_max_feerate: Option<u64>,
         /// Blocks a hop's funding waits unconfirmed before each bump.

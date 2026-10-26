@@ -423,7 +423,7 @@ Options:
       --payment-address <PAYMENT_ADDRESS>
           PaySwap: settle the swap to this third-party address. The swap amount then means the exact amount the receiver gets
       --bump-max-feerate <BUMP_MAX_FEERATE>
-          Replace a hop's funding at a higher feerate, up to this many sats/vB, while it sits unconfirmed. The extra fee comes out of the swap amount. Off unless set
+          Replace a hop's funding at a higher feerate, up to this many sats/vB, while it sits unconfirmed. The extra fee comes out of the swap amount. Off unless set. Not with `--payment-address`
       --bump-after-blocks <BUMP_AFTER_BLOCKS>
           Blocks a hop's funding waits unconfirmed before each bump [default: 2]
       --bump-max-count <BUMP_MAX_COUNT>
@@ -436,7 +436,7 @@ Options:
 
 The `--tx-count`, `--tx-counts`, `--max-input-budget`, and `--feerate` parameters are explained in [the fee policy](./fee-policy.md).
 
-If fees jump while a hop's funding waits to confirm, `--bump-max-feerate` lets your node replace that funding at a higher feerate instead of waiting out the two-hour timeout. You pay the extra fee: it comes out of the swap amount, so you receive that much less. A maker only bumps its own funding when its offer allows it. See [Funding bumps](./fee-policy.md#funding-bumps).
+If fees jump while a hop's funding waits to confirm, `--bump-max-feerate` lets your node replace that funding at a higher feerate instead of waiting out the two-hour timeout. You pay the extra fee: it comes out of the swap amount, so you receive that much less. A maker only bumps its own funding when its offer allows it. It cannot be combined with `--payment-address`: a bump would come out of the exact amount the receiver is owed. See [Funding bumps](./fee-policy.md#funding-bumps).
 
 By default, the command opens an interactive UTXO picker so you can choose which coins fund the swap; pass `--auto-select` to let the wallet pick them automatically.
 
